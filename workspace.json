@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "repositories": [
+    {
+      "id": "blitz",
+      "path": "blitz",
+      "github": "nshkrdotcom/blitz",
+      "status": "pilot",
+      "projects": [
+        {"app": "blitz", "path": ".", "managed_deps": []}
+      ]
+    },
+    {
+      "id": "execution_plane",
+      "path": "execution_plane",
+      "github": "nshkrdotcom/execution_plane",
+      "status": "pilot",
+      "projects": [
+        {"app": "execution_plane_workspace", "path": ".", "managed_deps": []},
+        {"app": "execution_plane", "path": "core/execution_plane", "managed_deps": []},
+        {"app": "execution_plane_process", "path": "runtimes/execution_plane_process", "managed_deps": ["execution_plane"]},
+        {"app": "execution_plane_jsonrpc", "path": "protocols/execution_plane_jsonrpc", "managed_deps": ["execution_plane"]}
+      ]
+    },
+    {
+      "id": "cli_subprocess_core",
+      "path": "cli_subprocess_core",
+      "github": "nshkrdotcom/cli_subprocess_core",
+      "status": "pilot",
+      "projects": [
+        {"app": "cli_subprocess_core", "path": ".", "managed_deps": ["execution_plane", "execution_plane_process", "execution_plane_jsonrpc"]}
+      ]
+    },
+    {
+      "id": "codex_sdk",
+      "path": "codex_sdk",
+      "github": "nshkrdotcom/codex_sdk",
+      "status": "pilot",
+      "projects": [
+        {"app": "codex_sdk", "path": ".", "managed_deps": ["cli_subprocess_core"]}
+      ]
+    },
+    {
+      "id": "weld",
+      "path": "weld",
+      "github": "nshkrdotcom/weld",
+      "status": "weld_owner",
+      "projects": [
+        {"app": "weld", "path": ".", "managed_deps": []}
+      ]
+    },
+    {
+      "id": "inference",
+      "path": "inference",
+      "github": "nshkrdotcom/inference",
+      "status": "weld_wedge",
+      "projects": [
+        {"app": "inference_workspace", "path": ".", "managed_deps": ["weld"]},
+        {"app": "inference", "path": "apps/inference", "managed_deps": []}
+      ]
+    },
+    {
+      "id": "citadel",
+      "path": "citadel",
+      "github": "nshkrdotcom/citadel",
+      "status": "weld_regression",
+      "projects": [
+        {"app": "citadel_workspace", "path": ".", "managed_deps": ["weld"]}
+      ]
+    }
+  ]
+}
