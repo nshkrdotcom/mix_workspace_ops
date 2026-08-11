@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Mix Workspace Ops</title>
+  <desc id="desc">A symmetric hexagon containing two dependency paths converging into a verified artifact.</desc>
+  <defs>
+    <linearGradient id="shell" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8b5cf6"/>
+      <stop offset="0.5" stop-color="#4f46e5"/>
+      <stop offset="1" stop-color="#06b6d4"/>
+    </linearGradient>
+    <linearGradient id="core" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e9d5ff"/>
+      <stop offset="1" stop-color="#67e8f9"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3.2" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <path d="M128 16 225 72v112l-97 56-97-56V72Z" fill="#0b1020" stroke="url(#shell)" stroke-width="8" stroke-linejoin="round"/>
+  <path d="M77 82h39l12 20 12-20h39" fill="none" stroke="#a78bfa" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M77 82v46l51 30 51-30V82" fill="none" stroke="#22d3ee" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" opacity=".88"/>
+  <circle cx="77" cy="82" r="13" fill="#111827" stroke="#c4b5fd" stroke-width="6"/>
+  <circle cx="179" cy="82" r="13" fill="#111827" stroke="#67e8f9" stroke-width="6"/>
+  <path d="m128 101 28 16v32l-28 16-28-16v-32Z" fill="url(#core)" stroke="#f8fafc" stroke-width="4" stroke-linejoin="round" filter="url(#glow)"/>
+  <path d="m101 117 27 16 27-16M128 133v31" fill="none" stroke="#312e81" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M128 181v22" stroke="#f8fafc" stroke-width="7" stroke-linecap="round"/>
+  <path d="m116 194 12 12 12-12" fill="none" stroke="#f8fafc" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

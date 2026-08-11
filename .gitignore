@@ -1,0 +1,7 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/mix_workspace_ops
+/erl_crash.dump
+/.mix_workspace_ops/
