@@ -3,6 +3,11 @@ defmodule MixWorkspaceOps.Release.LocalAdapterTest do
 
   alias MixWorkspaceOps.Release.LocalAdapter
 
+  test "Hex requests identify the release client" do
+    assert [{~c"user-agent", user_agent}] = LocalAdapter.hex_request_headers()
+    assert List.starts_with?(user_agent, ~c"mix_workspace_ops/")
+  end
+
   test "preflight requires the exact clean pushed package commit", context do
     root = temporary_directory!(context)
     repository = Path.join(root, "sample_package")

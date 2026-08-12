@@ -6,6 +6,7 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
   alias MixWorkspaceOps.{Command, Git, Project}
 
   @preserved_environment ~w(HOME PATH USER LOGNAME LANG LC_ALL TERM SHELL ASDF_DIR ASDF_DATA_DIR MIX_HOME MIX_ARCHIVES MIX_ENV MIX_TARGET ERL_AFLAGS ERL_FLAGS ELIXIR_ERL_OPTIONS SSH_AUTH_SOCK XDG_RUNTIME_DIR CI CODEX_CI)
+  @hex_user_agent ~c"mix_workspace_ops/0.1.0"
 
   @impl true
   def transition(:preflight, context), do: preflight(context)
@@ -95,7 +96,9 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
     url = ~c"https://hex.pm/api/packages/#{context.plan.package}/releases/#{context.plan.version}"
     :ok = ensure_http_started()
 
-    case :httpc.request(:get, {url, []}, [ssl: ssl_options()], body_format: :binary) do
+    case :httpc.request(:get, {url, hex_request_headers()}, [ssl: ssl_options()],
+           body_format: :binary
+         ) do
       {:ok, {{_http, 200, _reason}, _headers, body}} -> verify_checksum(context, body)
       {:ok, {{_http, status, _reason}, _headers, _body}} -> {:error, {:hex_status, status}}
       {:error, reason} -> {:error, {:hex_request, reason}}
@@ -174,7 +177,9 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
     url = ~c"https://hex.pm/api/packages/#{context.plan.package}/releases/#{context.plan.version}"
     :ok = ensure_http_started()
 
-    case :httpc.request(:get, {url, []}, [ssl: ssl_options()], body_format: :binary) do
+    case :httpc.request(:get, {url, hex_request_headers()}, [ssl: ssl_options()],
+           body_format: :binary
+         ) do
       {:ok, {{_http, 404, _reason}, _headers, _body}} ->
         :absent
 
@@ -212,6 +217,9 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
       customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]
     ]
   end
+
+  @doc false
+  def hex_request_headers, do: [{~c"user-agent", @hex_user_agent}]
 
   defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 end
