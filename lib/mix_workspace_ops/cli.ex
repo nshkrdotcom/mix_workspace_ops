@@ -2,7 +2,6 @@ defmodule MixWorkspaceOps.CLI do
   @moduledoc false
 
   alias MixWorkspaceOps.{
-    Bootstrap,
     Command,
     Discovery,
     Doctor,
@@ -131,37 +130,23 @@ defmodule MixWorkspaceOps.CLI do
 
   defp dispatch(["run" | args]) do
     with {:ok, option_args, command} <- split_command(args),
-         {:ok, options, []} <- registry_options(option_args, project: nil, mode: "local"),
+         {:ok, options, []} <-
+           registry_options(option_args, project: nil, mode: "local", mix_state: "managed"),
          :ok <- require_option(options, :project),
          :ok <- require_command(command),
          :ok <- require_safe_run_command(command),
          {:ok, registry} <- load_bound_registry(options),
          :ok <- ensure_project_in_view(registry, options),
-         {:ok, mode} <- source_mode(options.mode) do
+         {:ok, mode} <- source_mode(options.mode),
+         {:ok, mix_state} <- mix_state(options.mix_state) do
       project_root = Registry.project_root(registry, options.project)
 
       Overlay.with_activation(
         registry,
         options.project,
-        [mode: mode, state_root: options.state_root],
+        [mode: mode, mix_state: mix_state, state_root: options.state_root],
         fn source_report, env -> run_command(command, project_root, source_report, env) end
       )
-    end
-  end
-
-  defp dispatch(["bootstrap", "install" | args]) do
-    with {:ok, options, []} <- registry_options(args, project: nil),
-         :ok <- require_option(options, :project),
-         {:ok, registry} <- load_bound_registry(options),
-         project_root = Registry.project_root(registry, options.project),
-         {:ok, path} <- Bootstrap.install(project_root) do
-      {:ok,
-       %{
-         schema: "mix_workspace_ops.bootstrap/v1",
-         project: options.project,
-         path: path,
-         status: :current
-       }}
     end
   end
 
@@ -271,6 +256,7 @@ defmodule MixWorkspaceOps.CLI do
   defp option_key("state-root"), do: {:ok, :state_root}
   defp option_key("project"), do: {:ok, :project}
   defp option_key("mode"), do: {:ok, :mode}
+  defp option_key("mix-state"), do: {:ok, :mix_state}
   defp option_key("output"), do: {:ok, :output}
   defp option_key("github-owner"), do: {:ok, :github_owner}
   defp option_key("descriptor"), do: {:ok, :descriptor}
@@ -308,6 +294,10 @@ defmodule MixWorkspaceOps.CLI do
   defp source_mode("hex"), do: {:ok, :hex}
   defp source_mode(mode), do: {:usage_error, "invalid source mode #{inspect(mode)}"}
 
+  defp mix_state("managed"), do: {:ok, :managed}
+  defp mix_state("delegated"), do: {:ok, :delegated}
+  defp mix_state(mode), do: {:usage_error, "invalid Mix-state ownership #{inspect(mode)}"}
+
   defp run_command([executable | argv], project_root, source_report, env) do
     case Command.run(executable, argv, cd: project_root, env: env) do
       {:ok, command_result} -> {:ok, %{source: source_report, command: command_result}}
@@ -337,8 +327,8 @@ defmodule MixWorkspaceOps.CLI do
       inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
       doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
       plan --project ID --registry PATH --checkout-root PATH [--view PATH]
-      bootstrap install --project ID --registry PATH --checkout-root PATH
-      run --project ID --mode local|git|hex --registry PATH --checkout-root PATH -- COMMAND [ARG ...]
+      run --project ID --mode local|git|hex --mix-state managed|delegated \\
+        --registry PATH --checkout-root PATH -- COMMAND [ARG ...]
       release publish --descriptor PATH [--state-root PATH]
       help
     """)

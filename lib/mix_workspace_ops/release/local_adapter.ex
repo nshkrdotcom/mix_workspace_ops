@@ -137,7 +137,8 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
   end
 
   defp ensure_no_overlay do
-    variables = ~w(MIX_WORKSPACE_OPS_OVERLAY MIX_WORKSPACE_OPS_LOCKFILE)
+    variables =
+      ~w(MIX_WORKSPACE_OPS_BOOTSTRAP MIX_WORKSPACE_OPS_CONTEXT_DIGEST MIX_WORKSPACE_OPS_LOCKFILE MIX_WORKSPACE_OPS_OVERLAY)
 
     if Enum.all?(variables, &(System.get_env(&1) in [nil, ""])),
       do: :ok,

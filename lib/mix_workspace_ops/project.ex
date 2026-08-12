@@ -13,7 +13,7 @@ defmodule MixWorkspaceOps.Project do
       app when is_atom(app) and not is_nil(app) -> Atom.to_string(app)
       _other -> ""
     end
-  version = config |> Keyword.fetch!(:version) |> to_string()
+  version = config |> Keyword.get(:version, "") |> to_string()
   dependencies =
     config
     |> Keyword.get(:deps, [])
@@ -57,7 +57,13 @@ defmodule MixWorkspaceOps.Project do
              @expression
            ],
            cd: project_root,
-           env: [{"MIX_ENV", "dev"}, {"MIX_WORKSPACE_OPS_OVERLAY", nil}]
+           env: [
+             {"MIX_ENV", "dev"},
+             {"MIX_WORKSPACE_OPS_BOOTSTRAP", nil},
+             {"MIX_WORKSPACE_OPS_CONTEXT_DIGEST", nil},
+             {"MIX_WORKSPACE_OPS_LOCKFILE", nil},
+             {"MIX_WORKSPACE_OPS_OVERLAY", nil}
+           ]
          ) do
       {:ok, result} -> parse(result.output)
       {:error, result} -> {:error, {:command_failed, result.exit_code, result.output}}
@@ -88,16 +94,12 @@ defmodule MixWorkspaceOps.Project do
   end
 
   defp parse_metadata([app, version, dependencies]) do
-    if app == "" do
-      {:error, :non_application_mix_project}
-    else
-      {:ok,
-       %{
-         app: app,
-         version: version,
-         dependencies: if(dependencies == "", do: [], else: String.split(dependencies, ","))
-       }}
-    end
+    {:ok,
+     %{
+       app: if(app == "", do: nil, else: app),
+       version: version,
+       dependencies: if(dependencies == "", do: [], else: String.split(dependencies, ","))
+     }}
   end
 
   defp parse_metadata(_parts), do: {:error, :invalid_metadata_marker}

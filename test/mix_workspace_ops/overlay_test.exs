@@ -13,6 +13,10 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {:ok, activation} = Overlay.activate(registry, "consumer", state_root: state_root)
     assert activation.report.projects == ["core", "consumer"]
     assert {"MIX_WORKSPACE_OPS_OVERLAY", activation.path} in activation.env
+    assert {"MIX_WORKSPACE_OPS_BOOTSTRAP", activation.report.bootstrap_path} in activation.env
+
+    assert {"MIX_WORKSPACE_OPS_CONTEXT_DIGEST", activation.report.context_digest} in activation.env
+
     assert {"MIX_DEPS_PATH", activation.report.runtime.deps_path} in activation.env
     assert {"MIX_BUILD_ROOT", activation.report.runtime.build_root} in activation.env
     assert {"HEX_HOME", activation.report.runtime.hex_home} in activation.env
@@ -23,12 +27,71 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert String.starts_with?(activation.report.runtime.root, state_root)
     assert File.read!(activation.report.runtime.lockfile) == "%{}\n"
     assert {:ok, overlay} = Overlay.read(activation.path)
+    assert overlay.context_digest == activation.report.context_digest
     assert Map.keys(overlay.sources) == ["consumer", "core"]
     assert overlay.sources["core"].path == Path.join(root, "core")
     assert is_binary(overlay.sources["core"].source_digest)
 
     refute File.exists?(Path.join(root, "core/.mix_workspace_ops"))
     refute File.exists?(Path.join(root, "consumer/.mix_workspace_ops"))
+  end
+
+  test "delegated execution carries source context but allocates no child Mix state", context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    initialize_repository!(Path.join(root, "core"))
+    initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
+
+    assert {:ok, activation} =
+             Overlay.activate(registry(root), "consumer",
+               state_root: state_root,
+               mix_state: :delegated
+             )
+
+    assert activation.report.runtime.ownership == :delegated
+    assert activation.report.runtime.digest == activation.report.context_digest
+    assert {"MIX_WORKSPACE_OPS_OVERLAY", activation.path} in activation.env
+
+    assert {"MIX_WORKSPACE_OPS_CONTEXT_DIGEST", activation.report.context_digest} in activation.env
+
+    refute Enum.any?(activation.env, fn {key, _value} ->
+             key in ~w(MIX_DEPS_PATH MIX_BUILD_ROOT HEX_HOME MIX_WORKSPACE_OPS_LOCKFILE)
+           end)
+  end
+
+  test "semantic context is independent of checkout paths", context do
+    root = temporary_directory!(context)
+    first = Path.join(root, "first")
+    second = Path.join(root, "second")
+    File.mkdir_p!(first)
+    File.mkdir_p!(second)
+    initialize_repository!(Path.join(first, "core"))
+    initialize_repository!(Path.join(first, "consumer"), ~s([{:core, path: "../core"}]))
+
+    for repository <- ~w(core consumer) do
+      source = Path.join(first, repository)
+      destination = Path.join(second, repository)
+      {_, 0} = System.cmd("git", ["clone", "--quiet", source, destination])
+
+      {_, 0} =
+        System.cmd(
+          "git",
+          ["remote", "set-url", "origin", "https://github.com/example-org/#{repository}.git"],
+          cd: destination
+        )
+    end
+
+    first_registry = registry(first)
+    second_registry = registry(second)
+
+    assert {:ok, first_activation} =
+             Overlay.activate(first_registry, "consumer", state_root: Path.join(root, "state-a"))
+
+    assert {:ok, second_activation} =
+             Overlay.activate(second_registry, "consumer", state_root: Path.join(root, "state-b"))
+
+    assert first_activation.report.context_digest == second_activation.report.context_digest
+    refute first_activation.report.overlay_digest == second_activation.report.overlay_digest
   end
 
   test "content addressing reuses identical bytes and changes across modes", context do
@@ -42,9 +105,15 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {:ok, second} = Overlay.activate(registry, "consumer", state_root: state_root)
     assert first.path == second.path
 
+    File.write!(Path.join(root, "consumer/target-change.txt"), "owned by target impact logic\n")
+    assert {:ok, target_changed} = Overlay.activate(registry, "consumer", state_root: state_root)
+    refute target_changed.path == first.path
+    assert target_changed.report.context_digest == first.report.context_digest
+
     File.write!(Path.join(root, "core/uncommitted.txt"), "changed source\n")
     assert {:ok, dirty} = Overlay.activate(registry, "consumer", state_root: state_root)
     refute dirty.path == first.path
+    refute dirty.report.context_digest == first.report.context_digest
 
     assert {:ok, git} = Overlay.activate(registry, "consumer", mode: :git, state_root: state_root)
     refute git.path == first.path
@@ -77,22 +146,37 @@ defmodule MixWorkspaceOps.OverlayTest do
     state_root = Path.join(root, "operator-state")
     initialize_repository!(Path.join(root, "core"))
     consumer = initialize_repository!(Path.join(root, "consumer"))
-    {:ok, bootstrap} = MixWorkspaceOps.Bootstrap.install(consumer)
     File.write!(Path.join(consumer, "mix.lock"), "%{}\n")
 
     File.write!(Path.join(consumer, "mix.exs"), """
-    Code.require_file(#{inspect(bootstrap)})
+    if bootstrap = System.get_env("MIX_WORKSPACE_OPS_BOOTSTRAP") do
+      Code.require_file(bootstrap)
+    end
 
     defmodule Consumer.MixProject do
       use Mix.Project
 
       def project do
         [app: :consumer, version: "0.1.0", deps: deps()] ++
-          MixWorkspaceOpsBootstrap.project_options(__DIR__)
+          workspace_project_options()
       end
 
       defp deps do
-        [MixWorkspaceOpsBootstrap.dep(:core, ">= 0.0.0", __DIR__)]
+        [workspace_dep(:core, ">= 0.0.0")]
+      end
+
+      defp workspace_dep(app, requirement) do
+        case Code.ensure_loaded(MixWorkspaceOpsBootstrap) do
+          {:module, module} -> apply(module, :dep, [app, requirement, __DIR__, []])
+          _other -> {app, requirement}
+        end
+      end
+
+      defp workspace_project_options do
+        case Code.ensure_loaded(MixWorkspaceOpsBootstrap) do
+          {:module, module} -> apply(module, :project_options, [__DIR__])
+          _other -> []
+        end
       end
     end
     """)

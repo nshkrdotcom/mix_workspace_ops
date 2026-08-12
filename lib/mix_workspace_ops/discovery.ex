@@ -3,7 +3,7 @@ defmodule MixWorkspaceOps.Discovery do
 
   alias MixWorkspaceOps.{Binding, Command, Git, Project}
 
-  @pruned_directories ~w(.git .github .worktrees .cache _build _legacy deps deps_legacy_* doc cover dist node_modules priv_plts temp tmp backup backups build_support vendor vendored test priv examples fixtures templates)
+  @pruned_directories ~w(.git .github .worktrees .cache _build _legacy deps deps_legacy_* doc cover dist node_modules priv_plts temp tmp backup backups build_support vendor vendored test priv fixtures templates)
 
   @spec scan(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
   def scan(checkout_root, github_owner) do
@@ -116,11 +116,11 @@ defmodule MixWorkspaceOps.Discovery do
 
   defp discover_projects(repository_root, repository_id, mix_files) do
     project_paths = Enum.map(mix_files, &Path.dirname/1)
-    workspace? = length(project_paths) > 1
+    workspace_root? = workspace_root?(repository_root, project_paths)
 
     project_paths
     |> Enum.map(fn project_path ->
-      discover_project(repository_root, repository_id, project_path, workspace?)
+      discover_project(repository_root, repository_id, project_path, workspace_root?)
     end)
     |> Enum.reduce({[], []}, fn
       {:ok, project}, {projects, errors} -> {[project | projects], errors}
@@ -129,32 +129,44 @@ defmodule MixWorkspaceOps.Discovery do
     |> then(fn {projects, errors} -> {Enum.sort_by(projects, & &1["id"]), errors} end)
   end
 
-  defp discover_project(repository_root, repository_id, project_path, workspace?) do
+  defp discover_project(repository_root, repository_id, project_path, workspace_root?) do
     relative_path = Path.relative_to(project_path, repository_root)
 
     case Project.metadata_at(project_path) do
       {:ok, metadata} ->
         project_id =
-          if workspace? or relative_path != ".",
+          if is_binary(metadata.app) and (workspace_root? or relative_path != "."),
             do: "#{repository_id}.#{metadata.app}",
             else: repository_id
 
-        {:ok,
-         %{
-           "id" => project_id,
-           "app" => metadata.app,
-           "path" => relative_path,
-           "kind" => project_kind(relative_path, workspace?),
-           "tags" => ["ecosystem"],
-           "profile" => "default"
-         }}
-
-      {:error, :non_application_mix_project} ->
-        {:error, {relative_path, "non_application_mix_project"}}
+        if is_nil(metadata.app) and relative_path != "." do
+          {:error, {relative_path, "non_application_nested_mix_project"}}
+        else
+          {:ok,
+           %{
+             "id" => project_id,
+             "app" => metadata.app,
+             "path" => relative_path,
+             "kind" => project_kind(relative_path, workspace_root?),
+             "tags" => ["ecosystem"],
+             "profile" => "default"
+           }}
+        end
 
       {:error, _reason} ->
         {:error, {relative_path, "mix_metadata_unavailable"}}
     end
+  end
+
+  defp workspace_root?(repository_root, project_paths) do
+    Enum.any?(project_paths, fn project_path ->
+      relative_path = Path.relative_to(project_path, repository_root)
+      relative_path != "." and not example_project_path?(relative_path)
+    end)
+  end
+
+  defp example_project_path?(relative_path) do
+    "examples" in Path.split(relative_path)
   end
 
   defp find_mix_files(root) do
@@ -178,6 +190,7 @@ defmodule MixWorkspaceOps.Discovery do
     applications =
       for repository <- repositories,
           project <- repository["projects"],
+          is_binary(project["app"]),
           do: %{
             app: project["app"],
             repository: repository["id"],

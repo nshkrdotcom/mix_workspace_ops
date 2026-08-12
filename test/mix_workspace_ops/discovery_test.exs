@@ -83,4 +83,47 @@ defmodule MixWorkspaceOps.DiscoveryTest do
     assert {:ok, discovery} = Discovery.scan(root, "example-org")
     assert [%{"default_branch" => "main"}] = discovery.registry.repositories
   end
+
+  test "keeps a non-application umbrella root as a workspace target", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "umbrella"), "[]", "example-org/umbrella")
+    File.mkdir_p!(Path.join(repository, "apps/child"))
+
+    File.write!(Path.join(repository, "mix.exs"), """
+    defmodule Umbrella.MixProject do
+      use Mix.Project
+      def project, do: [apps_path: "apps", version: "0.1.0"]
+    end
+    """)
+
+    File.write!(Path.join(repository, "apps/child/mix.exs"), """
+    defmodule Child.MixProject do
+      use Mix.Project
+      def project, do: [app: :child, version: "0.1.0"]
+    end
+    """)
+
+    assert {:ok, discovery} = Discovery.scan(root, "example-org")
+    assert [%{"projects" => projects}] = discovery.registry.repositories
+    assert Enum.any?(projects, &(&1["id"] == "umbrella" and is_nil(&1["app"])))
+    assert Enum.any?(projects, &(&1["app"] == "child"))
+  end
+
+  test "does not discard a real project merely because it lives under examples", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "lab"), "[]", "example-org/lab")
+    File.mkdir_p!(Path.join(repository, "sandbox/examples/proof"))
+
+    File.write!(Path.join(repository, "sandbox/examples/proof/mix.exs"), """
+    defmodule Proof.MixProject do
+      use Mix.Project
+      def project, do: [app: :proof, version: "0.1.0"]
+    end
+    """)
+
+    assert {:ok, discovery} = Discovery.scan(root, "example-org")
+    assert [%{"projects" => projects}] = discovery.registry.repositories
+    assert Enum.any?(projects, &(&1["id"] == "lab" and &1["kind"] == "standalone"))
+    assert Enum.any?(projects, &(&1["app"] == "proof"))
+  end
 end

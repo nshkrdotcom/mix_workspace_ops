@@ -15,12 +15,21 @@ defmodule MixWorkspaceOps.ProjectTest do
     assert metadata.version == "0.1.0"
   end
 
-  test "rejects non-application workspace roots", context do
+  test "loads dependency metadata from a non-application umbrella root", context do
     root = temporary_directory!(context)
     repository = initialize_repository!(Path.join(root, "alpha"))
-    mix_file = Path.join(repository, "mix.exs")
-    File.write!(mix_file, String.replace(File.read!(mix_file), "app: :alpha, ", "app: nil, "))
 
-    assert {:error, :non_application_mix_project} = Project.metadata_at(repository)
+    File.write!(Path.join(repository, "mix.exs"), """
+    defmodule Umbrella.MixProject do
+      use Mix.Project
+
+      def project, do: [apps_path: "apps", version: "0.1.0", deps: [{:jason, "~> 1.4"}]]
+    end
+    """)
+
+    assert {:ok, metadata} = Project.metadata_at(repository)
+    assert metadata.app == nil
+    assert metadata.version == "0.1.0"
+    assert metadata.dependencies == ["jason"]
   end
 end

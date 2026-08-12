@@ -77,9 +77,11 @@ defmodule MixWorkspaceOps.WorkspaceCase do
   end
 
   def project(id, app \\ nil, opts \\ []) do
+    application = Keyword.get(opts, :app, app || id)
+
     %{
       "id" => id,
-      "app" => app || id,
+      "app" => if(is_nil(application), do: :null, else: application),
       "path" => Keyword.get(opts, :path, "."),
       "kind" => Keyword.get(opts, :kind, "standalone"),
       "tags" => Keyword.get(opts, :tags, ["fixture"]),

@@ -1,5 +1,5 @@
 defmodule MixWorkspaceOps.Runtime do
-  @moduledoc "Operator-owned lock, dependency, build, and Hex isolation for one source digest."
+  @moduledoc "Mix-state ownership for one source context."
 
   @spec prepare(String.t(), String.t(), binary()) :: {:ok, map()} | {:error, term()}
   def prepare(state_root, digest, lock_bytes) do
@@ -26,6 +26,7 @@ defmodule MixWorkspaceOps.Runtime do
          ],
          report: %{
            schema: "mix_workspace_ops.runtime/v1",
+           ownership: :managed,
            digest: digest,
            root: root,
            deps_path: deps,
@@ -36,6 +37,20 @@ defmodule MixWorkspaceOps.Runtime do
          }
        }}
     end
+  end
+
+  @doc "Returns a state report for a command that owns its child Mix state."
+  @spec delegated(String.t()) :: {:ok, map()}
+  def delegated(digest) do
+    {:ok,
+     %{
+       env: [],
+       report: %{
+         schema: "mix_workspace_ops.runtime/v1",
+         ownership: :delegated,
+         digest: digest
+       }
+     }}
   end
 
   defp mkdir_private(path) do

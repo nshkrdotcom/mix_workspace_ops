@@ -12,7 +12,7 @@ defmodule MixWorkspaceOps.Registry do
 
   @type project :: %{
           id: String.t(),
-          app: String.t(),
+          app: String.t() | nil,
           path: String.t(),
           kind: String.t(),
           tags: [String.t()],
@@ -45,7 +45,7 @@ defmodule MixWorkspaceOps.Registry do
          {:ok, decoded} <- decode(bytes),
          {:ok, repositories} <- parse_registry(decoded),
          {:ok, projects} <- index_unique(repositories, :projects, :id, "project id"),
-         {:ok, applications} <- index_unique(repositories, :projects, :app, "application") do
+         {:ok, applications} <- index_applications(repositories) do
       {:ok,
        %__MODULE__{
          path: path,
@@ -111,7 +111,12 @@ defmodule MixWorkspaceOps.Registry do
       |> Map.new(&{&1.id, &1})
 
     projects = Map.new(selected_projects, &{&1.id, &1})
-    applications = Map.new(selected_projects, &{&1.app, &1})
+
+    applications =
+      selected_projects
+      |> Enum.filter(&is_binary(&1.app))
+      |> Map.new(&{&1.app, &1})
+
     bindings = Map.take(registry.bindings, Map.keys(repositories))
 
     %{
@@ -211,10 +216,10 @@ defmodule MixWorkspaceOps.Registry do
          } = raw,
          repository_id
        )
-       when map_size(raw) == 6 and is_binary(id) and is_binary(app) and is_binary(path) and
-              is_binary(kind) and is_list(tags) and is_binary(profile) do
-    with :ok <- validate_stable_id(id),
-         :ok <- validate_identifier(app),
+       when map_size(raw) == 6 do
+    with {:ok, app} <- normalize_project_fields(id, app, path, kind, tags, profile),
+         :ok <- validate_stable_id(id),
+         :ok <- validate_application(app, kind),
          :ok <- validate_relative_path(path),
          :ok <- validate_kind(kind),
          :ok <- validate_tags(tags),
@@ -229,10 +234,24 @@ defmodule MixWorkspaceOps.Registry do
          profile: profile,
          repository: repository_id
        }}
+    else
+      :error -> {:error, {:invalid_project, raw}}
+      error -> error
     end
   end
 
   defp parse_project(raw, _repository_id), do: {:error, {:invalid_project, raw}}
+
+  defp normalize_project_fields(id, app, path, kind, tags, profile) do
+    strings? = Enum.all?([id, path, kind, profile], &is_binary/1)
+    app? = is_binary(app) or is_nil(app) or app == :null
+
+    if strings? and app? and is_list(tags) do
+      {:ok, if(app == :null, do: nil, else: app)}
+    else
+      :error
+    end
+  end
 
   defp parse_list(entries, parser) do
     entries
@@ -257,6 +276,19 @@ defmodule MixWorkspaceOps.Registry do
     end
   end
 
+  defp index_applications(repositories) do
+    entries =
+      for repository <- repositories,
+          project <- repository.projects,
+          is_binary(project.app),
+          do: project
+
+    case ensure_unique(entries, :app, "application") do
+      {:ok, unique} -> {:ok, Map.new(unique, &{&1.app, &1})}
+      error -> error
+    end
+  end
+
   defp ensure_unique(entries, key, label) do
     duplicates =
       entries
@@ -275,6 +307,10 @@ defmodule MixWorkspaceOps.Registry do
       do: :ok,
       else: {:error, {:invalid_identifier, identifier}}
   end
+
+  defp validate_application(nil, kind) when kind in ["workspace_root", "tooling"], do: :ok
+  defp validate_application(app, _kind) when is_binary(app), do: validate_identifier(app)
+  defp validate_application(app, kind), do: {:error, {:invalid_application, app, kind}}
 
   defp validate_stable_id(identifier) do
     if Regex.match?(~r/^[a-z][a-z0-9_.-]*$/, identifier),

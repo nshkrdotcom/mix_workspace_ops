@@ -1,36 +1,32 @@
 defmodule MixWorkspaceOps.Bootstrap do
-  @moduledoc "Installation and drift checks for the minimal project-side source bootstrap."
+  @moduledoc "Materializes the Mix-load bootstrap in operator-owned state."
 
-  @relative_path "build_support/mix_workspace_ops_bootstrap.exs"
+  @environment_variable "MIX_WORKSPACE_OPS_BOOTSTRAP"
   @template Path.expand("../../priv/bootstrap/mix_workspace_ops_bootstrap.exs", __DIR__)
   @external_resource @template
   @contents File.read!(@template)
 
-  @spec relative_path() :: String.t()
-  def relative_path, do: @relative_path
+  @doc "Returns the variable containing the explicit operator bootstrap path."
+  @spec environment_variable() :: String.t()
+  def environment_variable, do: @environment_variable
 
   @spec contents() :: binary()
   def contents, do: @contents
 
-  @spec status(String.t()) :: :missing | :current | {:drifted, String.t()}
-  def status(project_root) do
-    path = Path.join(project_root, @relative_path)
+  @doc "Writes or reuses the exact bootstrap beneath operator-owned state."
+  @spec materialize(String.t()) :: {:ok, String.t()} | {:error, term()}
+  def materialize(state_root) do
+    path =
+      state_root
+      |> Path.expand()
+      |> Path.join("bootstrap")
+      |> Path.join(digest(contents()) <> ".exs")
 
     case File.read(path) do
-      {:ok, bytes} -> if(bytes == contents(), do: :current, else: {:drifted, digest(bytes)})
-      {:error, :enoent} -> :missing
-      {:error, reason} -> {:drifted, inspect(reason)}
-    end
-  end
-
-  @spec install(String.t()) :: {:ok, String.t()} | {:error, term()}
-  def install(project_root) do
-    path = Path.join(project_root, @relative_path)
-
-    case status(project_root) do
-      :current -> {:ok, path}
-      :missing -> write(path, contents())
-      {:drifted, digest} -> {:error, {:bootstrap_drift, path, digest}}
+      {:ok, bytes} when bytes == @contents -> {:ok, path}
+      {:ok, _bytes} -> {:error, {:bootstrap_digest_collision, path}}
+      {:error, :enoent} -> write(path, contents())
+      {:error, reason} -> {:error, {:bootstrap_read, path, reason}}
     end
   end
 
@@ -38,7 +34,9 @@ defmodule MixWorkspaceOps.Bootstrap do
     temporary = path <> ".tmp.#{System.unique_integer([:positive])}"
 
     with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- File.chmod(Path.dirname(path), 0o700),
          :ok <- File.write(temporary, bytes, [:sync]),
+         :ok <- File.chmod(temporary, 0o600),
          :ok <- File.rename(temporary, path) do
       {:ok, path}
     end

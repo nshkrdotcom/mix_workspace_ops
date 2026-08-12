@@ -3,6 +3,22 @@ defmodule MixWorkspaceOps.RegistryTest do
 
   alias MixWorkspaceOps.{Graph, Registry}
 
+  test "allows a non-application workspace root without indexing a fake app", context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "workspace"))
+
+    path =
+      write_registry!(root, [
+        repository("workspace", [
+          project("workspace", nil, kind: "workspace_root", app: nil)
+        ])
+      ])
+
+    assert {:ok, registry} = Registry.load(path)
+    assert registry.projects["workspace"].app == nil
+    assert registry.applications == %{}
+  end
+
   test "loads, binds, and derives a dependency closure", context do
     root = temporary_directory!(context)
     initialize_repository!(Path.join(root, "core"))

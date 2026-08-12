@@ -20,17 +20,16 @@ defmodule MixWorkspaceOps.BootstrapTest do
     :ok
   end
 
-  test "installs an exact minimal bootstrap and refuses drift", context do
+  test "materializes one exact bootstrap outside managed repositories", context do
     root = temporary_directory!(context)
+    project = Path.join(root, "project")
+    File.mkdir_p!(project)
 
-    assert {:ok, path} = Bootstrap.install(root)
-    assert path == Path.join(root, Bootstrap.relative_path())
+    assert {:ok, path} = Bootstrap.materialize(Path.join(root, "state"))
+    assert String.starts_with?(path, Path.join(root, "state/bootstrap"))
     assert File.read!(path) == Bootstrap.contents()
-    assert Bootstrap.status(root) == :current
-
-    File.write!(path, "operator edit\n")
-    assert {:drifted, digest} = Bootstrap.status(root)
-    assert {:error, {:bootstrap_drift, ^path, ^digest}} = Bootstrap.install(root)
+    assert {:ok, ^path} = Bootstrap.materialize(Path.join(root, "state"))
+    refute File.exists?(Path.join(project, "build_support"))
   end
 
   test "the standalone bootstrap reads only the explicit absolute overlay", context do
@@ -42,7 +41,8 @@ defmodule MixWorkspaceOps.BootstrapTest do
 
     contents =
       "mix_workspace_ops.overlay/v1\n" <>
-        "registry_digest\tdigest\ngraph_digest\tgraph\ntarget\tconsumer\nmode\tlocal\n" <>
+        "registry_digest\tdigest\ngraph_digest\tgraph\ncontext_digest\tcontext\n" <>
+        "target\tconsumer\nmode\tlocal\n" <>
         "target_head\trevision\ntarget_source_digest\tsource\n" <>
         "lock_digest\tlock\ntoolchain\telixir-test-otp-test\n" <>
         "dependency\tpath\t#{dependency}\trevision\tsource\n"

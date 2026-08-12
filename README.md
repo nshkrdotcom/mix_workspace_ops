@@ -47,6 +47,14 @@ and publication receipts. It does not own a user's ecosystem registry,
 application runtime configuration, product acceptance, package projection
 semantics, or workspace impact scheduling.
 
+The default repository integration is zero code. Repositories without
+switchable cross-repository internal dependencies need no MWO file, module,
+task, or dependency. Existing `mix.exs` files remain authoritative; only a
+project whose dependency tuple must switch between Hex and an explicit operator
+overlay needs the minimal Mix-load seam. Exceptional repository configuration,
+if ever required, is limited to one declarative manifest rather than a copied
+helper subsystem.
+
 ## Registry-driven usage
 
 The portable registry contains GitHub identities and relative Mix-project
@@ -70,7 +78,7 @@ then verified against its Git origin and Git common directory.
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \
   --project example.consumer \
-  --mode local -- mix test
+  --mode local --mix-state managed -- mix test
 ```
 
 Local and Git overlays are stored beneath operator-owned XDG state and passed
@@ -78,16 +86,28 @@ only to the child command through `MIX_WORKSPACE_OPS_OVERLAY`. No source-mode
 state is written into managed repositories. A direct `mix` invocation with no
 overlay environment variable uses the ordinary dependency declarations.
 
-Every launched command also receives content-addressed, operator-owned
-`MIX_DEPS_PATH`, `MIX_BUILD_ROOT`, `HEX_HOME`, and lockfile state. Different
-source modes, dependency commits, target commits, lockfiles, and Elixir/OTP
-toolchains cannot share mutable Mix artifacts. Publication is refused through
-`run`; it is available only through the release transaction below.
+MWO materializes its bootstrap in operator state and supplies its path through
+`MIX_WORKSPACE_OPS_BOOTSTRAP`; it does not install executable helper code into
+the repository. `MIX_WORKSPACE_OPS_CONTEXT_DIGEST` identifies the normalized,
+path-independent dependency-source selection for cache-aware callers.
+
+Managed Mix-state mode supplies content-addressed, operator-owned
+`MIX_DEPS_PATH`, `MIX_BUILD_ROOT`, `HEX_HOME`, and lockfile state for one Mix
+graph. Delegated mode supplies only the source/bootstrap context so a workspace
+runner can retain ownership of its child state:
+
+```bash
+./mix_workspace_ops run ... --mix-state delegated -- runner command
+```
+
+Publication is refused through `run`; it is available only through the release
+transaction below.
 
 Discovery is also generic. It accepts the owner explicitly, deduplicates by Git
 identity, rejects worktrees and wrongly named clones, prunes generated and
 fixture trees, and records unloadable or duplicate Mix applications as
-unresolved evidence rather than guessing an identity.
+unresolved evidence rather than guessing an identity. A real project is not
+discarded merely because it lives beneath `examples` or `support`.
 
 Release publication is a separate, fail-closed transaction over an already
 committed and pushed revision:
@@ -102,5 +122,6 @@ checkout, persists every transition, exposes credentials only to its publisher
 step, verifies the Hex checksum, and creates the tag only afterward.
 
 See [Architecture](guides/architecture.md) for the ownership split and safety
-model, and [Fail-closed release transaction](guides/release_transaction.md) for
-the publication state machine.
+model, [Contract examples](examples/contract_examples.md) for the synthetic runner seam,
+and [Fail-closed release transaction](guides/release_transaction.md) for the
+publication state machine.

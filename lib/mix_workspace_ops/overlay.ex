@@ -1,9 +1,10 @@
 defmodule MixWorkspaceOps.Overlay do
   @moduledoc "Content-addressed, operator-owned source overlays activated only in child processes."
 
-  alias MixWorkspaceOps.{Git, Graph, Registry, Runtime}
+  alias MixWorkspaceOps.{Bootstrap, Git, Graph, Registry, Runtime}
 
   @env "MIX_WORKSPACE_OPS_OVERLAY"
+  @context_env "MIX_WORKSPACE_OPS_CONTEXT_DIGEST"
   @header "mix_workspace_ops.overlay/v1"
   @maximum_bytes 16 * 1024 * 1024
 
@@ -16,10 +17,15 @@ defmodule MixWorkspaceOps.Overlay do
   @spec environment_variable() :: String.t()
   def environment_variable, do: @env
 
+  @doc "Returns the subprocess variable carrying the path-independent source context."
+  @spec context_environment_variable() :: String.t()
+  def context_environment_variable, do: @context_env
+
   @spec activate(Registry.t(), String.t() | atom(), keyword()) ::
           {:ok, activation()} | {:error, term()}
   def activate(registry, target, opts \\ []) do
     mode = Keyword.get(opts, :mode, :local)
+    mix_state = Keyword.get(opts, :mix_state, :managed)
     state_root = Keyword.get_lazy(opts, :state_root, &default_state_root/0)
 
     with {:ok, resolution} <- Graph.resolve(registry, target),
@@ -27,12 +33,39 @@ defmodule MixWorkspaceOps.Overlay do
          target_project <- Registry.project!(registry, target),
          target_root <- Registry.project_root(registry, target_project),
          {:ok, lock_bytes} <- source_lock(target_root),
+         context <-
+           context_contents(
+             registry,
+             to_string(target),
+             mode,
+             resolution,
+             rows,
+             target_project,
+             lock_bytes
+           ),
+         context_digest <- digest(context),
          contents <-
-           contents(registry, to_string(target), mode, resolution, rows, target_root, lock_bytes),
-         digest <- digest(contents),
-         {:ok, path} <- materialize(state_root, digest, contents, mode),
-         {:ok, runtime} <- Runtime.prepare(state_root, digest, lock_bytes) do
-      env = [{@env, path} | runtime.env]
+           contents(
+             registry,
+             to_string(target),
+             mode,
+             resolution,
+             rows,
+             target_root,
+             lock_bytes,
+             context_digest
+           ),
+         overlay_digest <- digest(contents),
+         {:ok, path} <- materialize(state_root, overlay_digest, contents, mode),
+         {:ok, bootstrap_path} <- Bootstrap.materialize(state_root),
+         {:ok, runtime} <- prepare_runtime(mix_state, state_root, context_digest, lock_bytes) do
+      env =
+        [
+          {Bootstrap.environment_variable(), bootstrap_path},
+          {@env, path},
+          {@context_env, context_digest}
+          | runtime.env
+        ]
 
       {:ok,
        %{
@@ -44,8 +77,10 @@ defmodule MixWorkspaceOps.Overlay do
            mode: mode,
            registry_digest: registry.digest,
            graph_digest: resolution.digest,
-           overlay_digest: digest,
+           overlay_digest: overlay_digest,
+           context_digest: context_digest,
            overlay_path: path,
+           bootstrap_path: bootstrap_path,
            runtime: runtime.report,
            projects: Enum.map(resolution.projects, & &1.id),
            edges: resolution.edges,
@@ -89,6 +124,7 @@ defmodule MixWorkspaceOps.Overlay do
 
   defp source_rows(registry, projects, :local) do
     projects
+    |> Enum.reject(&is_nil(&1.app))
     |> Enum.map(fn project ->
       path = Registry.project_root(registry, project)
 
@@ -103,6 +139,7 @@ defmodule MixWorkspaceOps.Overlay do
 
   defp source_rows(registry, projects, :git) do
     projects
+    |> Enum.reject(&is_nil(&1.app))
     |> Enum.map(fn project ->
       repository = Registry.repository!(registry, project.repository)
       root = Registry.repository_root(registry, repository.id)
@@ -126,11 +163,21 @@ defmodule MixWorkspaceOps.Overlay do
     end)
   end
 
-  defp contents(registry, target, mode, resolution, rows, target_root, lock_bytes) do
+  defp contents(
+         registry,
+         target,
+         mode,
+         resolution,
+         rows,
+         target_root,
+         lock_bytes,
+         context_digest
+       ) do
     metadata = [
       @header,
       "registry_digest\t#{registry.digest}",
       "graph_digest\t#{resolution.digest}",
+      "context_digest\t#{context_digest}",
       "target\t#{target}",
       "mode\t#{mode}",
       "target_head\t#{Git.head!(target_root)}",
@@ -142,6 +189,69 @@ defmodule MixWorkspaceOps.Overlay do
     (metadata ++ Enum.map(rows, &Enum.join(&1, "\t")))
     |> Enum.join("\n")
     |> Kernel.<>("\n")
+  end
+
+  defp context_contents(
+         registry,
+         target,
+         mode,
+         resolution,
+         rows,
+         target_project,
+         lock_bytes
+       ) do
+    target_repository = Registry.repository!(registry, target_project.repository)
+
+    metadata = [
+      "mix_workspace_ops.context/v1",
+      "graph_digest\t#{resolution.digest}",
+      "target\t#{target}",
+      "mode\t#{mode}",
+      "target_repository\t#{target_repository.github}",
+      "target_project_path\t#{target_project.path}",
+      "lock_digest\t#{digest(lock_bytes)}",
+      "toolchain\telixir-#{System.version()}-otp-#{:erlang.system_info(:otp_release)}"
+    ]
+
+    sources =
+      Enum.map(rows, fn [app | _rest] = row ->
+        {:ok, project} = Registry.project_for_app(registry, app)
+        semantic_source(registry, project, row, target_project.repository)
+      end)
+
+    (metadata ++ sources)
+    |> Enum.join("\n")
+    |> Kernel.<>("\n")
+  end
+
+  defp semantic_source(registry, project, [app, kind | _rest], target_repository)
+       when project.repository == target_repository do
+    repository = Registry.repository!(registry, project.repository)
+    Enum.join(["source", app, kind, repository.github, project.path, "target-repository"], "\t")
+  end
+
+  defp semantic_source(
+         registry,
+         project,
+         [app, "path", _path, revision, source_digest],
+         _target_repository
+       ) do
+    repository = Registry.repository!(registry, project.repository)
+
+    Enum.join(
+      ["source", app, "path", repository.github, project.path, revision, source_digest],
+      "\t"
+    )
+  end
+
+  defp semantic_source(
+         registry,
+         project,
+         [app, "git", _url, revision, subdir],
+         _target_repository
+       ) do
+    repository = Registry.repository!(registry, project.repository)
+    Enum.join(["source", app, "git", repository.github, project.path, revision, subdir], "\t")
   end
 
   defp materialize(_state_root, _digest, _contents, :hex), do: {:ok, nil}
@@ -180,6 +290,7 @@ defmodule MixWorkspaceOps.Overlay do
         @header,
         "registry_digest\t" <> registry_digest,
         "graph_digest\t" <> graph_digest,
+        "context_digest\t" <> context_digest,
         "target\t" <> target,
         "mode\t" <> mode,
         "target_head\t" <> target_head,
@@ -194,6 +305,7 @@ defmodule MixWorkspaceOps.Overlay do
              schema: @header,
              registry_digest: registry_digest,
              graph_digest: graph_digest,
+             context_digest: context_digest,
              target: target,
              mode: mode,
              target_head: target_head,
@@ -242,6 +354,15 @@ defmodule MixWorkspaceOps.Overlay do
     base = System.get_env("XDG_STATE_HOME") || Path.join(System.user_home!(), ".local/state")
     Path.join(base, "mix_workspace_ops")
   end
+
+  defp prepare_runtime(:managed, state_root, digest, lock_bytes),
+    do: Runtime.prepare(state_root, digest, lock_bytes)
+
+  defp prepare_runtime(:delegated, _state_root, digest, _lock_bytes),
+    do: Runtime.delegated(digest)
+
+  defp prepare_runtime(mode, _state_root, _digest, _lock_bytes),
+    do: {:error, {:unsupported_mix_state, mode}}
 
   defp source_lock(project_root) do
     case File.read(Path.join(project_root, "mix.lock")) do
