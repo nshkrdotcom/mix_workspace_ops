@@ -61,8 +61,12 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
   defp gates(context) do
     Enum.reduce_while(context.plan.gates, {:ok, %{}}, fn [executable | argv], {:ok, _evidence} ->
       case isolated_run(executable, argv, cd: context.project) do
-        {:ok, _result} -> {:cont, {:ok, %{}}}
-        {:error, result} -> {:halt, {:error, {:gate_failed, executable, argv, result.exit_code}}}
+        {:ok, _result} ->
+          {:cont, {:ok, %{}}}
+
+        {:error, result} ->
+          IO.binwrite(:stderr, result.output)
+          {:halt, {:error, {:gate_failed, executable, argv, result.exit_code}}}
       end
     end)
   end

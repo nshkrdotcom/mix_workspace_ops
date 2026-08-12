@@ -17,14 +17,14 @@ defmodule MixWorkspaceOps.Release.DescriptorTest do
         "version" => "1.2.0",
         "tag" => "v1.2.0",
         "default_branch" => "main",
-        "gates" => [["mix", "test"]],
+        "gates" => [["mix", "deps.get"], ["mix", "test"]],
         "publisher_prefix" => ["/operator/with_secrets"]
       })
     )
 
     assert {:ok, plan} = Descriptor.load(path)
     assert plan.package == "sample_package"
-    assert plan.gates == [["mix", "test"]]
+    assert plan.gates == [["mix", "deps.get"], ["mix", "test"]]
   end
 
   test "rejects a tag that does not name the exact version", context do

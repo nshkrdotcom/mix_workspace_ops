@@ -1,6 +1,8 @@
 defmodule MixWorkspaceOps.Release.LocalAdapterTest do
   use MixWorkspaceOps.WorkspaceCase, async: false
 
+  import ExUnit.CaptureIO
+
   alias MixWorkspaceOps.Release.LocalAdapter
 
   test "Hex requests identify the release client" do
@@ -56,6 +58,23 @@ defmodule MixWorkspaceOps.Release.LocalAdapterTest do
     }
 
     assert {:ok, %{}} = LocalAdapter.transition(:gates, context)
+  end
+
+  test "a failed gate reports diagnostics without adding them to the error", context do
+    root = temporary_directory!(context)
+
+    context = %{
+      project: root,
+      plan: %{gates: [["sh", "-c", "printf gate-diagnostic >&2; exit 19"]]}
+    }
+
+    output =
+      capture_io(:stderr, fn ->
+        assert {:error, {:gate_failed, "sh", ["-c", _command], 19}} =
+                 LocalAdapter.transition(:gates, context)
+      end)
+
+    assert output == "gate-diagnostic"
   end
 
   defp run!(executable, arguments, cwd) do

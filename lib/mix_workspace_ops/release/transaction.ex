@@ -119,8 +119,9 @@ defmodule MixWorkspaceOps.Release.Transaction do
   defp validate_plan(_plan), do: {:error, :invalid_release_plan}
 
   defp transaction_id(plan) do
-    nonce = System.unique_integer([:positive, :monotonic])
-    "#{plan.package}-#{plan.version}-#{nonce}"
+    timestamp = System.system_time(:microsecond)
+    nonce = :crypto.strong_rand_bytes(6) |> Base.url_encode64(padding: false)
+    "#{plan.package}-#{plan.version}-#{timestamp}-#{nonce}"
   end
 
   defp default_state_root do

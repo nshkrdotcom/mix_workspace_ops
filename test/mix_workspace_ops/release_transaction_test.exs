@@ -80,6 +80,24 @@ defmodule MixWorkspaceOps.Release.TransactionTest do
     assert File.read!(receipt) =~ "adapter_exception"
   end
 
+  test "a transaction id cannot append to an earlier receipt", context do
+    state_root = temporary_directory!(context)
+
+    assert {:error, {:release_transition, :preflight, {:injected, :preflight}, _receipt}} =
+             Transaction.run(plan(:preflight), Adapter,
+               state_root: state_root,
+               transaction_id: "one-attempt"
+             )
+
+    expected = Path.join([state_root, "releases", "one-attempt"])
+
+    assert {:error, {:transaction_exists, ^expected}} =
+             Transaction.run(plan(nil), Adapter,
+               state_root: state_root,
+               transaction_id: "one-attempt"
+             )
+  end
+
   defp plan(fail_at) do
     %{
       package: "sample_package",

@@ -8,7 +8,7 @@ The transaction persists a synced append-only receipt and advances through:
 
 1. repository, branch, upstream, package/version, tag, and overlay preflight;
 2. a clean detached checkout of the already-pushed commit;
-3. structured gate commands;
+3. structured gate commands, beginning with dependency hydration in a clean checkout;
 4. archive construction and SHA-256 calculation;
 5. the one credential-bearing publisher invocation;
 6. Hex API version and checksum verification;
@@ -38,7 +38,7 @@ Example descriptor:
   "version": "1.2.0",
   "tag": "v1.2.0",
   "default_branch": "main",
-  "gates": [["mix", "ci"], ["mix", "docs", "--warnings-as-errors"]],
+  "gates": [["mix", "deps.get"], ["mix", "ci"], ["mix", "docs", "--warnings-as-errors"]],
   "publisher_prefix": ["/operator/bin/with_secrets"]
 }
 ```
@@ -46,6 +46,10 @@ Example descriptor:
 The absolute repository and publisher paths make this descriptor operator
 state, not portable registry data. A package repository or ecosystem registry
 must not commit it.
+
+The checkout deliberately contains no inherited `_build` or `deps`. The first
+gate must therefore hydrate dependencies explicitly; no ambient source tree or
+shared cache is treated as release evidence.
 
 ## Prepared-artifact owner seam
 
