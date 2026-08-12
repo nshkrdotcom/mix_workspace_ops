@@ -44,3 +44,16 @@ Example descriptor:
 The absolute repository and publisher paths make this descriptor operator
 state, not portable registry data. A package repository or ecosystem registry
 must not commit it.
+
+## Prepared-artifact owner seam
+
+A projection tool may add a `handoff` object to its release metadata using
+`mix_workspace_ops.prepared_artifact/v1`. The bounded object identifies the
+package/version, source revision, relative prepared-project and archive paths,
+and SHA-256 digests. `MixWorkspaceOps.Release.PreparedArtifact` validates that
+portable data without depending on the producer or interpreting its manifest.
+
+The producer retains projection and preparation ownership. MWO retains the
+eventual clean-checkout transaction. Consuming this handoff in a real projected
+package release is deferred until a product release requires it; synthetic
+inputs exercise the schema now.
