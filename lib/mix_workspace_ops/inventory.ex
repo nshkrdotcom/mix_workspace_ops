@@ -6,7 +6,7 @@ defmodule MixWorkspaceOps.Inventory do
   @helper_name "dependency_sources.exs"
   @config_name "dependency_sources.config.exs"
   @excluded_segments ~w(.git _build deps doc cover node_modules priv_plts)
-  @pruned_names ~w(.git .worktrees _build deps doc cover dist node_modules souleqRepo temp)
+  @pruned_names ~w(.git .worktrees _build deps doc cover dist node_modules temp tmp backup backups)
 
   @type row :: %{
           repository_root: String.t(),
@@ -33,7 +33,6 @@ defmodule MixWorkspaceOps.Inventory do
         |> String.split("\n", trim: true)
         |> Enum.reject(&excluded?/1)
         |> Enum.map(&inspect_helper/1)
-        |> Enum.filter(&nshkr_remote?(&1.remote))
         |> Enum.sort_by(&{&1.repository_root, &1.helper_path})
 
       {:ok, rows}
@@ -112,8 +111,6 @@ defmodule MixWorkspaceOps.Inventory do
     common_dir == Path.join(repository_root, ".git") and
       Path.basename(repository_root) == repository_name
   end
-
-  defp nshkr_remote?(remote), do: String.contains?(remote, "nshkrdotcom/")
 
   defp present_path(path), do: if(File.regular?(path), do: path)
   defp digest_optional(path), do: if(File.regular?(path), do: digest_file(path))

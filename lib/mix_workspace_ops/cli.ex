@@ -1,7 +1,17 @@
 defmodule MixWorkspaceOps.CLI do
   @moduledoc false
 
-  alias MixWorkspaceOps.{Bootstrap, Catalog, Command, Doctor, Graph, Inventory, Overlay, Report}
+  alias MixWorkspaceOps.{
+    Bootstrap,
+    Command,
+    Doctor,
+    Graph,
+    Inventory,
+    Overlay,
+    Registry,
+    Report,
+    View
+  }
 
   @spec main([String.t()]) :: no_return()
   def main(args) do
@@ -37,9 +47,42 @@ defmodule MixWorkspaceOps.CLI do
   defp dispatch(["help"]), do: :usage
   defp dispatch([]), do: :usage
 
+  defp dispatch(["registry", "validate" | args]) do
+    with {:ok, options, []} <- registry_options(args),
+         :ok <- require_option(options, :registry),
+         {:ok, registry} <- Registry.load(options.registry) do
+      {:ok,
+       %{
+         schema: Registry.schema(),
+         digest: registry.digest,
+         repositories: map_size(registry.repositories),
+         projects: map_size(registry.projects),
+         applications: map_size(registry.applications)
+       }}
+    end
+  end
+
+  defp dispatch(["registry", "select" | args]) do
+    with {:ok, options, []} <- registry_options(args),
+         :ok <- require_options(options, [:registry, :view]),
+         {:ok, registry} <- Registry.load(options.registry),
+         {:ok, view} <- View.load(options.view),
+         {:ok, projects} <- View.select(registry, view) do
+      {:ok,
+       %{
+         schema: "mix_workspace_ops.selection/v1",
+         registry_digest: registry.digest,
+         view: view.id,
+         view_digest: view.digest,
+         projects: Enum.map(projects, & &1.id)
+       }}
+    end
+  end
+
   defp dispatch(["inventory" | args]) do
-    with {:ok, options, []} <- parse_options(args, root: "/home/home/p/g/n", output: nil),
-         {:ok, rows} <- Inventory.scan(options.root),
+    with {:ok, options, []} <- parse_options(args, checkout_root: nil, output: nil),
+         :ok <- require_option(options, :checkout_root),
+         {:ok, rows} <- Inventory.scan(options.checkout_root),
          report = Inventory.summary(rows),
          :ok <- maybe_write_report(options.output, report) do
       {:ok, report}
@@ -47,62 +90,100 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   defp dispatch(["doctor" | args]) do
-    with {:ok, options, []} <- catalog_options(args),
-         {:ok, catalog} <- Catalog.load(options.catalog, root: options.root) do
-      report = Doctor.inspect(catalog)
+    with {:ok, options, []} <- registry_options(args),
+         {:ok, registry} <- load_bound_registry(options) do
+      report = Doctor.inspect(registry)
       if report.healthy, do: {:ok, report}, else: {:error, {:unhealthy_workspace, report}}
     end
   end
 
   defp dispatch(["plan" | args]) do
-    with {:ok, options, []} <- catalog_options(args, project: nil),
+    with {:ok, options, []} <- registry_options(args, project: nil),
          :ok <- require_option(options, :project),
-         {:ok, catalog} <- Catalog.load(options.catalog, root: options.root) do
-      projects = Graph.closure(catalog, options.project)
-
+         {:ok, registry} <- load_bound_registry(options),
+         :ok <- ensure_project_in_view(registry, options),
+         {:ok, resolution} <- Graph.resolve(registry, options.project) do
       {:ok,
        %{
-         schema: 1,
+         schema: "mix_workspace_ops.plan/v1",
          target: options.project,
-         catalog_digest: catalog.digest,
-         projects: Enum.map(projects, & &1.app),
-         edges: Graph.edges(catalog)
+         registry_digest: registry.digest,
+         graph_digest: resolution.digest,
+         projects: Enum.map(resolution.projects, & &1.id),
+         edges: resolution.edges,
+         external_dependencies: resolution.external_dependencies
        }}
     end
   end
 
   defp dispatch(["run" | args]) do
     with {:ok, option_args, command} <- split_command(args),
-         {:ok, options, []} <- catalog_options(option_args, project: nil, mode: "local"),
+         {:ok, options, []} <- registry_options(option_args, project: nil, mode: "local"),
          :ok <- require_option(options, :project),
          :ok <- require_command(command),
-         {:ok, catalog} <- Catalog.load(options.catalog, root: options.root),
+         {:ok, registry} <- load_bound_registry(options),
+         :ok <- ensure_project_in_view(registry, options),
          {:ok, mode} <- source_mode(options.mode) do
-      project_root = Catalog.project_root(catalog, options.project)
+      project_root = Registry.project_root(registry, options.project)
 
-      result =
-        Overlay.with_activation(catalog, options.project, [mode: mode], fn source_report ->
-          run_command(command, project_root, source_report)
-        end)
-
-      result
+      Overlay.with_activation(
+        registry,
+        options.project,
+        [mode: mode, state_root: options.state_root],
+        fn source_report, env -> run_command(command, project_root, source_report, env) end
+      )
     end
   end
 
   defp dispatch(["bootstrap", "install" | args]) do
-    with {:ok, options, []} <- catalog_options(args, project: nil),
+    with {:ok, options, []} <- registry_options(args, project: nil),
          :ok <- require_option(options, :project),
-         {:ok, catalog} <- Catalog.load(options.catalog, root: options.root),
-         project_root = Catalog.project_root(catalog, options.project),
+         {:ok, registry} <- load_bound_registry(options),
+         project_root = Registry.project_root(registry, options.project),
          {:ok, path} <- Bootstrap.install(project_root) do
-      {:ok, %{schema: 1, project: options.project, path: path, status: :current}}
+      {:ok,
+       %{
+         schema: "mix_workspace_ops.bootstrap/v1",
+         project: options.project,
+         path: path,
+         status: :current
+       }}
     end
   end
 
-  defp dispatch(args), do: {:usage_error, "unknown command: #{Enum.join(args, " ")}"}
+  defp dispatch(args), do: {:usage_error, "unknown command: #{Enum.join(args, " ")} "}
 
-  defp catalog_options(args, defaults \\ []) do
-    defaults = Keyword.merge([catalog: "workspace.json", root: "/home/home/p/g/n"], defaults)
+  defp load_bound_registry(options) do
+    with :ok <- require_options(options, [:registry, :checkout_root]),
+         {:ok, registry} <- Registry.load(options.registry) do
+      Registry.bind(registry, options.checkout_root, binding_file: options.binding)
+    end
+  end
+
+  defp ensure_project_in_view(_registry, %{view: nil}), do: :ok
+
+  defp ensure_project_in_view(registry, options) do
+    with {:ok, view} <- View.load(options.view),
+         {:ok, projects} <- View.select(registry, view) do
+      if Enum.any?(projects, &(&1.id == options.project)),
+        do: :ok,
+        else: {:error, {:project_outside_view, options.project, view.id}}
+    end
+  end
+
+  defp registry_options(args, defaults \\ []) do
+    defaults =
+      Keyword.merge(
+        [
+          registry: nil,
+          checkout_root: nil,
+          binding: nil,
+          view: nil,
+          state_root: default_state_root()
+        ],
+        defaults
+      )
+
     parse_options(args, defaults)
   end
 
@@ -131,12 +212,17 @@ defmodule MixWorkspaceOps.CLI do
     do: parse_options(rest, options, [argument | positional])
 
   defp normalize_paths({:ok, options, rest}) do
-    options =
-      options
-      |> Map.update(:root, nil, &Path.expand/1)
-      |> Map.update(:catalog, nil, fn path -> Path.expand(path, options.root) end)
+    path_keys = [:registry, :checkout_root, :binding, :view, :state_root, :output]
 
-    {:ok, options, rest}
+    normalized =
+      Enum.reduce(path_keys, options, fn key, acc ->
+        Map.update(acc, key, nil, fn
+          nil -> nil
+          path -> Path.expand(path)
+        end)
+      end)
+
+    {:ok, normalized, rest}
   end
 
   defp normalize_paths(error), do: error
@@ -148,17 +234,30 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp option_key("root"), do: {:ok, :root}
-  defp option_key("catalog"), do: {:ok, :catalog}
+  defp option_key("registry"), do: {:ok, :registry}
+  defp option_key("checkout-root"), do: {:ok, :checkout_root}
+  defp option_key("binding"), do: {:ok, :binding}
+  defp option_key("view"), do: {:ok, :view}
+  defp option_key("state-root"), do: {:ok, :state_root}
   defp option_key("project"), do: {:ok, :project}
   defp option_key("mode"), do: {:ok, :mode}
   defp option_key("output"), do: {:ok, :output}
   defp option_key(option), do: {:error, "unknown option --#{option}"}
 
-  defp require_option(options, key) do
-    if Map.get(options, key), do: :ok, else: {:usage_error, "missing --#{key}"}
+  defp require_options(options, keys) do
+    Enum.reduce_while(keys, :ok, fn key, :ok ->
+      case require_option(options, key) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
   end
 
+  defp require_option(options, key) do
+    if Map.get(options, key), do: :ok, else: {:usage_error, "missing --#{option_name(key)}"}
+  end
+
+  defp option_name(key), do: key |> to_string() |> String.replace("_", "-")
   defp require_command([]), do: {:usage_error, "empty command"}
   defp require_command(_command), do: :ok
 
@@ -167,8 +266,8 @@ defmodule MixWorkspaceOps.CLI do
   defp source_mode("hex"), do: {:ok, :hex}
   defp source_mode(mode), do: {:usage_error, "invalid source mode #{inspect(mode)}"}
 
-  defp run_command([executable | argv], project_root, source_report) do
-    case Command.run(executable, argv, cd: project_root) do
+  defp run_command([executable | argv], project_root, source_report, env) do
+    case Command.run(executable, argv, cd: project_root, env: env) do
       {:ok, command_result} -> {:ok, %{source: source_report, command: command_result}}
       {:error, command_result} -> {:error, {:command_failed, command_result}}
     end
@@ -180,16 +279,23 @@ defmodule MixWorkspaceOps.CLI do
   defp format_error({:unhealthy_workspace, report}), do: Report.encode(report)
   defp format_error(reason), do: inspect(reason, pretty: true, limit: :infinity)
 
+  defp default_state_root do
+    base = System.get_env("XDG_STATE_HOME") || Path.join(System.user_home!(), ".local/state")
+    Path.join(base, "mix_workspace_ops")
+  end
+
   defp usage(status \\ 0) do
     IO.puts("""
     mix_workspace_ops <command>
 
       version
-      inventory [--root PATH] [--output PATH]
-      doctor [--catalog PATH] [--root PATH]
-      plan --project APP [--catalog PATH] [--root PATH]
-      bootstrap install --project APP [--catalog PATH] [--root PATH]
-      run --project APP [--mode local|git|hex] [--catalog PATH] [--root PATH] -- COMMAND [ARG ...]
+      registry validate --registry PATH
+      registry select --registry PATH --view PATH
+      inventory --checkout-root PATH [--output PATH]
+      doctor --registry PATH --checkout-root PATH [--binding PATH]
+      plan --project ID --registry PATH --checkout-root PATH [--view PATH]
+      bootstrap install --project ID --registry PATH --checkout-root PATH
+      run --project ID --mode local|git|hex --registry PATH --checkout-root PATH -- COMMAND [ARG ...]
       help
     """)
 

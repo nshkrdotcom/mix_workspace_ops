@@ -1,115 +1,108 @@
 defmodule MixWorkspaceOps.Overlay do
-  @moduledoc "Explicit operator-owned local/Git source overlay materialization."
+  @moduledoc "Content-addressed, operator-owned source overlays activated only in child processes."
 
-  alias MixWorkspaceOps.{Catalog, Git, Graph}
+  alias MixWorkspaceOps.{Git, Graph, Registry}
 
-  @relative_path ".mix_workspace_ops/sources.tsv"
-  @header "mix_workspace_ops\t1"
+  @env "MIX_WORKSPACE_OPS_OVERLAY"
+  @header "mix_workspace_ops.overlay/v1"
 
-  @type activation :: %{files: %{String.t() => :absent | {:present, binary()}}, report: map()}
+  @type activation :: %{
+          path: String.t() | nil,
+          env: [{String.t(), String.t() | nil}],
+          report: map()
+        }
 
-  @spec relative_path() :: String.t()
-  def relative_path, do: @relative_path
+  @spec environment_variable() :: String.t()
+  def environment_variable, do: @env
 
-  @spec activate(Catalog.t(), String.t() | atom(), keyword()) ::
+  @spec activate(Registry.t(), String.t() | atom(), keyword()) ::
           {:ok, activation()} | {:error, term()}
-  def activate(catalog, target, opts \\ []) do
+  def activate(registry, target, opts \\ []) do
     mode = Keyword.get(opts, :mode, :local)
-    projects = Graph.closure(catalog, target)
-    repositories = repositories_for(catalog, projects)
+    state_root = Keyword.get_lazy(opts, :state_root, &default_state_root/0)
 
-    with {:ok, rows} <- source_rows(catalog, projects, mode),
-         contents <- contents(catalog, to_string(target), mode, rows),
-         {:ok, files} <- change_repositories(repositories, contents, mode) do
+    with {:ok, resolution} <- Graph.resolve(registry, target),
+         {:ok, rows} <- source_rows(registry, resolution.projects, mode),
+         contents <- contents(registry, to_string(target), mode, resolution, rows),
+         digest <- digest(contents),
+         {:ok, path} <- materialize(state_root, digest, contents, mode) do
+      env = [{@env, path}]
+
       {:ok,
        %{
-         files: files,
+         path: path,
+         env: env,
          report: %{
+           schema: @header,
            target: to_string(target),
            mode: mode,
-           catalog_digest: catalog.digest,
-           projects: Enum.map(projects, & &1.app),
-           repositories: repositories,
+           registry_digest: registry.digest,
+           graph_digest: resolution.digest,
+           overlay_digest: digest,
+           overlay_path: path,
+           projects: Enum.map(resolution.projects, & &1.id),
+           edges: resolution.edges,
+           external_dependencies: resolution.external_dependencies,
            rows: rows
          }
        }}
     end
   end
 
-  @spec restore(activation()) :: :ok | {:error, term()}
-  def restore(%{files: files}) do
-    Enum.reduce_while(files, :ok, fn {path, previous}, :ok ->
-      result =
-        case previous do
-          :absent -> remove_generated(path)
-          {:present, bytes} -> atomic_write(path, bytes)
-        end
-
-      case result do
-        :ok -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, {path, reason}}}
-      end
-    end)
-  end
-
-  @spec with_activation(Catalog.t(), String.t() | atom(), keyword(), (map() -> result)) :: result
+  @spec with_activation(Registry.t(), String.t() | atom(), keyword(), (map(), list() -> result)) ::
+          result
         when result: term()
-  def with_activation(catalog, target, opts \\ [], function) when is_function(function, 1) do
-    {:ok, activation} = activate(catalog, target, opts)
-
-    try do
-      function.(activation.report)
-    after
-      :ok = restore(activation)
+  def with_activation(registry, target, opts \\ [], function) when is_function(function, 2) do
+    case activate(registry, target, opts) do
+      {:ok, activation} -> function.(activation.report, activation.env)
+      {:error, reason} -> {:error, reason}
     end
   end
 
   @spec read(String.t()) :: {:ok, map()} | {:error, term()}
-  def read(project_root) do
-    path = Path.join(project_root, @relative_path)
-
-    with {:ok, bytes} <- File.read(path) do
+  def read(path) do
+    with true <- Path.type(path) == :absolute || {:error, :overlay_path_must_be_absolute},
+         {:ok, bytes} <- File.read(path) do
       parse(bytes)
     end
   end
 
-  defp repositories_for(catalog, projects) do
+  @spec active() :: {:ok, map()} | :inactive | {:error, term()}
+  def active do
+    case System.get_env(@env) do
+      nil -> :inactive
+      "" -> :inactive
+      path -> read(path)
+    end
+  end
+
+  defp source_rows(registry, projects, :local) do
     projects
-    |> Enum.map(&Catalog.repository_root(catalog, &1.repository))
-    |> Enum.uniq()
-    |> Enum.sort()
+    |> Enum.map(fn project ->
+      path = Registry.project_root(registry, project)
+
+      if File.regular?(Path.join(path, "mix.exs")) do
+        {:ok, [project.app, "path", path, Git.head!(path)]}
+      else
+        {:error, {:missing_mix_project, project.id, path}}
+      end
+    end)
+    |> collect_rows()
   end
 
-  defp source_rows(catalog, projects, :local) do
-    rows =
-      Enum.map(projects, fn project ->
-        path = Catalog.project_root(catalog, project)
-
-        if File.regular?(Path.join(path, "mix.exs")) do
-          {:ok, [project.app, "path", path, Git.head!(path)]}
-        else
-          {:error, {:missing_mix_project, project.app, path}}
-        end
-      end)
-
-    collect_rows(rows)
+  defp source_rows(registry, projects, :git) do
+    projects
+    |> Enum.map(fn project ->
+      repository = Registry.repository!(registry, project.repository)
+      root = Registry.repository_root(registry, repository.id)
+      url = "https://github.com/#{repository.github}.git"
+      {:ok, [project.app, "git", url, Git.head!(root), project.path]}
+    end)
+    |> collect_rows()
   end
 
-  defp source_rows(catalog, projects, :git) do
-    rows =
-      Enum.map(projects, fn project ->
-        repository = Catalog.repository!(catalog, project.repository)
-        root = Catalog.repository_root(catalog, repository.id)
-        url = "https://github.com/#{repository.github}.git"
-        {:ok, [project.app, "git", url, Git.head!(root), project.path]}
-      end)
-
-    collect_rows(rows)
-  end
-
-  defp source_rows(_catalog, _projects, :hex), do: {:ok, []}
-
-  defp source_rows(_catalog, _projects, mode), do: {:error, {:unsupported_source_mode, mode}}
+  defp source_rows(_registry, _projects, :hex), do: {:ok, []}
+  defp source_rows(_registry, _projects, mode), do: {:error, {:unsupported_source_mode, mode}}
 
   defp collect_rows(rows) do
     Enum.reduce_while(rows, {:ok, []}, fn
@@ -122,10 +115,11 @@ defmodule MixWorkspaceOps.Overlay do
     end)
   end
 
-  defp contents(catalog, target, mode, rows) do
+  defp contents(registry, target, mode, resolution, rows) do
     metadata = [
       @header,
-      "catalog_digest\t#{catalog.digest}",
+      "registry_digest\t#{registry.digest}",
+      "graph_digest\t#{resolution.digest}",
       "target\t#{target}",
       "mode\t#{mode}"
     ]
@@ -135,125 +129,96 @@ defmodule MixWorkspaceOps.Overlay do
     |> Kernel.<>("\n")
   end
 
-  defp write_repositories(repositories, contents) do
-    Enum.reduce_while(repositories, {:ok, %{}}, fn repository, {:ok, previous} ->
-      path = Path.join(repository, @relative_path)
+  defp materialize(_state_root, _digest, _contents, :hex), do: {:ok, nil}
 
-      case write_repository(path, contents) do
-        {:ok, old_state} -> {:cont, {:ok, Map.put(previous, path, old_state)}}
-        {:error, reason} -> {:halt, {:error, {path, reason}}}
-      end
-    end)
-  end
-
-  defp change_repositories(repositories, _contents, :hex) do
-    remove_repositories(repositories)
-  end
-
-  defp change_repositories(repositories, contents, _mode) do
-    write_repositories(repositories, contents)
-  end
-
-  defp remove_repositories(repositories) do
-    Enum.reduce_while(repositories, {:ok, %{}}, fn repository, {:ok, previous} ->
-      path = Path.join(repository, @relative_path)
-
-      case remove_repository(path) do
-        {:ok, old_state} -> {:cont, {:ok, Map.put(previous, path, old_state)}}
-        {:error, reason} -> {:halt, {:error, {path, reason}}}
-      end
-    end)
-  end
-
-  defp remove_repository(path) do
-    case File.read(path) do
-      {:ok, bytes} -> remove_known_overlay(path, bytes)
-      {:error, :enoent} -> {:ok, :absent}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp remove_known_overlay(path, bytes) do
-    if String.starts_with?(bytes, @header <> "\n") do
-      case File.rm(path) do
-        :ok -> {:ok, {:present, bytes}}
-        {:error, reason} -> {:error, reason}
-      end
-    else
-      {:error, :refuse_to_remove_unrecognized_overlay}
-    end
-  end
-
-  defp write_repository(path, contents) do
-    with {:ok, previous} <- previous_contents(path),
-         :ok <- atomic_write(path, contents) do
-      {:ok, previous}
-    end
-  end
-
-  defp previous_contents(path) do
-    case File.read(path) do
-      {:ok, bytes} -> {:ok, {:present, bytes}}
-      {:error, :enoent} -> {:ok, :absent}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp atomic_write(path, contents) do
-    directory = Path.dirname(path)
+  defp materialize(state_root, digest, contents, _mode) do
+    directory = state_root |> Path.expand() |> Path.join("overlays")
+    path = Path.join(directory, digest <> ".tsv")
     temporary = path <> ".tmp.#{System.unique_integer([:positive])}"
 
     with :ok <- File.mkdir_p(directory),
-         :ok <- File.write(temporary, contents, [:sync]) do
+         :ok <- File.chmod(directory, 0o700),
+         :ok <- write_if_absent(path, temporary, contents),
+         :ok <- File.chmod(path, 0o600) do
+      {:ok, path}
+    end
+  end
+
+  defp write_if_absent(path, temporary, contents) do
+    case File.read(path) do
+      {:ok, ^contents} -> :ok
+      {:ok, _other} -> {:error, {:overlay_digest_collision, path}}
+      {:error, :enoent} -> atomic_write(path, temporary, contents)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp atomic_write(path, temporary, contents) do
+    with :ok <- File.write(temporary, contents, [:sync]) do
       File.rename(temporary, path)
     end
   end
 
-  defp remove_generated(path) do
-    case File.read(path) do
-      {:ok, bytes} when is_binary(bytes) ->
-        if String.starts_with?(bytes, @header <> "\n") do
-          File.rm(path)
-        else
-          {:error, :refuse_to_remove_unrecognized_overlay}
+  defp parse(bytes) do
+    case String.split(bytes, "\n", trim: true) do
+      [
+        @header,
+        "registry_digest\t" <> registry_digest,
+        "graph_digest\t" <> graph_digest,
+        "target\t" <> target,
+        "mode\t" <> mode | rows
+      ]
+      when mode in ["local", "git"] ->
+        with {:ok, sources} <- parse_rows(rows) do
+          {:ok,
+           %{
+             schema: @header,
+             registry_digest: registry_digest,
+             graph_digest: graph_digest,
+             target: target,
+             mode: mode,
+             digest: digest(bytes),
+             sources: sources
+           }}
         end
 
-      {:error, :enoent} ->
-        :ok
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp parse(bytes) do
-    lines = String.split(bytes, "\n", trim: true)
-
-    case lines do
-      [@header, "catalog_digest\t" <> digest, "target\t" <> target, "mode\t" <> mode | rows] ->
-        {:ok,
-         %{
-           catalog_digest: digest,
-           target: target,
-           mode: mode,
-           sources: Map.new(rows, &parse_row!/1)
-         }}
-
-      _ ->
+      _lines ->
         {:error, :invalid_overlay}
     end
   end
 
-  defp parse_row!(row) do
+  defp parse_rows(rows) do
+    Enum.reduce_while(rows, {:ok, %{}}, fn row, {:ok, sources} ->
+      case parse_row(row) do
+        {:ok, {app, source}} when not is_map_key(sources, app) ->
+          {:cont, {:ok, Map.put(sources, app, source)}}
+
+        {:ok, {app, _source}} ->
+          {:halt, {:error, {:duplicate_overlay_application, app}}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp parse_row(row) do
     case String.split(row, "\t") do
       [app, "path", path, revision] ->
-        {app, %{kind: :path, path: path, revision: revision}}
+        {:ok, {app, %{kind: :path, path: path, revision: revision}}}
 
       [app, "git", url, revision, subdir] ->
-        {app, %{kind: :git, url: url, revision: revision, subdir: subdir}}
+        {:ok, {app, %{kind: :git, url: url, revision: revision, subdir: subdir}}}
 
-      _ ->
-        raise ArgumentError, "invalid overlay row: #{inspect(row)}"
+      _parts ->
+        {:error, {:invalid_overlay_row, row}}
     end
   end
+
+  defp default_state_root do
+    base = System.get_env("XDG_STATE_HOME") || Path.join(System.user_home!(), ".local/state")
+    Path.join(base, "mix_workspace_ops")
+  end
+
+  defp digest(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 end

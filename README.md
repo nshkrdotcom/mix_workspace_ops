@@ -24,9 +24,9 @@ package's `mix.exs` as the compatibility authority.
 
 ## Status
 
-The project is under active pilot development. The initial acceptance surface
-is Blitz, Execution Plane, CLI Subprocess Core, Codex SDK, Weld, and the
-Inference release-incident replay.
+The project is under active pilot development. Its protocols and examples are
+ecosystem-neutral: a registry is supplied at invocation time, and no operator's
+repository inventory is compiled into the tool.
 
 ## Build
 
@@ -41,10 +41,38 @@ managed application's repository or invoke it through `sudo`.
 
 ## Boundary
 
-Mix Workspace Ops owns repository cataloging, explicit local dependency
+Mix Workspace Ops owns generic registry validation, explicit local dependency
 overlays, graph planning, release preconditions, clean-checkout verification,
-and publication receipts. It does not own application runtime configuration,
-product acceptance, Weld projection semantics, or Blitz impact scheduling.
+and publication receipts. It does not own a user's ecosystem registry,
+application runtime configuration, product acceptance, package projection
+semantics, or workspace impact scheduling.
+
+## Registry-driven usage
+
+The portable registry contains GitHub identities and relative Mix-project
+coordinates. The operator supplies a checkout root at runtime; every checkout is
+then verified against its Git origin and Git common directory.
+
+```bash
+./mix_workspace_ops registry validate --registry /path/to/registry.json
+./mix_workspace_ops registry select \
+  --registry /path/to/registry.json \
+  --view /path/to/view.json
+./mix_workspace_ops plan \
+  --registry /path/to/registry.json \
+  --checkout-root /path/to/checkouts \
+  --project example.consumer
+./mix_workspace_ops run \
+  --registry /path/to/registry.json \
+  --checkout-root /path/to/checkouts \
+  --project example.consumer \
+  --mode local -- mix test
+```
+
+Local and Git overlays are stored beneath operator-owned XDG state and passed
+only to the child command through `MIX_WORKSPACE_OPS_OVERLAY`. No source-mode
+state is written into managed repositories. A direct `mix` invocation with no
+overlay environment variable uses the ordinary dependency declarations.
 
 See [Architecture](guides/architecture.md) for the ownership split and safety
 model.

@@ -1,82 +1,53 @@
 defmodule MixWorkspaceOps.OverlayTest do
   use MixWorkspaceOps.WorkspaceCase, async: true
 
-  alias MixWorkspaceOps.{Catalog, Overlay}
+  alias MixWorkspaceOps.{Overlay, Registry}
 
-  test "activates a dependency closure and restores every repository", context do
+  test "materializes one operator-state overlay without writing managed repositories", context do
     root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
     initialize_repository!(Path.join(root, "core"))
-    initialize_repository!(Path.join(root, "consumer"))
-    catalog = catalog(root)
+    initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
+    registry = registry(root)
 
-    assert {:ok, activation} = Overlay.activate(catalog, :consumer)
+    assert {:ok, activation} = Overlay.activate(registry, "consumer", state_root: state_root)
     assert activation.report.projects == ["core", "consumer"]
+    assert activation.env == [{"MIX_WORKSPACE_OPS_OVERLAY", activation.path}]
+    assert String.starts_with?(activation.path, state_root)
+    assert {:ok, overlay} = Overlay.read(activation.path)
+    assert Map.keys(overlay.sources) == ["consumer", "core"]
+    assert overlay.sources["core"].path == Path.join(root, "core")
 
-    for repository <- ["core", "consumer"] do
-      assert {:ok, overlay} = Overlay.read(Path.join(root, repository))
-      assert Map.keys(overlay.sources) == ["consumer", "core"]
-      assert overlay.sources["core"].path == Path.join(root, "core")
-    end
-
-    assert :ok = Overlay.restore(activation)
-
-    refute File.exists?(Path.join(root, "core/#{Overlay.relative_path()}"))
-    refute File.exists?(Path.join(root, "consumer/#{Overlay.relative_path()}"))
+    refute File.exists?(Path.join(root, "core/.mix_workspace_ops"))
+    refute File.exists?(Path.join(root, "consumer/.mix_workspace_ops"))
   end
 
-  test "restores pre-existing overlay bytes after a raised operation", context do
+  test "content addressing reuses identical bytes and changes across modes", context do
     root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
     initialize_repository!(Path.join(root, "core"))
-    initialize_repository!(Path.join(root, "consumer"))
-    catalog = catalog(root)
-    path = Path.join(root, "consumer/#{Overlay.relative_path()}")
-    File.mkdir_p!(Path.dirname(path))
-    original = "operator-owned bytes\n"
-    File.write!(path, original)
+    initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
+    registry = registry(root)
 
-    assert_raise RuntimeError, "stop", fn ->
-      Overlay.with_activation(catalog, :consumer, [], fn _report -> raise "stop" end)
-    end
+    assert {:ok, first} = Overlay.activate(registry, "consumer", state_root: state_root)
+    assert {:ok, second} = Overlay.activate(registry, "consumer", state_root: state_root)
+    assert first.path == second.path
 
-    assert File.read!(path) == original
+    assert {:ok, git} = Overlay.activate(registry, "consumer", mode: :git, state_root: state_root)
+    refute git.path == first.path
+
+    assert {:ok, hex} = Overlay.activate(registry, "consumer", mode: :hex, state_root: state_root)
+    assert hex.path == nil
+    assert hex.env == [{"MIX_WORKSPACE_OPS_OVERLAY", nil}]
   end
 
-  test "hex mode temporarily removes and restores a recognized overlay", context do
-    root = temporary_directory!(context)
-    initialize_repository!(Path.join(root, "core"))
-    initialize_repository!(Path.join(root, "consumer"))
-    catalog = catalog(root)
-    assert {:ok, local_activation} = Overlay.activate(catalog, :consumer)
-
-    Overlay.with_activation(catalog, :consumer, [mode: :hex], fn report ->
-      assert report.mode == :hex
-      refute File.exists?(Path.join(root, "consumer/#{Overlay.relative_path()}"))
-    end)
-
-    assert {:ok, %{mode: "local"}} = Overlay.read(Path.join(root, "consumer"))
-    assert :ok = Overlay.restore(local_activation)
-  end
-
-  defp catalog(root) do
+  defp registry(root) do
     root
-    |> write_catalog!([
-      repository("core", "core", [project("core", [])]),
-      repository("consumer", "consumer", [project("consumer", ["core"])])
+    |> write_registry!([
+      repository("core", [project("core")]),
+      repository("consumer", [project("consumer")])
     ])
-    |> Catalog.load!(root: root)
-  end
-
-  defp repository(id, path, projects) do
-    %{
-      "id" => id,
-      "path" => path,
-      "github" => "nshkrdotcom/#{id}",
-      "status" => "pilot",
-      "projects" => projects
-    }
-  end
-
-  defp project(app, dependencies) do
-    %{"app" => app, "path" => ".", "managed_deps" => dependencies}
+    |> Registry.load!()
+    |> bind!(root)
   end
 end

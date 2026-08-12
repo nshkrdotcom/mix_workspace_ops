@@ -22,23 +22,69 @@ defmodule MixWorkspaceOps.WorkspaceCase do
     path
   end
 
-  @spec initialize_repository!(String.t()) :: String.t()
-  def initialize_repository!(path) do
+  @spec initialize_repository!(String.t(), String.t(), String.t()) :: String.t()
+  def initialize_repository!(path, deps \\ "[]", github \\ nil) do
     File.mkdir_p!(path)
     run!("git", ["init", "--quiet", "--initial-branch=main"], path)
-    run!("git", ["config", "user.email", "test@example.com"], path)
+    run!("git", ["config", "user.email", "test@example.invalid"], path)
     run!("git", ["config", "user.name", "Test Operator"], path)
-    File.write!(Path.join(path, "mix.exs"), "defmodule Fixture.MixProject do\nend\n")
+    app = path |> Path.basename() |> String.replace(~r/[^a-z0-9_]/, "_")
+    github = github || "example-org/#{Path.basename(path)}"
+    module = app |> String.split("_", trim: true) |> Enum.map_join(&String.capitalize/1)
+
+    File.write!(Path.join(path, "mix.exs"), """
+    defmodule #{module}.MixProject do
+      use Mix.Project
+
+      def project, do: [app: :#{app}, version: "0.1.0", deps: #{deps}]
+    end
+    """)
+
+    run!("git", ["remote", "add", "origin", "https://github.com/#{github}.git"], path)
     run!("git", ["add", "mix.exs"], path)
     run!("git", ["commit", "--quiet", "-m", "fixture"], path)
     path
   end
 
-  @spec write_catalog!(String.t(), [map()]) :: String.t()
-  def write_catalog!(root, repositories) do
-    path = Path.join(root, "workspace.json")
-    File.write!(path, :json.encode(%{"schema" => 1, "repositories" => repositories}))
+  @spec write_registry!(String.t(), [map()]) :: String.t()
+  def write_registry!(root, repositories) do
+    path = Path.join(root, "registry.json")
+
+    File.write!(
+      path,
+      :json.encode(%{
+        "schema" => "mix_workspace_ops.registry/v1",
+        "repositories" => repositories
+      })
+    )
+
     path
+  end
+
+  @spec bind!(MixWorkspaceOps.Registry.t(), String.t()) :: MixWorkspaceOps.Registry.t()
+  def bind!(registry, checkout_root) do
+    {:ok, registry} = MixWorkspaceOps.Registry.bind(registry, checkout_root)
+    registry
+  end
+
+  def repository(id, projects, github \\ nil) do
+    %{
+      "id" => id,
+      "github" => github || "example-org/#{id}",
+      "default_branch" => "main",
+      "projects" => projects
+    }
+  end
+
+  def project(id, app \\ nil, opts \\ []) do
+    %{
+      "id" => id,
+      "app" => app || id,
+      "path" => Keyword.get(opts, :path, "."),
+      "kind" => Keyword.get(opts, :kind, "standalone"),
+      "tags" => Keyword.get(opts, :tags, ["fixture"]),
+      "profile" => Keyword.get(opts, :profile, "default")
+    }
   end
 
   defp run!(executable, args, cwd) do

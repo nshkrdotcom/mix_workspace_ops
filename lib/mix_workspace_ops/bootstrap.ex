@@ -2,18 +2,15 @@ defmodule MixWorkspaceOps.Bootstrap do
   @moduledoc "Installation and drift checks for the minimal project-side source bootstrap."
 
   @relative_path "build_support/mix_workspace_ops_bootstrap.exs"
+  @template Path.expand("../../priv/bootstrap/mix_workspace_ops_bootstrap.exs", __DIR__)
+  @external_resource @template
+  @contents File.read!(@template)
 
   @spec relative_path() :: String.t()
   def relative_path, do: @relative_path
 
   @spec contents() :: binary()
-  def contents do
-    :mix_workspace_ops
-    |> :code.priv_dir()
-    |> to_string()
-    |> Path.join("bootstrap/mix_workspace_ops_bootstrap.exs")
-    |> File.read!()
-  end
+  def contents, do: @contents
 
   @spec status(String.t()) :: :missing | :current | {:drifted, String.t()}
   def status(project_root) do

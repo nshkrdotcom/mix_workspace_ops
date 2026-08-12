@@ -1,13 +1,15 @@
 defmodule MixWorkspaceOpsBootstrap do
   @moduledoc false
 
-  @schema_header "mix_workspace_ops\t1"
-  @relative_overlay ".mix_workspace_ops/sources.tsv"
+  @schema_header "mix_workspace_ops.overlay/v1"
+  @overlay_env "MIX_WORKSPACE_OPS_OVERLAY"
   @publish_tasks MapSet.new(["hex.build", "hex.publish", "deps.publish_preflight"])
 
-  def dep(app, requirement, project_root, extra_opts \\ []) when is_atom(app) do
-    case source(project_root, Atom.to_string(app)) do
-      nil -> dependency_tuple(app, requirement, extra_opts)
+  def dep(app, requirement, _project_root, extra_opts \\ []) when is_atom(app) do
+    case source(Atom.to_string(app)) do
+      nil ->
+        dependency_tuple(app, requirement, extra_opts)
+
       %{kind: :path, path: path} ->
         dependency_tuple(app, requirement, Keyword.merge(extra_opts, path: path, override: true))
 
@@ -20,10 +22,12 @@ defmodule MixWorkspaceOpsBootstrap do
     end
   end
 
-  def active?(project_root), do: not is_nil(find_overlay(project_root))
+  def active?(_project_root \\ nil), do: not is_nil(overlay_path())
 
-  def source(project_root, app) do
-    case find_overlay(project_root) do
+  def source(_project_root, app), do: source(to_string(app))
+
+  defp source(app) do
+    case overlay_path() do
       nil -> nil
       path -> path |> parse_overlay!() |> Map.get(app)
     end
@@ -32,53 +36,59 @@ defmodule MixWorkspaceOpsBootstrap do
   defp dependency_tuple(app, requirement, []), do: {app, requirement}
   defp dependency_tuple(app, requirement, opts), do: {app, requirement, opts}
 
-  defp find_overlay(project_root) do
-    project_root
-    |> Path.expand()
-    |> ancestors()
-    |> Enum.map(&Path.join(&1, @relative_overlay))
-    |> Enum.find(&File.regular?/1)
-    |> reject_publish_mode!()
-  end
-
-  defp ancestors(path), do: ancestors(path, [])
-
-  defp ancestors(path, acc) do
-    parent = Path.dirname(path)
-
-    if parent == path do
-      Enum.reverse([path | acc])
-    else
-      ancestors(parent, [path | acc])
+  defp overlay_path do
+    case System.get_env(@overlay_env) do
+      nil -> nil
+      "" -> nil
+      path -> validate_overlay_path!(path)
     end
   end
 
-  defp reject_publish_mode!(nil), do: nil
+  defp validate_overlay_path!(path) do
+    unless Path.type(path) == :absolute do
+      raise "#{@overlay_env} must contain an absolute path"
+    end
 
-  defp reject_publish_mode!(overlay_path) do
+    unless File.regular?(path) do
+      raise "#{@overlay_env} points to a missing overlay: #{path}"
+    end
+
     if Enum.any?(System.argv(), &MapSet.member?(@publish_tasks, &1)) do
-      raise "non-Hex Mix Workspace Ops overlay is active at #{overlay_path}; deactivate it before package build or publication"
+      raise "a non-Hex Mix Workspace Ops overlay is active; rerun publication without #{@overlay_env}"
     end
 
-    overlay_path
+    path
   end
 
   defp parse_overlay!(path) do
     case path |> File.read!() |> String.split("\n", trim: true) do
-      [@schema_header, "catalog_digest\t" <> _digest, "target\t" <> _target,
-       "mode\t" <> _mode | rows] ->
-        Map.new(rows, &parse_row!/1)
+      [@schema_header, "registry_digest\t" <> _registry_digest,
+       "graph_digest\t" <> _graph_digest, "target\t" <> _target, "mode\t" <> mode | rows]
+      when mode in ["local", "git"] ->
+        parse_rows!(rows)
 
-      _ ->
+      _lines ->
         raise "invalid Mix Workspace Ops overlay at #{path}"
     end
+  end
+
+  defp parse_rows!(rows) do
+    Enum.reduce(rows, %{}, fn row, sources ->
+      {app, source} = parse_row!(row)
+
+      if Map.has_key?(sources, app) do
+        raise "duplicate Mix Workspace Ops source for #{app}"
+      end
+
+      Map.put(sources, app, source)
+    end)
   end
 
   defp parse_row!(row) do
     case String.split(row, "\t") do
       [app, "path", path, revision] ->
-        unless File.regular?(Path.join(path, "mix.exs")) do
-          raise "local Mix dependency #{app} has no mix.exs at #{path}"
+        unless Path.type(path) == :absolute and File.regular?(Path.join(path, "mix.exs")) do
+          raise "local Mix dependency #{app} has no absolute Mix project at #{path}"
         end
 
         {app, %{kind: :path, path: path, revision: revision}}
@@ -86,7 +96,7 @@ defmodule MixWorkspaceOpsBootstrap do
       [app, "git", url, revision, subdir] ->
         {app, %{kind: :git, url: url, revision: revision, subdir: subdir}}
 
-      _ ->
+      _parts ->
         raise "invalid Mix Workspace Ops overlay row: #{inspect(row)}"
     end
   end

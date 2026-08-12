@@ -1,84 +1,84 @@
 defmodule MixWorkspaceOps.Doctor do
-  @moduledoc "Read-only validation of catalog repositories, projects, and operator overlays."
+  @moduledoc "Read-only validation of bound repositories and Mix-project identities."
 
-  alias MixWorkspaceOps.{Catalog, Git, Overlay}
+  alias MixWorkspaceOps.{Git, Project, Registry}
 
-  @spec inspect(Catalog.t()) :: map()
-  def inspect(catalog) do
+  @spec inspect(Registry.t()) :: map()
+  def inspect(registry) do
     repositories =
-      catalog.repositories
+      registry.repositories
       |> Map.values()
       |> Enum.sort_by(& &1.id)
-      |> Enum.map(&inspect_repository(catalog, &1))
+      |> Enum.map(&inspect_repository(registry, &1))
 
     checks = Enum.flat_map(repositories, & &1.checks)
 
     %{
-      schema: 1,
-      catalog: catalog.path,
-      catalog_digest: catalog.digest,
+      schema: "mix_workspace_ops.doctor/v1",
+      registry: registry.path,
+      registry_digest: registry.digest,
       healthy: Enum.all?(checks, & &1.pass),
       repositories: repositories
     }
   end
 
-  defp inspect_repository(catalog, repository) do
-    root = Catalog.repository_root(catalog, repository)
-    projects = Enum.map(repository.projects, &inspect_project(catalog, &1))
+  defp inspect_repository(registry, repository) do
+    root = Registry.repository_root(registry, repository)
+    projects = Enum.map(repository.projects, &inspect_project(registry, &1))
 
     checks =
       [
         check(:directory, File.dir?(root), root),
         check(:git_root, git_root?(root), root),
         check(:remote, remote_matches?(root, repository.github), repository.github),
-        check(:clean, git_clean?(root), root),
-        check(:upstream, upstream_matches?(root), root),
-        inspect_overlay(root)
+        check(:clean, Git.clean?(root), root),
+        check(:branch, Git.branch!(root) == repository.default_branch, repository.default_branch)
       ] ++ Enum.flat_map(projects, & &1.checks)
 
     %{
       id: repository.id,
       root: root,
-      status: repository.status,
       healthy: all_pass?(checks),
-      checks: checks
+      checks: checks,
+      projects: projects
     }
-  end
-
-  defp inspect_project(catalog, project) do
-    root = Catalog.project_root(catalog, project)
-    checks = [check(:mix_project, File.regular?(Path.join(root, "mix.exs")), root)]
-    %{app: project.app, root: root, checks: checks}
-  end
-
-  defp inspect_overlay(root) do
-    case Overlay.read(root) do
-      {:ok, overlay} -> check(:overlay, true, %{mode: overlay.mode, target: overlay.target})
-      {:error, :enoent} -> check(:overlay, true, :inactive)
-      {:error, reason} -> check(:overlay, false, reason)
-    end
-  end
-
-  defp git_root?(root) do
-    File.dir?(root) and match?({:ok, ^root}, Git.root(root))
   rescue
-    _error -> false
+    error ->
+      check = check(:repository_fault, false, Exception.message(error))
+
+      %{
+        id: repository.id,
+        root: Map.get(registry.bindings, repository.id),
+        healthy: false,
+        checks: [check],
+        projects: []
+      }
   end
+
+  defp inspect_project(registry, project) do
+    root = Registry.project_root(registry, project)
+
+    metadata_check =
+      case Project.metadata(registry, project) do
+        {:ok, metadata} -> check(:mix_identity, metadata.app == project.app, metadata)
+        {:error, reason} -> check(:mix_identity, false, reason)
+      end
+
+    checks = [
+      check(:mix_project, File.regular?(Path.join(root, "mix.exs")), root),
+      metadata_check
+    ]
+
+    %{id: project.id, app: project.app, root: root, checks: checks}
+  end
+
+  defp git_root?(root), do: match?({:ok, ^root}, Git.root(root))
 
   defp remote_matches?(root, github) do
-    Git.remote_url!(root)
-    |> String.replace_suffix(".git", "")
-    |> String.ends_with?(github)
-  rescue
-    MixWorkspaceOps.CommandError -> false
-  end
-
-  defp git_clean?(root), do: File.dir?(root) and Git.clean?(root)
-
-  defp upstream_matches?(root) do
-    File.dir?(root) and Git.head!(root) == Git.upstream_head!(root)
-  rescue
-    MixWorkspaceOps.CommandError -> false
+    case MixWorkspaceOps.Binding.normalize_github(Git.remote_url!(root)) do
+      {:ok, ^github} -> true
+      _other -> false
+    end
   end
 
   defp check(name, pass?, detail), do: %{name: name, pass: pass?, detail: detail}
