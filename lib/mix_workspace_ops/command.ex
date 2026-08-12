@@ -17,12 +17,7 @@ defmodule MixWorkspaceOps.Command do
     cwd = opts |> Keyword.get(:cd, File.cwd!()) |> Path.expand()
     env = Keyword.get(opts, :env, [])
 
-    {output, exit_code} =
-      System.cmd(executable, args,
-        cd: cwd,
-        env: env,
-        stderr_to_stdout: true
-      )
+    {output, exit_code} = execute(executable, args, cwd, env)
 
     result = %__MODULE__{
       executable: executable,
@@ -33,6 +28,16 @@ defmodule MixWorkspaceOps.Command do
     }
 
     if exit_code == 0, do: {:ok, result}, else: {:error, result}
+  end
+
+  defp execute(executable, args, cwd, env) do
+    System.cmd(executable, args,
+      cd: cwd,
+      env: env,
+      stderr_to_stdout: true
+    )
+  rescue
+    error in [ErlangError, ArgumentError] -> {Exception.message(error), 127}
   end
 
   @spec run!(String.t(), [String.t()], keyword()) :: t()

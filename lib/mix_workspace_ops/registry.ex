@@ -1,7 +1,7 @@
 defmodule MixWorkspaceOps.Registry do
   @moduledoc "Strict, portable repository and Mix-project identity registry."
 
-  alias MixWorkspaceOps.Binding
+  alias MixWorkspaceOps.{Binding, StrictJSON}
 
   @schema "mix_workspace_ops.registry/v1"
   @project_kinds ~w(standalone workspace_root package tooling)
@@ -96,6 +96,33 @@ defmodule MixWorkspaceOps.Registry do
     end
   end
 
+  @spec restrict(t(), [project()]) :: t()
+  def restrict(%__MODULE__{} = registry, selected_projects) when is_list(selected_projects) do
+    selected_ids = selected_projects |> Enum.map(& &1.id) |> MapSet.new()
+
+    repositories =
+      registry.repositories
+      |> Map.values()
+      |> Enum.map(fn repository ->
+        projects = Enum.filter(repository.projects, &MapSet.member?(selected_ids, &1.id))
+        %{repository | projects: projects}
+      end)
+      |> Enum.reject(&(&1.projects == []))
+      |> Map.new(&{&1.id, &1})
+
+    projects = Map.new(selected_projects, &{&1.id, &1})
+    applications = Map.new(selected_projects, &{&1.app, &1})
+    bindings = Map.take(registry.bindings, Map.keys(repositories))
+
+    %{
+      registry
+      | repositories: repositories,
+        projects: projects,
+        applications: applications,
+        bindings: bindings
+    }
+  end
+
   @spec repository_root(t(), repository() | String.t()) :: String.t()
   def repository_root(registry, repository_id) when is_binary(repository_id) do
     case Map.fetch(registry.bindings, repository_id) do
@@ -123,9 +150,7 @@ defmodule MixWorkspaceOps.Registry do
   end
 
   defp decode(bytes) do
-    {:ok, :json.decode(bytes)}
-  catch
-    kind, reason -> {:error, {:json, kind, reason}}
+    StrictJSON.decode(bytes)
   end
 
   defp parse_registry(%{"schema" => @schema, "repositories" => repositories} = raw)
@@ -150,7 +175,7 @@ defmodule MixWorkspaceOps.Registry do
        )
        when map_size(raw) == 4 and is_binary(id) and is_binary(github) and
               is_binary(default_branch) and is_list(projects) do
-    with :ok <- validate_identifier(id),
+    with :ok <- validate_stable_id(id),
          :ok <- validate_github(github),
          :ok <- validate_branch(default_branch),
          {:ok, parsed_projects} <- parse_projects(projects, id) do

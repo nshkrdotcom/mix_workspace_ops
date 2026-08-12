@@ -55,6 +55,10 @@ then verified against its Git origin and Git common directory.
 
 ```bash
 ./mix_workspace_ops registry validate --registry /path/to/registry.json
+./mix_workspace_ops registry discover \
+  --checkout-root /path/to/checkouts \
+  --github-owner example-org \
+  --output /path/to/discovery.json
 ./mix_workspace_ops registry select \
   --registry /path/to/registry.json \
   --view /path/to/view.json
@@ -74,5 +78,29 @@ only to the child command through `MIX_WORKSPACE_OPS_OVERLAY`. No source-mode
 state is written into managed repositories. A direct `mix` invocation with no
 overlay environment variable uses the ordinary dependency declarations.
 
+Every launched command also receives content-addressed, operator-owned
+`MIX_DEPS_PATH`, `MIX_BUILD_ROOT`, `HEX_HOME`, and lockfile state. Different
+source modes, dependency commits, target commits, lockfiles, and Elixir/OTP
+toolchains cannot share mutable Mix artifacts. Publication is refused through
+`run`; it is available only through the release transaction below.
+
+Discovery is also generic. It accepts the owner explicitly, deduplicates by Git
+identity, rejects worktrees and wrongly named clones, prunes generated and
+fixture trees, and records unloadable or duplicate Mix applications as
+unresolved evidence rather than guessing an identity.
+
+Release publication is a separate, fail-closed transaction over an already
+committed and pushed revision:
+
+```bash
+./mix_workspace_ops release publish \
+  --descriptor /path/to/untracked-release-descriptor.json
+```
+
+The transaction never stages or commits source. It builds from a detached clean
+checkout, persists every transition, exposes credentials only to its publisher
+step, verifies the Hex checksum, and creates the tag only afterward.
+
 See [Architecture](guides/architecture.md) for the ownership split and safety
-model.
+model, and [Fail-closed release transaction](guides/release_transaction.md) for
+the publication state machine.

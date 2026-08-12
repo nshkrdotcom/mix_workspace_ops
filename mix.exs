@@ -31,7 +31,7 @@ defmodule MixWorkspaceOps.MixProject do
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "guides/architecture.md"]
+      extras: ["README.md", "guides/architecture.md", "guides/release_transaction.md"]
     ]
   end
 end

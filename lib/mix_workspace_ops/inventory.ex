@@ -1,12 +1,12 @@
 defmodule MixWorkspaceOps.Inventory do
   @moduledoc "Read-only discovery of copied dependency-source helpers and their Git identity."
 
-  alias MixWorkspaceOps.{Command, Git}
+  alias MixWorkspaceOps.{Command, Git, Registry}
 
   @helper_name "dependency_sources.exs"
   @config_name "dependency_sources.config.exs"
-  @excluded_segments ~w(.git _build deps doc cover node_modules priv_plts)
-  @pruned_names ~w(.git .worktrees _build deps doc cover dist node_modules temp tmp backup backups)
+  @excluded_segments ~w(.git .cache _build _legacy deps doc cover node_modules priv_plts vendor vendored)
+  @pruned_names ~w(.git .worktrees .cache _build _legacy deps deps_legacy_* doc cover dist node_modules temp tmp backup backups vendor vendored)
 
   @type row :: %{
           repository_root: String.t(),
@@ -37,6 +37,25 @@ defmodule MixWorkspaceOps.Inventory do
 
       {:ok, rows}
     end
+  end
+
+  @spec scan_registry(Registry.t()) :: {:ok, [row()]} | {:error, term()}
+  def scan_registry(%Registry{} = registry) do
+    registry.repositories
+    |> Map.values()
+    |> Enum.sort_by(& &1.id)
+    |> Enum.reduce_while({:ok, []}, fn repository, {:ok, rows} ->
+      root = Registry.repository_root(registry, repository)
+
+      case scan(root) do
+        {:ok, repository_rows} -> {:cont, {:ok, repository_rows ++ rows}}
+        {:error, reason} -> {:halt, {:error, {:inventory_repository, repository.id, reason}}}
+      end
+    end)
+    |> then(fn
+      {:ok, rows} -> {:ok, Enum.sort_by(rows, &{&1.repository_root, &1.helper_path})}
+      error -> error
+    end)
   end
 
   defp find_arguments(root) do

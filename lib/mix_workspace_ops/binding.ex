@@ -1,7 +1,7 @@
 defmodule MixWorkspaceOps.Binding do
   @moduledoc "Binds portable registry identities to verified operator-owned Git checkouts."
 
-  alias MixWorkspaceOps.{Git, Registry}
+  alias MixWorkspaceOps.{Git, Registry, StrictJSON}
 
   @spec resolve(Registry.t(), String.t(), keyword()) ::
           {:ok, %{String.t() => String.t()}} | {:error, term()}
@@ -90,9 +90,7 @@ defmodule MixWorkspaceOps.Binding do
   end
 
   defp decode(bytes) do
-    {:ok, :json.decode(bytes)}
-  catch
-    kind, reason -> {:error, {:json, kind, reason}}
+    StrictJSON.decode(bytes, maximum_bytes: 1024 * 1024)
   end
 
   defp reject_duplicate_common_dirs(bindings) do

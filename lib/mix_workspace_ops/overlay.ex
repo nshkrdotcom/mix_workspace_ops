@@ -1,10 +1,11 @@
 defmodule MixWorkspaceOps.Overlay do
   @moduledoc "Content-addressed, operator-owned source overlays activated only in child processes."
 
-  alias MixWorkspaceOps.{Git, Graph, Registry}
+  alias MixWorkspaceOps.{Git, Graph, Registry, Runtime}
 
   @env "MIX_WORKSPACE_OPS_OVERLAY"
   @header "mix_workspace_ops.overlay/v1"
+  @maximum_bytes 16 * 1024 * 1024
 
   @type activation :: %{
           path: String.t() | nil,
@@ -23,10 +24,15 @@ defmodule MixWorkspaceOps.Overlay do
 
     with {:ok, resolution} <- Graph.resolve(registry, target),
          {:ok, rows} <- source_rows(registry, resolution.projects, mode),
-         contents <- contents(registry, to_string(target), mode, resolution, rows),
+         target_project <- Registry.project!(registry, target),
+         target_root <- Registry.project_root(registry, target_project),
+         {:ok, lock_bytes} <- source_lock(target_root),
+         contents <-
+           contents(registry, to_string(target), mode, resolution, rows, target_root, lock_bytes),
          digest <- digest(contents),
-         {:ok, path} <- materialize(state_root, digest, contents, mode) do
-      env = [{@env, path}]
+         {:ok, path} <- materialize(state_root, digest, contents, mode),
+         {:ok, runtime} <- Runtime.prepare(state_root, digest, lock_bytes) do
+      env = [{@env, path} | runtime.env]
 
       {:ok,
        %{
@@ -40,6 +46,7 @@ defmodule MixWorkspaceOps.Overlay do
            graph_digest: resolution.digest,
            overlay_digest: digest,
            overlay_path: path,
+           runtime: runtime.report,
            projects: Enum.map(resolution.projects, & &1.id),
            edges: resolution.edges,
            external_dependencies: resolution.external_dependencies,
@@ -62,7 +69,11 @@ defmodule MixWorkspaceOps.Overlay do
   @spec read(String.t()) :: {:ok, map()} | {:error, term()}
   def read(path) do
     with true <- Path.type(path) == :absolute || {:error, :overlay_path_must_be_absolute},
-         {:ok, bytes} <- File.read(path) do
+         {:ok, stat} <- File.stat(path),
+         true <- stat.type == :regular || {:error, :overlay_must_be_regular},
+         true <- stat.size <= @maximum_bytes || {:error, :overlay_too_large},
+         {:ok, bytes} <- File.read(path),
+         :ok <- verify_content_address(path, bytes) do
       parse(bytes)
     end
   end
@@ -82,7 +93,7 @@ defmodule MixWorkspaceOps.Overlay do
       path = Registry.project_root(registry, project)
 
       if File.regular?(Path.join(path, "mix.exs")) do
-        {:ok, [project.app, "path", path, Git.head!(path)]}
+        {:ok, [project.app, "path", path, Git.head!(path), Git.source_digest(path)]}
       else
         {:error, {:missing_mix_project, project.id, path}}
       end
@@ -115,13 +126,17 @@ defmodule MixWorkspaceOps.Overlay do
     end)
   end
 
-  defp contents(registry, target, mode, resolution, rows) do
+  defp contents(registry, target, mode, resolution, rows, target_root, lock_bytes) do
     metadata = [
       @header,
       "registry_digest\t#{registry.digest}",
       "graph_digest\t#{resolution.digest}",
       "target\t#{target}",
-      "mode\t#{mode}"
+      "mode\t#{mode}",
+      "target_head\t#{Git.head!(target_root)}",
+      "target_source_digest\t#{Git.source_digest(target_root)}",
+      "lock_digest\t#{digest(lock_bytes)}",
+      "toolchain\telixir-#{System.version()}-otp-#{:erlang.system_info(:otp_release)}"
     ]
 
     (metadata ++ Enum.map(rows, &Enum.join(&1, "\t")))
@@ -166,7 +181,11 @@ defmodule MixWorkspaceOps.Overlay do
         "registry_digest\t" <> registry_digest,
         "graph_digest\t" <> graph_digest,
         "target\t" <> target,
-        "mode\t" <> mode | rows
+        "mode\t" <> mode,
+        "target_head\t" <> target_head,
+        "target_source_digest\t" <> target_source_digest,
+        "lock_digest\t" <> lock_digest,
+        "toolchain\t" <> toolchain | rows
       ]
       when mode in ["local", "git"] ->
         with {:ok, sources} <- parse_rows(rows) do
@@ -177,6 +196,10 @@ defmodule MixWorkspaceOps.Overlay do
              graph_digest: graph_digest,
              target: target,
              mode: mode,
+             target_head: target_head,
+             target_source_digest: target_source_digest,
+             lock_digest: lock_digest,
+             toolchain: toolchain,
              digest: digest(bytes),
              sources: sources
            }}
@@ -204,8 +227,8 @@ defmodule MixWorkspaceOps.Overlay do
 
   defp parse_row(row) do
     case String.split(row, "\t") do
-      [app, "path", path, revision] ->
-        {:ok, {app, %{kind: :path, path: path, revision: revision}}}
+      [app, "path", path, revision, source_digest] ->
+        {:ok, {app, %{kind: :path, path: path, revision: revision, source_digest: source_digest}}}
 
       [app, "git", url, revision, subdir] ->
         {:ok, {app, %{kind: :git, url: url, revision: revision, subdir: subdir}}}
@@ -218,6 +241,21 @@ defmodule MixWorkspaceOps.Overlay do
   defp default_state_root do
     base = System.get_env("XDG_STATE_HOME") || Path.join(System.user_home!(), ".local/state")
     Path.join(base, "mix_workspace_ops")
+  end
+
+  defp source_lock(project_root) do
+    case File.read(Path.join(project_root, "mix.lock")) do
+      {:ok, bytes} -> {:ok, bytes}
+      {:error, :enoent} -> {:ok, "%{}\n"}
+      {:error, reason} -> {:error, {:source_lock, reason}}
+    end
+  end
+
+  defp verify_content_address(path, bytes) do
+    expected = Path.basename(path, ".tsv")
+    actual = digest(bytes)
+
+    if expected == actual, do: :ok, else: {:error, {:overlay_digest_mismatch, expected, actual}}
   end
 
   defp digest(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)

@@ -5,8 +5,14 @@ defmodule MixWorkspaceOps.Project do
 
   @marker "__MIX_WORKSPACE_OPS_METADATA__"
   @expression """
+  Mix.start()
+  Code.compile_file("mix.exs")
   config = Mix.Project.config()
-  app = config |> Keyword.fetch!(:app) |> Atom.to_string()
+  app =
+    case Keyword.get(config, :app) do
+      app when is_atom(app) and not is_nil(app) -> Atom.to_string(app)
+      _other -> ""
+    end
   version = config |> Keyword.fetch!(:version) |> to_string()
   dependencies =
     config
@@ -25,14 +31,36 @@ defmodule MixWorkspaceOps.Project do
   def metadata(registry, project) do
     project_root = Registry.project_root(registry, project)
 
+    case metadata_at(project_root) do
+      {:ok, %{app: app} = metadata} when app == project.app ->
+        {:ok, metadata}
+
+      {:ok, %{app: app}} ->
+        {:error, {:application_identity_drift, project.id, project.app, app}}
+
+      {:error, reason} ->
+        {:error, {:mix_project_metadata, project.id, reason}}
+    end
+  end
+
+  @spec metadata_at(String.t()) :: {:ok, map()} | {:error, term()}
+  def metadata_at(project_root) do
+    project_root = Path.expand(project_root)
+
     case Command.run(
-           "mix",
-           ["run", "--no-start", "--no-deps-check", "--no-compile", "-e", @expression],
+           "timeout",
+           [
+             "--kill-after=2",
+             "15",
+             "elixir",
+             "-e",
+             @expression
+           ],
            cd: project_root,
            env: [{"MIX_ENV", "dev"}, {"MIX_WORKSPACE_OPS_OVERLAY", nil}]
          ) do
-      {:ok, result} -> parse(result.output, project)
-      {:error, result} -> {:error, {:mix_project_metadata, project.id, result}}
+      {:ok, result} -> parse(result.output)
+      {:error, result} -> {:error, {:command_failed, result.exit_code, result.output}}
     end
   end
 
@@ -44,7 +72,7 @@ defmodule MixWorkspaceOps.Project do
     end
   end
 
-  defp parse(output, project) do
+  defp parse(output) do
     marker =
       output
       |> String.split("\n", trim: true)
@@ -52,25 +80,25 @@ defmodule MixWorkspaceOps.Project do
 
     case marker do
       nil ->
-        {:error, {:missing_metadata_marker, project.id}}
+        {:error, :missing_metadata_marker}
 
       @marker <> encoded ->
-        parse_metadata(String.split(encoded, "\t"), project)
+        parse_metadata(String.split(encoded, "\t"))
     end
   end
 
-  defp parse_metadata([app, version, dependencies], project) do
-    if app == project.app do
+  defp parse_metadata([app, version, dependencies]) do
+    if app == "" do
+      {:error, :non_application_mix_project}
+    else
       {:ok,
        %{
          app: app,
          version: version,
          dependencies: if(dependencies == "", do: [], else: String.split(dependencies, ","))
        }}
-    else
-      {:error, {:application_identity_drift, project.id, project.app, app}}
     end
   end
 
-  defp parse_metadata(_parts, project), do: {:error, {:invalid_metadata_marker, project.id}}
+  defp parse_metadata(_parts), do: {:error, :invalid_metadata_marker}
 end

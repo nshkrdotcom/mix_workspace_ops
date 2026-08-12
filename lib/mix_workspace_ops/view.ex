@@ -1,7 +1,7 @@
 defmodule MixWorkspaceOps.View do
   @moduledoc "Strict named selectors over portable registry project identities and tags."
 
-  alias MixWorkspaceOps.Registry
+  alias MixWorkspaceOps.{Registry, StrictJSON}
 
   @schema "mix_workspace_ops.view/v1"
   @enforce_keys [:path, :digest, :id, :description, :selector]
@@ -93,9 +93,7 @@ defmodule MixWorkspaceOps.View do
   end
 
   defp decode(bytes) do
-    {:ok, :json.decode(bytes)}
-  catch
-    kind, reason -> {:error, {:json, kind, reason}}
+    StrictJSON.decode(bytes, maximum_bytes: 1024 * 1024)
   end
 
   defp digest(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)

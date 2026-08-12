@@ -34,6 +34,29 @@ defmodule MixWorkspaceOps.Git do
   @spec clean?(String.t()) :: boolean()
   def clean?(repo), do: output!(repo, ["status", "--porcelain"]) == ""
 
+  @spec source_digest(String.t()) :: String.t()
+  def source_digest(repo) do
+    root = root!(repo)
+    status = output_binary!(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    diff = output_binary!(root, ["diff", "--binary", "--no-ext-diff", "HEAD", "--"])
+    untracked = output_binary!(root, ["ls-files", "--others", "--exclude-standard", "-z"])
+
+    untracked_digests =
+      untracked
+      |> :binary.split(<<0>>, [:global, :trim_all])
+      |> Enum.sort()
+      |> Enum.map(fn relative ->
+        path = Path.join(root, relative)
+        [relative, <<0>>, file_kind(path), <<0>>, content_digest(path), <<0>>]
+      end)
+
+    :crypto.hash(
+      :sha256,
+      ["status\0", status, "diff\0", diff, "untracked\0", untracked_digests]
+    )
+    |> Base.encode16(case: :lower)
+  end
+
   @spec tag_exists?(String.t(), String.t()) :: boolean()
   def tag_exists?(repo, tag) do
     case Command.run("git", ["show-ref", "--verify", "--quiet", "refs/tags/#{tag}"], cd: repo) do
@@ -49,5 +72,36 @@ defmodule MixWorkspaceOps.Git do
     |> Command.run!(args, cd: repo)
     |> Map.fetch!(:output)
     |> String.trim()
+  end
+
+  defp root!(repo) do
+    case root(repo) do
+      {:ok, root} -> root
+      {:error, reason} -> raise "cannot resolve Git root: #{inspect(reason)}"
+    end
+  end
+
+  defp output_binary!(repo, args) do
+    "git" |> Command.run!(args, cd: repo) |> Map.fetch!(:output)
+  end
+
+  defp file_kind(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :symlink}} -> "symlink"
+      {:ok, %{type: :regular}} -> "file"
+      {:ok, %{type: type}} -> to_string(type)
+      {:error, reason} -> "error:#{reason}"
+    end
+  end
+
+  defp content_digest(path) do
+    bytes =
+      case File.lstat(path) do
+        {:ok, %{type: :symlink}} -> path |> File.read_link!() |> IO.iodata_to_binary()
+        {:ok, %{type: :regular}} -> File.read!(path)
+        _other -> <<>>
+      end
+
+    :crypto.hash(:sha256, bytes)
   end
 end

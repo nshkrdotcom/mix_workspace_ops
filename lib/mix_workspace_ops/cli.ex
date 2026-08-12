@@ -4,6 +4,7 @@ defmodule MixWorkspaceOps.CLI do
   alias MixWorkspaceOps.{
     Bootstrap,
     Command,
+    Discovery,
     Doctor,
     Graph,
     Inventory,
@@ -12,6 +13,8 @@ defmodule MixWorkspaceOps.CLI do
     Report,
     View
   }
+
+  alias MixWorkspaceOps.Release.{Descriptor, LocalAdapter, Transaction}
 
   @spec main([String.t()]) :: no_return()
   def main(args) do
@@ -79,10 +82,20 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
+  defp dispatch(["registry", "discover" | args]) do
+    with {:ok, options, []} <-
+           parse_options(args, checkout_root: nil, github_owner: nil, output: nil),
+         :ok <- require_options(options, [:checkout_root, :github_owner]),
+         {:ok, discovery} <- Discovery.scan(options.checkout_root, options.github_owner),
+         :ok <- maybe_write_report(options.output, discovery) do
+      {:ok, discovery}
+    end
+  end
+
   defp dispatch(["inventory" | args]) do
-    with {:ok, options, []} <- parse_options(args, checkout_root: nil, output: nil),
-         :ok <- require_option(options, :checkout_root),
-         {:ok, rows} <- Inventory.scan(options.checkout_root),
+    with {:ok, options, []} <- registry_options(args, output: nil),
+         {:ok, registry} <- load_bound_registry(options),
+         {:ok, rows} <- Inventory.scan_registry(registry),
          report = Inventory.summary(rows),
          :ok <- maybe_write_report(options.output, report) do
       {:ok, report}
@@ -121,6 +134,7 @@ defmodule MixWorkspaceOps.CLI do
          {:ok, options, []} <- registry_options(option_args, project: nil, mode: "local"),
          :ok <- require_option(options, :project),
          :ok <- require_command(command),
+         :ok <- require_safe_run_command(command),
          {:ok, registry} <- load_bound_registry(options),
          :ok <- ensure_project_in_view(registry, options),
          {:ok, mode} <- source_mode(options.mode) do
@@ -151,24 +165,40 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
+  defp dispatch(["release", "publish" | args]) do
+    with {:ok, options, []} <-
+           parse_options(args, descriptor: nil, state_root: default_state_root()),
+         :ok <- require_option(options, :descriptor),
+         {:ok, plan} <- Descriptor.load(options.descriptor) do
+      Transaction.run(plan, LocalAdapter, state_root: options.state_root)
+    end
+  end
+
   defp dispatch(args), do: {:usage_error, "unknown command: #{Enum.join(args, " ")} "}
 
   defp load_bound_registry(options) do
     with :ok <- require_options(options, [:registry, :checkout_root]),
-         {:ok, registry} <- Registry.load(options.registry) do
+         {:ok, registry} <- Registry.load(options.registry),
+         {:ok, registry} <- restrict_to_view(registry, options.view) do
       Registry.bind(registry, options.checkout_root, binding_file: options.binding)
+    end
+  end
+
+  defp restrict_to_view(registry, nil), do: {:ok, registry}
+
+  defp restrict_to_view(registry, view_path) do
+    with {:ok, view} <- View.load(view_path),
+         {:ok, projects} <- View.select(registry, view) do
+      {:ok, Registry.restrict(registry, projects)}
     end
   end
 
   defp ensure_project_in_view(_registry, %{view: nil}), do: :ok
 
   defp ensure_project_in_view(registry, options) do
-    with {:ok, view} <- View.load(options.view),
-         {:ok, projects} <- View.select(registry, view) do
-      if Enum.any?(projects, &(&1.id == options.project)),
-        do: :ok,
-        else: {:error, {:project_outside_view, options.project, view.id}}
-    end
+    if Map.has_key?(registry.projects, options.project),
+      do: :ok,
+      else: {:error, {:project_outside_view, options.project, options.view}}
   end
 
   defp registry_options(args, defaults \\ []) do
@@ -212,7 +242,7 @@ defmodule MixWorkspaceOps.CLI do
     do: parse_options(rest, options, [argument | positional])
 
   defp normalize_paths({:ok, options, rest}) do
-    path_keys = [:registry, :checkout_root, :binding, :view, :state_root, :output]
+    path_keys = [:registry, :checkout_root, :binding, :view, :state_root, :output, :descriptor]
 
     normalized =
       Enum.reduce(path_keys, options, fn key, acc ->
@@ -242,6 +272,8 @@ defmodule MixWorkspaceOps.CLI do
   defp option_key("project"), do: {:ok, :project}
   defp option_key("mode"), do: {:ok, :mode}
   defp option_key("output"), do: {:ok, :output}
+  defp option_key("github-owner"), do: {:ok, :github_owner}
+  defp option_key("descriptor"), do: {:ok, :descriptor}
   defp option_key(option), do: {:error, "unknown option --#{option}"}
 
   defp require_options(options, keys) do
@@ -260,6 +292,16 @@ defmodule MixWorkspaceOps.CLI do
   defp option_name(key), do: key |> to_string() |> String.replace("_", "-")
   defp require_command([]), do: {:usage_error, "empty command"}
   defp require_command(_command), do: :ok
+
+  defp require_safe_run_command([executable, task | _arguments]) do
+    if Path.basename(executable) == "mix" and task in ["hex.publish", "deps.publish_preflight"] do
+      {:usage_error, "#{task} is available only through the fail-closed release transaction"}
+    else
+      :ok
+    end
+  end
+
+  defp require_safe_run_command(_command), do: :ok
 
   defp source_mode("local"), do: {:ok, :local}
   defp source_mode("git"), do: {:ok, :git}
@@ -291,11 +333,13 @@ defmodule MixWorkspaceOps.CLI do
       version
       registry validate --registry PATH
       registry select --registry PATH --view PATH
-      inventory --checkout-root PATH [--output PATH]
-      doctor --registry PATH --checkout-root PATH [--binding PATH]
+      registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
+      inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
+      doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
       plan --project ID --registry PATH --checkout-root PATH [--view PATH]
       bootstrap install --project ID --registry PATH --checkout-root PATH
       run --project ID --mode local|git|hex --registry PATH --checkout-root PATH -- COMMAND [ARG ...]
+      release publish --descriptor PATH [--state-root PATH]
       help
     """)
 

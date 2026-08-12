@@ -72,4 +72,53 @@ defmodule MixWorkspaceOps.RegistryTest do
     assert {:error, {:wrong_origin, "widget", "example-org/widget", "other-org/widget"}} =
              Registry.bind(registry, root)
   end
+
+  test "rejects duplicate JSON keys instead of accepting hidden precedence", context do
+    root = temporary_directory!(context)
+    path = Path.join(root, "registry.json")
+
+    File.write!(
+      path,
+      ~s({"schema":"mix_workspace_ops.registry/v1","schema":"other","repositories":[]})
+    )
+
+    assert {:error, {:duplicate_json_key, "schema"}} = Registry.load(path)
+  end
+
+  test "repository identities may use stable hyphenated names", context do
+    root = temporary_directory!(context)
+
+    path =
+      write_registry!(root, [
+        repository("context-nexus", [
+          project("context-nexus.context_nexus", "context_nexus")
+        ])
+      ])
+
+    assert {:ok, registry} = Registry.load(path)
+    assert registry.repositories["context-nexus"].github == "example-org/context-nexus"
+  end
+
+  test "a selected view can bind without unrelated checkouts", context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "alpha"))
+
+    registry =
+      root
+      |> write_registry!([
+        repository("alpha", [project("alpha")]),
+        repository("beta", [project("beta")])
+      ])
+      |> Registry.load!()
+
+    restricted = Registry.restrict(registry, [Registry.project!(registry, "alpha")])
+    assert {:ok, bound} = Registry.bind(restricted, root)
+    assert Map.keys(bound.repositories) == ["alpha"]
+    assert Map.keys(bound.bindings) == ["alpha"]
+  end
+
+  test "strict JSON refuses oversized input before decoding" do
+    assert {:error, {:json_too_large, 7, 4}} =
+             MixWorkspaceOps.StrictJSON.decode("{\"a\":1}", maximum_bytes: 4)
+  end
 end
