@@ -19,7 +19,9 @@ Every transition writes `started` and `succeeded` or `failed` evidence before a
 later transition can run. A failed staging, gate, archive, publisher, registry
 verification, or receipt write prevents all later actions. Credentials are not
 accepted as descriptor fields and are never written to receipts; the publisher
-prefix is invoked only at the publish transition.
+prefix is invoked only at the publish transition. `HEX_API_KEY` is inherited by
+that one subprocess only and is absent from gate, archive, verification, and
+tag subprocess environments.
 
 `mix_workspace_ops run -- mix hex.publish` is rejected. The ordinary workspace
 runner owns isolated development state; only this release transaction may cross

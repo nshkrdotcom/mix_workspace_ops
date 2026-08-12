@@ -11,3 +11,5 @@
 - Accept non-application workspace roots and discover real example projects.
 - Validate a portable prepared-artifact handoff without depending on the
   projection tool that produced it.
+- Restrict `HEX_API_KEY` inheritance to the credential-bearing publish
+  transition instead of accepting it in release descriptors.

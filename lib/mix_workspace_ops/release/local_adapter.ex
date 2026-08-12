@@ -85,7 +85,7 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
     [executable | prefix_args] = context.plan.publisher_prefix
     argv = prefix_args ++ ["mix", "hex.publish", "--yes"]
 
-    case isolated_run(executable, argv, cd: context.project) do
+    case isolated_run(executable, argv, cd: context.project, preserve: ["HEX_API_KEY"]) do
       {:ok, _result} -> {:ok, %{}}
       {:error, result} -> {:error, {:publisher_failed, result.exit_code}}
     end
@@ -190,8 +190,11 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
   end
 
   defp isolated_run(executable, argv, opts \\ []) do
+    {extra_preserved, opts} = Keyword.pop(opts, :preserve, [])
+
     environment =
-      @preserved_environment
+      (@preserved_environment ++ extra_preserved)
+      |> Enum.uniq()
       |> Enum.flat_map(fn key ->
         case System.get_env(key) do
           nil -> []
