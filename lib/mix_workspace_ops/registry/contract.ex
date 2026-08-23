@@ -10,7 +10,7 @@ defmodule MixWorkspaceOps.Registry.Contract do
   saying which, and the error names every candidate.
   """
 
-  alias MixWorkspaceOps.Registry.Source
+  alias MixWorkspaceOps.Registry.{Document, Source}
 
   @doc """
   Indexes every provided application to the projects providing it.
@@ -33,9 +33,30 @@ defmodule MixWorkspaceOps.Registry.Contract do
   @doc "Applies every rule that needs the whole document."
   @spec validate([map()], %{String.t() => [map()]}, String.t()) :: :ok | {:error, term()}
   def validate(repositories, applications, schema) do
-    with :ok <- validate_groups(repositories, schema),
+    with :ok <- validate_unique_applications(applications, schema),
+         :ok <- validate_groups(repositories, schema),
          :ok <- validate_providers(repositories, applications) do
       validate_release_chain(repositories, applications)
+    end
+  end
+
+  # v1 had one global application namespace and refused a document where two
+  # projects provided the same application. v2 replaces that rule with explicit
+  # provider selection, but a v1 document still means what it meant, so the rule
+  # holds for exactly the schema that stated it.
+  defp validate_unique_applications(applications, schema) do
+    if schema == Document.legacy_schema() do
+      duplicates =
+        applications
+        |> Enum.filter(fn {_app, projects} -> length(projects) > 1 end)
+        |> Enum.map(&elem(&1, 0))
+        |> Enum.sort()
+
+      if duplicates == [],
+        do: :ok,
+        else: {:error, {:duplicate_entries, "application", duplicates}}
+    else
+      :ok
     end
   end
 

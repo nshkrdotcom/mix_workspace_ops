@@ -175,7 +175,19 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
     fn project -> {:ok, if(project.id == "alpha", do: ["shared"], else: [])} end
   end
 
-  test "a v1 document keeps its global application uniqueness rule", context do
+  test "a v1 document refuses two projects providing one application", context do
+    root = temporary_directory!(context)
+
+    path =
+      write_registry!(root, [
+        repository("alpha", [project("alpha"), project("alpha.shared", "shared")]),
+        repository("beta", [project("beta"), project("beta.shared", "shared")])
+      ])
+
+    assert {:error, {:duplicate_entries, "application", ["shared"]}} = Registry.load(path)
+  end
+
+  test "a v1 document with one provider per application still loads", context do
     root = temporary_directory!(context)
 
     registry =
@@ -188,5 +200,30 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
 
     assert map_size(registry.applications) == 2
     assert {:ok, %{id: "alpha"}} = Registry.project_for_app(registry, "alpha")
+  end
+
+  test "a v2 document accepts what v1 refused", context do
+    root = temporary_directory!(context)
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("alpha",
+          projects: [
+            catalog_project("alpha"),
+            catalog_project("alpha.shared", app: "shared", path: "shared", kind: "package")
+          ]
+        ),
+        catalog_repository("beta",
+          projects: [
+            catalog_project("beta"),
+            catalog_project("beta.shared", app: "shared", path: "shared", kind: "package")
+          ]
+        )
+      ])
+      |> Registry.load!()
+
+    assert Enum.map(Registry.providers(registry, "shared"), & &1.id) ==
+             ["alpha.shared", "beta.shared"]
   end
 end
