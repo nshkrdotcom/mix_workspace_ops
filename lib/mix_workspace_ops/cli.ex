@@ -16,6 +16,24 @@ defmodule MixWorkspaceOps.CLI do
   alias MixWorkspaceOps.Registry.ReleaseChain
   alias MixWorkspaceOps.Release.{Descriptor, LocalAdapter, Transaction}
 
+  @usage """
+  mix_workspace_ops <command>
+
+    version
+    registry validate --registry PATH
+    registry select --registry PATH --view PATH
+    registry workspace --registry PATH [--repository ID]
+    registry chain --registry PATH [--package APP]
+    registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
+    inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
+    doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
+    plan --project ID --registry PATH --checkout-root PATH [--view PATH]
+    run --project ID --mode local|git|hex --mix-state managed|delegated \
+      --registry PATH --checkout-root PATH -- COMMAND [ARG ...]
+    release publish --descriptor PATH [--state-root PATH]
+    help
+  """
+
   @spec main([String.t()]) :: no_return()
   def main(args) do
     args
@@ -23,6 +41,10 @@ defmodule MixWorkspaceOps.CLI do
     |> exit_status()
     |> System.halt()
   end
+
+  @doc false
+  @spec usage_text() :: String.t()
+  def usage_text, do: @usage
 
   defp exit_status(:usage), do: usage()
   defp exit_status({:ok, nil}), do: 0
@@ -42,15 +64,18 @@ defmodule MixWorkspaceOps.CLI do
     usage(64)
   end
 
-  defp dispatch(["version"]) do
+  @doc false
+  @spec dispatch([String.t()]) ::
+          :usage | {:ok, term()} | {:error, term()} | {:usage_error, String.t()}
+  def dispatch(["version"]) do
     IO.puts(MixWorkspaceOps.version())
     {:ok, nil}
   end
 
-  defp dispatch(["help"]), do: :usage
-  defp dispatch([]), do: :usage
+  def dispatch(["help"]), do: :usage
+  def dispatch([]), do: :usage
 
-  defp dispatch(["registry", "validate" | args]) do
+  def dispatch(["registry", "validate" | args]) do
     with {:ok, options, []} <- registry_options(args),
          :ok <- require_option(options, :registry),
          {:ok, registry} <- Registry.load(options.registry) do
@@ -69,7 +94,7 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp dispatch(["registry", "chain" | args]) do
+  def dispatch(["registry", "chain" | args]) do
     with {:ok, options, []} <- registry_options(args, package: nil),
          :ok <- require_option(options, :registry),
          {:ok, registry} <- Registry.load(options.registry),
@@ -86,7 +111,7 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp dispatch(["registry", "workspace" | args]) do
+  def dispatch(["registry", "workspace" | args]) do
     with {:ok, options, []} <- registry_options(args, repository: nil),
          :ok <- require_option(options, :registry),
          {:ok, registry} <- Registry.load(options.registry),
@@ -101,7 +126,7 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp dispatch(["registry", "select" | args]) do
+  def dispatch(["registry", "select" | args]) do
     with {:ok, options, []} <- registry_options(args),
          :ok <- require_options(options, [:registry, :view]),
          {:ok, registry} <- Registry.load(options.registry),
@@ -121,7 +146,7 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp dispatch(["registry", "discover" | args]) do
+  def dispatch(["registry", "discover" | args]) do
     with {:ok, options, []} <-
            parse_options(args, checkout_root: nil, github_owner: nil, output: nil),
          :ok <- require_options(options, [:checkout_root, :github_owner]),
@@ -131,7 +156,7 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp dispatch(["inventory" | args]) do
+  def dispatch(["inventory" | args]) do
     with {:ok, options, []} <- registry_options(args, output: nil),
          {:ok, registry} <- load_bound_registry(options),
          {:ok, rows} <- Inventory.scan_registry(registry),
@@ -141,7 +166,7 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp dispatch(["doctor" | args]) do
+  def dispatch(["doctor" | args]) do
     with {:ok, options, []} <- registry_options(args),
          {:ok, registry} <- load_bound_registry(options) do
       report = Doctor.inspect(registry)
@@ -149,7 +174,7 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp dispatch(["plan" | args]) do
+  def dispatch(["plan" | args]) do
     with {:ok, options, []} <- registry_options(args, project: nil),
          :ok <- require_option(options, :project),
          {:ok, registry} <- load_bound_registry(options),
@@ -169,7 +194,7 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp dispatch(["run" | args]) do
+  def dispatch(["run" | args]) do
     with {:ok, option_args, command} <- split_command(args),
          {:ok, options, []} <-
            registry_options(option_args, project: nil, mode: "local", mix_state: "managed"),
@@ -191,7 +216,7 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp dispatch(["release", "publish" | args]) do
+  def dispatch(["release", "publish" | args]) do
     with {:ok, options, []} <-
            parse_options(args, descriptor: nil, state_root: default_state_root()),
          :ok <- require_option(options, :descriptor),
@@ -200,7 +225,7 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp dispatch(args), do: {:usage_error, "unknown command: #{Enum.join(args, " ")} "}
+  def dispatch(args), do: {:usage_error, "unknown command: #{Enum.join(args, " ")} "}
 
   defp load_bound_registry(options) do
     with :ok <- require_options(options, [:registry, :checkout_root]),
@@ -408,24 +433,7 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   defp usage(status \\ 0) do
-    IO.puts("""
-    mix_workspace_ops <command>
-
-      version
-      registry validate --registry PATH
-      registry select --registry PATH --view PATH
-      registry workspace --registry PATH [--repository ID]
-      registry chain --registry PATH [--package APP]
-      registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
-      inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
-      doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
-      plan --project ID --registry PATH --checkout-root PATH [--view PATH]
-      run --project ID --mode local|git|hex --mix-state managed|delegated \\
-        --registry PATH --checkout-root PATH -- COMMAND [ARG ...]
-      release publish --descriptor PATH [--state-root PATH]
-      help
-    """)
-
+    IO.puts(@usage)
     status
   end
 end
