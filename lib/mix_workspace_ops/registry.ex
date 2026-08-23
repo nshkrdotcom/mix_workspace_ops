@@ -15,7 +15,7 @@ defmodule MixWorkspaceOps.Registry do
   """
 
   alias MixWorkspaceOps.Binding
-  alias MixWorkspaceOps.Registry.{Contract, Document, Source}
+  alias MixWorkspaceOps.Registry.{Contract, Document, Source, Workspace}
   alias MixWorkspaceOps.StrictJSON
 
   @enforce_keys [:path, :digest, :schema, :repositories, :projects, :applications]
@@ -189,6 +189,20 @@ defmodule MixWorkspaceOps.Registry do
   def providers(%__MODULE__{applications: applications}, app) do
     Map.get(applications, to_string(app), [])
   end
+
+  @doc """
+  The derived members of a repository's umbrella or Blitz workspace.
+
+  Membership derives from project metadata; the catalog records only the
+  exceptions derivation cannot see.
+  """
+  @spec workspace_members(t(), repository() | String.t()) ::
+          {:ok, [project()]} | {:error, term()}
+  defdelegate workspace_members(registry, repository), to: Workspace, as: :members
+
+  @doc "Every repository declaring a workspace, with its derived members."
+  @spec workspaces(t()) :: [{repository(), [project()]}]
+  defdelegate workspaces(registry), to: Workspace
 
   @spec repository!(t(), String.t()) :: repository()
   def repository!(%__MODULE__{repositories: repositories}, id) do

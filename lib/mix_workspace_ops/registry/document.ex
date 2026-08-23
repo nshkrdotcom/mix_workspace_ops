@@ -8,7 +8,7 @@ defmodule MixWorkspaceOps.Registry.Document do
   the same records, so a v1 catalog keeps working while it is migrated.
   """
 
-  alias MixWorkspaceOps.Registry.Source
+  alias MixWorkspaceOps.Registry.{Source, Workspace}
 
   @v1 "mix_workspace_ops.registry/v1"
   @v2 "portfolio_registry.registry/v2"
@@ -168,7 +168,9 @@ defmodule MixWorkspaceOps.Registry.Document do
     with :ok <- keys(raw, ~w(kind), ~w(include_project_ids exclude_project_ids), :workspace),
          :ok <- member(raw["kind"], @workspace_kinds, :workspace_kind),
          {:ok, include} <- project_ids(raw["include_project_ids"], projects, repository_id),
-         {:ok, exclude} <- project_ids(raw["exclude_project_ids"], projects, repository_id) do
+         {:ok, exclude} <- project_ids(raw["exclude_project_ids"], projects, repository_id),
+         :ok <- disjoint_members(include, exclude, repository_id),
+         :ok <- includable_members(include, projects, repository_id) do
       {:ok, %{kind: raw["kind"], include_project_ids: include, exclude_project_ids: exclude}}
     end
   end
@@ -192,6 +194,28 @@ defmodule MixWorkspaceOps.Registry.Document do
 
   defp project_ids(raw, _projects, repository_id),
     do: {:error, {:invalid_workspace_members, repository_id, raw}}
+
+  defp disjoint_members(include, exclude, repository_id) do
+    case include -- (include -- exclude) do
+      [] -> :ok
+      both -> {:error, {:contradictory_workspace_members, repository_id, Enum.sort(both)}}
+    end
+  end
+
+  # A generated project is build output. Saying it is build output and saying it
+  # is a workspace member are contradictory statements about the same project,
+  # so the document is refused rather than one of the two being preferred.
+  defp includable_members(include, projects, repository_id) do
+    generated =
+      projects
+      |> Enum.filter(&(&1.kind in Workspace.never_member_kinds() and &1.id in include))
+      |> Enum.map(& &1.id)
+      |> Enum.sort()
+
+    if generated == [],
+      do: :ok,
+      else: {:error, {:generated_workspace_member, repository_id, generated}}
+  end
 
   defp release_chain(raw, repository_id) when is_map(raw) do
     raw

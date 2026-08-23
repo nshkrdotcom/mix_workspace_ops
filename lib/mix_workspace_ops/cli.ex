@@ -86,6 +86,21 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
+  defp dispatch(["registry", "workspace" | args]) do
+    with {:ok, options, []} <- registry_options(args, repository: nil),
+         :ok <- require_option(options, :registry),
+         {:ok, registry} <- Registry.load(options.registry),
+         {:ok, workspaces} <- workspaces(registry, options.repository) do
+      {:ok,
+       %{
+         schema: "mix_workspace_ops.workspace/v1",
+         registry_digest: registry.digest,
+         repository: options.repository,
+         workspaces: workspaces
+       }}
+    end
+  end
+
   defp dispatch(["registry", "select" | args]) do
     with {:ok, options, []} <- registry_options(args),
          :ok <- require_options(options, [:registry, :view]),
@@ -287,6 +302,7 @@ defmodule MixWorkspaceOps.CLI do
   defp option_key("github-owner"), do: {:ok, :github_owner}
   defp option_key("descriptor"), do: {:ok, :descriptor}
   defp option_key("package"), do: {:ok, :package}
+  defp option_key("repository"), do: {:ok, :repository}
   defp option_key(option), do: {:error, "unknown option --#{option}"}
 
   defp require_options(options, keys) do
@@ -303,6 +319,35 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   defp option_name(key), do: key |> to_string() |> String.replace("_", "-")
+
+  defp workspaces(registry, nil) do
+    {:ok, Enum.map(Registry.workspaces(registry), &workspace_row/1)}
+  end
+
+  defp workspaces(registry, repository_id) do
+    with {:ok, repository} <- fetch_repository(registry, repository_id),
+         {:ok, members} <- Registry.workspace_members(registry, repository) do
+      {:ok, [workspace_row({repository, members})]}
+    end
+  end
+
+  defp fetch_repository(registry, repository_id) do
+    case Map.fetch(registry.repositories, repository_id) do
+      {:ok, repository} -> {:ok, repository}
+      :error -> {:error, {:unknown_repository, repository_id}}
+    end
+  end
+
+  defp workspace_row({repository, members}) do
+    %{
+      repository: repository.id,
+      kind: repository.workspace.kind,
+      projects: length(repository.projects),
+      members: Enum.map(members, & &1.id),
+      include_project_ids: repository.workspace.include_project_ids,
+      exclude_project_ids: repository.workspace.exclude_project_ids
+    }
+  end
 
   defp known_unselected(resolution) do
     Enum.map(resolution.known_unselected, fn {consumer, application, candidates} ->
@@ -369,6 +414,7 @@ defmodule MixWorkspaceOps.CLI do
       version
       registry validate --registry PATH
       registry select --registry PATH --view PATH
+      registry workspace --registry PATH [--repository ID]
       registry chain --registry PATH [--package APP]
       registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
       inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
