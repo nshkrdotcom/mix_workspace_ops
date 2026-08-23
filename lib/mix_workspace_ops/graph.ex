@@ -93,6 +93,11 @@ defmodule MixWorkspaceOps.Graph do
       {:ok, dependency} ->
         reduce_managed_dependency(registry, project, dependency, reader, current)
 
+      {:ambiguous, candidates} ->
+        {:halt,
+         {:error,
+          {:ambiguous_application, dependency_app, Enum.map(candidates, & &1.id), project.id}}}
+
       :error ->
         reduce_external_dependency(project, dependency_app, current)
     end

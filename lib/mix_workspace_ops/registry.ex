@@ -1,55 +1,84 @@
 defmodule MixWorkspaceOps.Registry do
-  @moduledoc "Strict, portable repository and Mix-project identity registry."
+  @moduledoc """
+  Repository-first catalog of portable identities, classifications, and
+  dependency-source declarations.
 
-  alias MixWorkspaceOps.{Binding, StrictJSON}
+  A repository is the unit of the catalog. It carries the identity every
+  operation needs — remote coordinate, languages, lifecycle, disposition,
+  visibility, roles, groups, agent scope — whether or not it builds anything with
+  Mix. Mix data is an optional per-repository block, so a repository with no Mix
+  project is still catalogued, grouped, and selectable.
 
-  @schema "mix_workspace_ops.registry/v1"
-  @project_kinds ~w(standalone workspace_root package tooling)
-  @reserved_path_segments ~w(.git .mix_workspace_ops _build deps)
+  Two schemas load. `portfolio_registry.registry/v2` is current;
+  `mix_workspace_ops.registry/v1` still loads and is normalized onto the same
+  records.
+  """
 
-  @enforce_keys [:path, :digest, :repositories, :projects, :applications]
-  defstruct [:path, :digest, :repositories, :projects, :applications, bindings: %{}]
+  alias MixWorkspaceOps.Binding
+  alias MixWorkspaceOps.Registry.{Contract, Document, Source}
+  alias MixWorkspaceOps.StrictJSON
+
+  @enforce_keys [:path, :digest, :schema, :repositories, :projects, :applications]
+  defstruct [:path, :digest, :schema, :repositories, :projects, :applications, bindings: %{}]
 
   @type project :: %{
           id: String.t(),
           app: String.t() | nil,
           path: String.t(),
           kind: String.t(),
-          tags: [String.t()],
-          profile: String.t(),
+          provides: [String.t()],
+          dependency_sources: %{String.t() => Source.t()},
           repository: String.t()
         }
   @type repository :: %{
           id: String.t(),
           github: String.t(),
           default_branch: String.t(),
-          projects: [project()]
+          languages: [String.t()],
+          lifecycle: String.t(),
+          disposition: String.t(),
+          visibility: String.t(),
+          roles: [String.t()],
+          groups: [String.t()],
+          agent_scope: String.t(),
+          projects: [project()],
+          workspace: map() | nil,
+          dependency_sources: %{String.t() => Source.t()},
+          release_chain: %{String.t() => [String.t()]}
         }
   @type t :: %__MODULE__{
           path: String.t(),
           digest: String.t(),
+          schema: String.t(),
           repositories: %{String.t() => repository()},
           projects: %{String.t() => project()},
-          applications: %{String.t() => project()},
+          applications: %{String.t() => [project()]},
           bindings: %{String.t() => String.t()}
         }
 
+  @doc "The schema identifier this version writes."
   @spec schema() :: String.t()
-  def schema, do: @schema
+  def schema, do: Document.current_schema()
+
+  @doc "Every schema identifier this version loads, current first."
+  @spec schemas() :: [String.t()]
+  def schemas, do: Document.schemas()
 
   @spec load(String.t()) :: {:ok, t()} | {:error, term()}
   def load(path) do
     path = Path.expand(path)
 
     with {:ok, bytes} <- File.read(path),
-         {:ok, decoded} <- decode(bytes),
-         {:ok, repositories} <- parse_registry(decoded),
-         {:ok, projects} <- index_unique(repositories, :projects, :id, "project id"),
-         {:ok, applications} <- index_applications(repositories) do
+         {:ok, decoded} <- StrictJSON.decode(bytes),
+         {:ok, {schema, repositories}} <- Document.parse(decoded),
+         {:ok, projects} <- index_projects(repositories),
+         applications = Contract.index_applications(repositories),
+         :ok <- Contract.validate(repositories, applications, schema) do
       {:ok,
        %__MODULE__{
          path: path,
          digest: sha256(bytes),
+         schema: schema,
          repositories: Map.new(repositories, &{&1.id, &1}),
          projects: projects,
          applications: applications
@@ -83,9 +112,34 @@ defmodule MixWorkspaceOps.Registry do
     end
   end
 
-  @spec project_for_app(t(), String.t() | atom()) :: {:ok, project()} | :error
+  @doc """
+  Finds the project providing `app`.
+
+  Returns `{:ambiguous, projects}` where more than one project provides it, so a
+  caller must either name a provider or report the candidates. It never picks the
+  first match.
+  """
+  @spec project_for_app(t(), String.t() | atom()) ::
+          {:ok, project()} | {:ambiguous, [project()]} | :error
   def project_for_app(%__MODULE__{applications: applications}, app) do
-    Map.fetch(applications, to_string(app))
+    case Map.get(applications, to_string(app), []) do
+      [project] -> {:ok, project}
+      [] -> :error
+      several -> {:ambiguous, several}
+    end
+  end
+
+  @doc "Resolves the provider of `app`, honouring an explicit provider project id."
+  @spec provider_for(t(), String.t() | atom(), String.t() | nil) ::
+          {:ok, project()} | {:error, term()}
+  def provider_for(%__MODULE__{applications: applications}, app, provider \\ nil) do
+    Contract.resolve_provider(applications, to_string(app), provider)
+  end
+
+  @doc "Every project providing `app`, sorted by project id."
+  @spec providers(t(), String.t() | atom()) :: [project()]
+  def providers(%__MODULE__{applications: applications}, app) do
+    Map.get(applications, to_string(app), [])
   end
 
   @spec repository!(t(), String.t()) :: repository()
@@ -96,35 +150,58 @@ defmodule MixWorkspaceOps.Registry do
     end
   end
 
+  @doc """
+  The dependency-source declarations in effect for a project.
+
+  A repository's table applies to every project in it. A project may declare its
+  own entry for an application, which replaces the repository's entry for that
+  application alone.
+  """
+  @spec dependency_sources(t(), project() | String.t()) :: %{String.t() => Source.t()}
+  def dependency_sources(registry, project_id) when is_binary(project_id) do
+    dependency_sources(registry, project!(registry, project_id))
+  end
+
+  def dependency_sources(registry, project) when is_map(project) do
+    registry
+    |> repository!(project.repository)
+    |> Map.fetch!(:dependency_sources)
+    |> Map.merge(project.dependency_sources)
+  end
+
+  @doc "Repositories carrying every group in `groups`."
+  @spec repositories_in_groups(t(), [String.t()]) :: [repository()]
+  def repositories_in_groups(%__MODULE__{repositories: repositories}, groups) do
+    repositories
+    |> Map.values()
+    |> Enum.filter(fn repository -> Enum.all?(groups, &(&1 in repository.groups)) end)
+    |> Enum.sort_by(& &1.id)
+  end
+
+  @spec groups(t()) :: [String.t()]
+  def groups(%__MODULE__{repositories: repositories}) do
+    repositories |> Map.values() |> Enum.flat_map(& &1.groups) |> Enum.uniq() |> Enum.sort()
+  end
+
   @spec restrict(t(), [project()]) :: t()
   def restrict(%__MODULE__{} = registry, selected_projects) when is_list(selected_projects) do
-    selected_ids = selected_projects |> Enum.map(& &1.id) |> MapSet.new()
+    selected_ids = MapSet.new(selected_projects, & &1.id)
 
     repositories =
       registry.repositories
       |> Map.values()
       |> Enum.map(fn repository ->
-        projects = Enum.filter(repository.projects, &MapSet.member?(selected_ids, &1.id))
-        %{repository | projects: projects}
+        %{repository | projects: Enum.filter(repository.projects, &(&1.id in selected_ids))}
       end)
       |> Enum.reject(&(&1.projects == []))
       |> Map.new(&{&1.id, &1})
 
-    projects = Map.new(selected_projects, &{&1.id, &1})
-
-    applications =
-      selected_projects
-      |> Enum.filter(&is_binary(&1.app))
-      |> Map.new(&{&1.app, &1})
-
-    bindings = Map.take(registry.bindings, Map.keys(repositories))
-
     %{
       registry
       | repositories: repositories,
-        projects: projects,
-        applications: applications,
-        bindings: bindings
+        projects: Map.new(selected_projects, &{&1.id, &1}),
+        applications: Contract.index_applications(Map.values(repositories)),
+        bindings: Map.take(registry.bindings, Map.keys(repositories))
     }
   end
 
@@ -154,211 +231,19 @@ defmodule MixWorkspaceOps.Registry do
     |> Path.expand()
   end
 
-  defp decode(bytes) do
-    StrictJSON.decode(bytes)
-  end
+  defp index_projects(repositories) do
+    projects = Enum.flat_map(repositories, & &1.projects)
 
-  defp parse_registry(%{"schema" => @schema, "repositories" => repositories} = raw)
-       when map_size(raw) == 2 and is_list(repositories) do
-    repositories
-    |> parse_list(&parse_repository/1)
-    |> then(fn
-      {:ok, parsed} -> ensure_unique(parsed, :id, "repository")
-      error -> error
-    end)
-  end
-
-  defp parse_registry(_decoded), do: {:error, :unsupported_registry_schema}
-
-  defp parse_repository(
-         %{
-           "id" => id,
-           "github" => github,
-           "default_branch" => default_branch,
-           "projects" => projects
-         } = raw
-       )
-       when map_size(raw) == 4 and is_binary(id) and is_binary(github) and
-              is_binary(default_branch) and is_list(projects) do
-    with :ok <- validate_stable_id(id),
-         :ok <- validate_github(github),
-         :ok <- validate_branch(default_branch),
-         {:ok, parsed_projects} <- parse_projects(projects, id) do
-      {:ok,
-       %{
-         id: id,
-         github: github,
-         default_branch: default_branch,
-         projects: parsed_projects
-       }}
-    end
-  end
-
-  defp parse_repository(raw), do: {:error, {:invalid_repository, raw}}
-
-  defp parse_projects(projects, repository_id) do
-    projects
-    |> parse_list(&parse_project(&1, repository_id))
-    |> then(fn
-      {:ok, parsed} -> ensure_unique(parsed, :id, "project")
-      error -> error
-    end)
-  end
-
-  defp parse_project(
-         %{
-           "id" => id,
-           "app" => app,
-           "path" => path,
-           "kind" => kind,
-           "tags" => tags,
-           "profile" => profile
-         } = raw,
-         repository_id
-       )
-       when map_size(raw) == 6 do
-    with {:ok, app} <- normalize_project_fields(id, app, path, kind, tags, profile),
-         :ok <- validate_stable_id(id),
-         :ok <- validate_application(app, kind),
-         :ok <- validate_relative_path(path),
-         :ok <- validate_kind(kind),
-         :ok <- validate_tags(tags),
-         :ok <- validate_stable_id(profile) do
-      {:ok,
-       %{
-         id: id,
-         app: app,
-         path: path,
-         kind: kind,
-         tags: Enum.sort(tags),
-         profile: profile,
-         repository: repository_id
-       }}
-    else
-      :error -> {:error, {:invalid_project, raw}}
-      error -> error
-    end
-  end
-
-  defp parse_project(raw, _repository_id), do: {:error, {:invalid_project, raw}}
-
-  defp normalize_project_fields(id, app, path, kind, tags, profile) do
-    strings? = Enum.all?([id, path, kind, profile], &is_binary/1)
-    app? = is_binary(app) or is_nil(app) or app == :null
-
-    if strings? and app? and is_list(tags) do
-      {:ok, if(app == :null, do: nil, else: app)}
-    else
-      :error
-    end
-  end
-
-  defp parse_list(entries, parser) do
-    entries
-    |> Enum.reduce_while({:ok, []}, fn raw, {:ok, parsed} ->
-      case parser.(raw) do
-        {:ok, entry} -> {:cont, {:ok, [entry | parsed]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> then(fn
-      {:ok, parsed} -> {:ok, Enum.reverse(parsed)}
-      error -> error
-    end)
-  end
-
-  defp index_unique(repositories, field, key, label) do
-    entries = Enum.flat_map(repositories, &Map.fetch!(&1, field))
-
-    case ensure_unique(entries, key, label) do
-      {:ok, unique} -> {:ok, Map.new(unique, &{Map.fetch!(&1, key), &1})}
-      error -> error
-    end
-  end
-
-  defp index_applications(repositories) do
-    entries =
-      for repository <- repositories,
-          project <- repository.projects,
-          is_binary(project.app),
-          do: project
-
-    case ensure_unique(entries, :app, "application") do
-      {:ok, unique} -> {:ok, Map.new(unique, &{&1.app, &1})}
-      error -> error
-    end
-  end
-
-  defp ensure_unique(entries, key, label) do
     duplicates =
-      entries
-      |> Enum.group_by(&Map.fetch!(&1, key))
-      |> Enum.filter(fn {_value, matches} -> length(matches) > 1 end)
+      projects
+      |> Enum.group_by(& &1.id)
+      |> Enum.filter(fn {_id, matches} -> length(matches) > 1 end)
       |> Enum.map(&elem(&1, 0))
       |> Enum.sort()
 
     if duplicates == [],
-      do: {:ok, entries},
-      else: {:error, {:duplicate_entries, label, duplicates}}
-  end
-
-  defp validate_identifier(identifier) do
-    if Regex.match?(~r/^[a-z][a-z0-9_]*$/, identifier),
-      do: :ok,
-      else: {:error, {:invalid_identifier, identifier}}
-  end
-
-  defp validate_application(nil, kind) when kind in ["workspace_root", "tooling"], do: :ok
-  defp validate_application(app, _kind) when is_binary(app), do: validate_identifier(app)
-  defp validate_application(app, kind), do: {:error, {:invalid_application, app, kind}}
-
-  defp validate_stable_id(identifier) do
-    if Regex.match?(~r/^[a-z][a-z0-9_.-]*$/, identifier),
-      do: :ok,
-      else: {:error, {:invalid_stable_id, identifier}}
-  end
-
-  defp validate_github(github) do
-    if Regex.match?(~r/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, github),
-      do: :ok,
-      else: {:error, {:invalid_github_identity, github}}
-  end
-
-  defp validate_branch(branch) do
-    if branch != "" and not String.contains?(branch, ["..", " ", "~", "^", ":"]),
-      do: :ok,
-      else: {:error, {:invalid_default_branch, branch}}
-  end
-
-  defp validate_kind(kind) when kind in @project_kinds, do: :ok
-  defp validate_kind(kind), do: {:error, {:invalid_project_kind, kind}}
-
-  defp validate_tags(tags) do
-    cond do
-      not Enum.all?(tags, &is_binary/1) -> {:error, {:invalid_tags, tags}}
-      tags != Enum.uniq(tags) -> {:error, {:duplicate_tags, tags}}
-      Enum.any?(tags, &(validate_stable_id(&1) != :ok)) -> {:error, {:invalid_tags, tags}}
-      true -> :ok
-    end
-  end
-
-  defp validate_relative_path(path) do
-    expanded = Path.expand(path, "/workspace")
-    segments = Path.split(path)
-
-    cond do
-      Path.type(path) == :absolute ->
-        {:error, {:absolute_registry_path, path}}
-
-      expanded != "/workspace" and not String.starts_with?(expanded, "/workspace/") ->
-        {:error, {:escaping_registry_path, path}}
-
-      Enum.any?(segments, &(&1 in @reserved_path_segments)) ->
-        {:error, {:reserved_registry_path, path}}
-
-      true ->
-        :ok
-    end
+      do: {:ok, Map.new(projects, &{&1.id, &1})},
+      else: {:error, {:duplicate_entries, "project", duplicates}}
   end
 
   defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
