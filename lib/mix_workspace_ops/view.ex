@@ -3,8 +3,13 @@ defmodule MixWorkspaceOps.View do
   Named selectors over the catalog.
 
   A view selects repositories first and projects second, so a repository with no
-  Mix project is still reachable — a Python repository is selected, grouped, and
-  operated on by repository-scoped commands even though it contributes no project.
+  Mix project is still reachable: `select_repositories/2` returns it and
+  `registry select` reports it, even though it contributes no project.
+
+  No command operates on such a repository yet. `Registry.restrict/2` drops a
+  repository once none of its projects is selected, so a repository-scoped unit
+  of work has nothing to run against. Repository-scoped units arrive with the
+  fan-out work; until then the selection is data, not an execution target.
 
   `portfolio_registry.view/v2` selects on repository identity, groups, languages,
   and lifecycles as well as project identity. `mix_workspace_ops.view/v1` still
