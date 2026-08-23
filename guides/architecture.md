@@ -60,9 +60,103 @@ those variables because the launched workspace runner owns its independent
 child state. Both modes carry the same source/bootstrap contract.
 
 Non-application workspace roots, including ordinary umbrella roots, are valid
-registry targets. Application uniqueness applies only to projects that declare
-an OTP application; no fake app name is introduced for a tooling or umbrella
-root.
+registry targets. No fake app name is introduced for a tooling or umbrella root.
+
+## The catalog contract
+
+The catalog is data. It is validated from outside, by this tool, and never
+contains executable code, credentials, absolute paths, or machine-local
+directory names.
+
+A repository is the unit of the catalog. Every repository carries the identity
+an operation needs — remote coordinate, default branch, languages, lifecycle,
+disposition, visibility, roles, groups, and agent scope — whether or not it
+builds anything with Mix. `languages` is a list, because one repository may
+carry several toolchains, and Mix data is an optional block, so a repository
+with no Mix project is still catalogued, grouped, and selected by a
+repository-scoped view.
+
+`disposition` describes the remote repository — `tracked`, `superseded`,
+`archived`, `intentionally_untracked`. Machine-local observations such as
+worktrees, scratch clones, and generated checkouts belong in an operator-local
+ledger, never in the catalog.
+
+### Dependency sources
+
+A repository's `dependency_sources` table says how each application it consumes
+can be resolved. It is a resolution table, not a dependency list: `mix.exs`
+remains the authority for which dependencies exist and what versions they
+require.
+
+Every entry resolves through an ordered list of candidate sources. The default
+order is `local`, then `github`, then `hex`, and the common case declares no
+order at all. An entry may declare one where it genuinely differs — a package
+with no published release names `["local", "github"]`, a third-party package
+with no sibling checkout names `["hex"]`. `publish_order` works the same way and
+defaults to `hex` alone, but an entry whose source will never be on a package
+registry may name another source, and publishing then honours it.
+
+`local` carries no path. It is derived from the catalog identity of the project
+that provides the application, joined to the operator's checkout of that
+project's repository. That is what keeps machine-local layout out of the
+catalog: a relative sibling path is a fact about one operator's disk, while the
+provider's repository and project path are portable.
+
+An entry may also carry `opts` — the Mix dependency options merged into the
+emitted tuple, from a fixed vocabulary of `override`, `runtime`, `optional`,
+`only`, and `targets`. These change how Mix resolves a diamond, so dropping them
+changes behaviour and they are carried explicitly.
+
+A project inside the repository may declare its own entry for one application,
+which replaces the repository's entry for that application alone.
+
+### Application identity and provider selection
+
+Application identity and provider selection are separate concepts. A project
+declares what it `provides`. More than one project may provide one application —
+a fork, an example, a successor, a vendored copy — and that is legal identity,
+not a defect. It becomes an error only where a dependency declaration would have
+to choose between candidates without saying which, and the error names every
+candidate. A declaration resolves the choice with `provider`, naming one
+project. Nothing ever silently takes the first match.
+
+### Workspace membership
+
+Workspace membership has one authority: derivation. A Mix umbrella declares its
+members through `apps_path`; a Blitz workspace declares them through project
+globs in the root project's metadata. The catalog records which mechanism a
+repository uses, and records members only as exceptions — a project derivation
+would include but which is not a member, or one it misses. Generated output that
+happens to be a Mix project is catalogued with the `generated` kind and is never
+a workspace member.
+
+### Release chain
+
+Membership of the release train is declared: a package is in the train when the
+repository providing it lists the package in `release_chain`. Prerequisites are
+then derived from the dependency-source declarations wherever derivation can see
+them. A cross-repository edge is visible, because a repository's table names what
+it consumes from elsewhere. An edge between two packages of the same repository
+is not, because a repository-scoped table does not say which of its projects
+consumes an entry; that edge is recorded explicitly, or the consuming project
+declares its own table and restores the attribution.
+
+### Views
+
+A view selects repositories first and projects second. Repository-scoped
+selection is what makes a repository with no Mix project reachable. A v2
+selector matches on `groups_any`, `groups_all`, `languages`, `lifecycles`,
+`repository_ids`, and `exclude_repository_ids`, then narrows to projects with
+`project_ids` and `exclude_project_ids`.
+
+### Schema versions
+
+`portfolio_registry.registry/v2` and `portfolio_registry.view/v2` are current.
+`mix_workspace_ops.registry/v1` and `mix_workspace_ops.view/v1` still load and
+are normalized onto the same records, so a v1 catalog keeps working while it is
+migrated. A v1 document is treated as a single-language Elixir catalog with
+every repository `tracked`, `active`, and `public`, and its project tags become
+repository groups.
 
 Registry discovery is an evidence-producing operation, not an authority by
 itself. It only admits independent canonical Git roots for an explicitly named

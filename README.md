@@ -57,9 +57,20 @@ helper subsystem.
 
 ## Registry-driven usage
 
-The portable registry contains GitHub identities and relative Mix-project
-coordinates. The operator supplies a checkout root at runtime; every checkout is
-then verified against its Git origin and Git common directory.
+The portable catalog is repository-first. Each repository carries its remote
+identity, languages, lifecycle, disposition, visibility, roles, groups, and
+agent scope; Mix projects are an optional block within it, so a repository that
+builds nothing with Mix is still catalogued, grouped, and selectable. Where a
+repository consumes cross-repository applications, it also carries the
+dependency-source table that says how each one resolves, and the release-train
+membership of the packages it publishes.
+
+`portfolio_registry.registry/v2` and `portfolio_registry.view/v2` are the
+current schemas. `mix_workspace_ops.registry/v1` and `mix_workspace_ops.view/v1`
+still load.
+
+The operator supplies a checkout root at runtime; every checkout is then
+verified against its Git origin and Git common directory.
 
 ```bash
 ./mix_workspace_ops registry validate --registry /path/to/registry.json
@@ -70,6 +81,9 @@ then verified against its Git origin and Git common directory.
 ./mix_workspace_ops registry select \
   --registry /path/to/registry.json \
   --view /path/to/view.json
+./mix_workspace_ops registry chain \
+  --registry /path/to/registry.json \
+  --package example_core
 ./mix_workspace_ops plan \
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \
