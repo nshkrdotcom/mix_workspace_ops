@@ -74,12 +74,8 @@ defmodule MixWorkspaceOps.Doctor do
 
   defp git_root?(root), do: match?({:ok, ^root}, Git.root(root))
 
-  defp remote_matches?(root, github) do
-    case MixWorkspaceOps.Binding.normalize_github(Git.remote_url!(root)) do
-      {:ok, ^github} -> true
-      _other -> false
-    end
-  end
+  defp remote_matches?(root, github),
+    do: github in MixWorkspaceOps.Binding.github_identities(root)
 
   defp check(name, pass?, detail), do: %{name: name, pass: pass?, detail: detail}
   defp all_pass?(checks), do: Enum.all?(checks, & &1.pass)

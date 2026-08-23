@@ -31,6 +31,20 @@ defmodule MixWorkspaceOps.Git do
   @spec remote_url!(String.t()) :: String.t()
   def remote_url!(repo), do: output!(repo, ["remote", "get-url", "origin"])
 
+  @doc """
+  Every URL configured for `origin`, fetch and push.
+
+  A checkout may fetch from a local mirror and push to the remote it belongs
+  to. Both are the same repository, so identity is read from the whole set
+  rather than from the fetch URL alone.
+  """
+  @spec remote_urls!(String.t()) :: [String.t()]
+  def remote_urls!(repo) do
+    (urls!(repo, ["remote", "get-url", "--all", "origin"]) ++
+       urls!(repo, ["remote", "get-url", "--all", "--push", "origin"]))
+    |> Enum.uniq()
+  end
+
   @spec clean?(String.t()) :: boolean()
   def clean?(repo), do: output!(repo, ["status", "--porcelain"]) == ""
 
@@ -72,6 +86,14 @@ defmodule MixWorkspaceOps.Git do
     |> Command.run!(args, cd: repo)
     |> Map.fetch!(:output)
     |> String.trim()
+  end
+
+  defp urls!(repo, args) do
+    repo
+    |> output!(args)
+    |> String.split("\n", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
   end
 
   defp root!(repo) do

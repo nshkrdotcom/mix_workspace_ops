@@ -74,12 +74,19 @@ defmodule MixWorkspaceOps.Discovery do
          true <- root == path,
          {:ok, common_dir} <- Git.common_dir(path),
          true <- common_dir == Path.join(path, ".git"),
-         {:ok, github} <- Binding.normalize_github(Git.remote_url!(path)),
+         {:ok, github} <- owned_identity(path, owner),
          [^owner, repository_name] <- String.split(github, "/"),
          true <- Path.basename(path) == repository_name do
       {:ok, %{github: github, repository_name: repository_name}}
     else
       _reason -> :skip
+    end
+  end
+
+  defp owned_identity(path, owner) do
+    case Enum.find(Binding.github_identities(path), &String.starts_with?(&1, owner <> "/")) do
+      nil -> :skip
+      identity -> {:ok, identity}
     end
   end
 

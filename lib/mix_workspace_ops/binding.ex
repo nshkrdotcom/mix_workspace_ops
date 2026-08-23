@@ -46,6 +46,28 @@ defmodule MixWorkspaceOps.Binding do
     end)
   end
 
+  @doc """
+  Every GitHub identity `origin` names in a checkout, sorted.
+
+  Fetch and push URLs are read together: a checkout that fetches from a local
+  mirror and pushes to GitHub is still the GitHub repository, and which of the
+  two an operator configured is a machine-local arrangement the catalog does not
+  record.
+  """
+  @spec github_identities(String.t()) :: [String.t()]
+  def github_identities(path) do
+    path
+    |> Git.remote_urls!()
+    |> Enum.flat_map(fn url ->
+      case normalize_github(url) do
+        {:ok, identity} -> [identity]
+        {:error, _reason} -> []
+      end
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
   defp verify(repository, path) do
     path = Path.expand(path)
 
@@ -56,10 +78,10 @@ defmodule MixWorkspaceOps.Binding do
          true <-
            common_dir == Path.join(path, ".git") ||
              {:error, {:noncanonical_git_common_dir, repository.id, common_dir}},
-         {:ok, actual_github} <- normalize_github(Git.remote_url!(path)),
+         identities = github_identities(path),
          true <-
-           actual_github == repository.github ||
-             {:error, {:wrong_origin, repository.id, repository.github, actual_github}} do
+           repository.github in identities ||
+             {:error, {:wrong_origin, repository.id, repository.github, identities}} do
       {:ok, root}
     else
       {:error, reason} -> {:error, reason}

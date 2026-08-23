@@ -85,8 +85,37 @@ defmodule MixWorkspaceOps.RegistryTest do
     registry =
       root |> write_registry!([repository("widget", [project("widget")])]) |> Registry.load!()
 
-    assert {:error, {:wrong_origin, "widget", "example-org/widget", "other-org/widget"}} =
+    assert {:error, {:wrong_origin, "widget", "example-org/widget", ["other-org/widget"]}} =
              Registry.bind(registry, root)
+  end
+
+  test "binding accepts a checkout that reaches its remote through a push URL", context do
+    root = temporary_directory!(context)
+    checkout = initialize_repository!(Path.join(root, "widget"), "[]", "other-org/widget")
+    mirror = Path.join(root, "widget_mirror.git")
+    System.cmd("git", ["init", "--bare", "--quiet", mirror])
+    System.cmd("git", ["remote", "set-url", "origin", mirror], cd: checkout)
+
+    System.cmd("git", ["remote", "set-url", "--add", "--push", "origin", mirror], cd: checkout)
+
+    System.cmd(
+      "git",
+      [
+        "remote",
+        "set-url",
+        "--add",
+        "--push",
+        "origin",
+        "https://github.com/example-org/widget.git"
+      ],
+      cd: checkout
+    )
+
+    registry =
+      root |> write_registry!([repository("widget", [project("widget")])]) |> Registry.load!()
+
+    assert {:ok, bound} = Registry.bind(registry, root)
+    assert bound.bindings == %{"widget" => checkout}
   end
 
   test "rejects duplicate JSON keys instead of accepting hidden precedence", context do
