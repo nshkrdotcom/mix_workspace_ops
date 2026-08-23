@@ -285,6 +285,7 @@ defmodule MixWorkspaceOps.CLI do
   defp option_key("output"), do: {:ok, :output}
   defp option_key("github-owner"), do: {:ok, :github_owner}
   defp option_key("descriptor"), do: {:ok, :descriptor}
+  defp option_key("package"), do: {:ok, :package}
   defp option_key(option), do: {:error, "unknown option --#{option}"}
 
   defp require_options(options, keys) do
