@@ -13,6 +13,7 @@ defmodule MixWorkspaceOps.CLI do
     View
   }
 
+  alias MixWorkspaceOps.Registry.ReleaseChain
   alias MixWorkspaceOps.Release.{Descriptor, LocalAdapter, Transaction}
 
   @spec main([String.t()]) :: no_return()
@@ -55,11 +56,32 @@ defmodule MixWorkspaceOps.CLI do
          {:ok, registry} <- Registry.load(options.registry) do
       {:ok,
        %{
-         schema: Registry.schema(),
+         schema: registry.schema,
          digest: registry.digest,
          repositories: map_size(registry.repositories),
          projects: map_size(registry.projects),
-         applications: map_size(registry.applications)
+         applications: map_size(registry.applications),
+         multiply_provided_applications: multiply_provided(registry),
+         groups: length(Registry.groups(registry)),
+         languages: languages(registry),
+         release_packages: length(ReleaseChain.packages(registry))
+       }}
+    end
+  end
+
+  defp dispatch(["registry", "chain" | args]) do
+    with {:ok, options, []} <- registry_options(args, package: nil),
+         :ok <- require_option(options, :registry),
+         {:ok, registry} <- Registry.load(options.registry),
+         {:ok, chain} <- ReleaseChain.derive(registry),
+         {:ok, order} <- ReleaseChain.order(registry, options.package) do
+      {:ok,
+       %{
+         schema: "mix_workspace_ops.release_chain/v1",
+         registry_digest: registry.digest,
+         package: options.package,
+         order: order,
+         prerequisites: chain
        }}
     end
   end
@@ -279,6 +301,19 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   defp option_name(key), do: key |> to_string() |> String.replace("_", "-")
+
+  defp multiply_provided(registry) do
+    Enum.count(registry.applications, fn {_app, projects} -> length(projects) > 1 end)
+  end
+
+  defp languages(registry) do
+    registry.repositories
+    |> Map.values()
+    |> Enum.flat_map(& &1.languages)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
   defp require_command([]), do: {:usage_error, "empty command"}
   defp require_command(_command), do: :ok
 
@@ -326,6 +361,7 @@ defmodule MixWorkspaceOps.CLI do
       version
       registry validate --registry PATH
       registry select --registry PATH --view PATH
+      registry chain --registry PATH [--package APP]
       registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
       inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
       doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
