@@ -32,7 +32,7 @@ defmodule MixWorkspaceOps.Discovery do
            repositories: Enum.sort_by(repositories, & &1["id"])
          },
          snapshot: %{
-           schema: "elixir_ecosystem_registry.snapshot/v1",
+           schema: "portfolio_registry.snapshot/v1",
            observed_on: "2026-08-11",
            github_owner: github_owner,
            repositories: length(repositories),

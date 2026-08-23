@@ -10,7 +10,7 @@ multi-project runner:
 - the runner owns its child dependency, build, and Hex state;
 - ordinary process inheritance carries the MWO bootstrap and source overlay to
   child Mix commands;
-- the runner neither reads EER nor parses an overlay.
+- the runner neither reads the portfolio registry nor parses an overlay.
 
 The integration suite creates disposable standalone, umbrella, poncho, and
 delegated-runner repositories around this example. No named client repository

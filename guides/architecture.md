@@ -3,19 +3,20 @@
 ## Zero-by-default repository contract
 
 The ordinary repository does not depend on Mix Workspace Ops and never reads a
-registry. EER is supplied to the operator tool, while the repository's existing
-`mix.exs` remains the compatibility authority.
+registry. The portfolio registry is supplied to the operator tool, while the
+repository's existing `mix.exs` remains the compatibility authority.
 
 A project with no locally switchable cross-repository dependency requires no
 MWO file or code. A project that does have one requires only the small Mix-load
 dependency seam, because Mix evaluates dependency tuples before an external
 task can alter them. Repository-local MWO configuration is absent by default;
 an exceptional repository may have at most one declarative, schema-validated
-manifest when its behavior cannot be derived from Mix metadata and EER.
+manifest when its behavior cannot be derived from Mix metadata and the
+portfolio registry.
 
 Workspace runners, release projectors, acceptance harnesses, and provisioning
-systems consume stable launch or receipt contracts later. They do not parse EER
-or incorporate MWO's implementation.
+systems consume stable launch or receipt contracts later. They do not parse the
+portfolio registry or incorporate MWO's implementation.
 
 Mix evaluates dependencies while loading `mix.exs`, before an external Mix task
 can inject a workspace-wide source policy. Mix Workspace Ops addresses that
@@ -51,7 +52,7 @@ digest excludes those paths, raw registry formatting, and target-repository
 source dirt. It includes resolved identities/graph, source mode,
 same-repository source identities, external revisions/content, lock state, and
 the toolchain. A cache-aware delegated runner consumes that digest as one opaque
-cache component without parsing an overlay or EER.
+cache component without parsing an overlay or the portfolio registry.
 
 Managed activation allocates content-addressed operator state for dependencies,
 builds, Hex data, and an overlay-specific lockfile. Delegated activation omits
