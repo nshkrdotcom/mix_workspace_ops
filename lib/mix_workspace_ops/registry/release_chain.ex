@@ -40,12 +40,8 @@ defmodule MixWorkspaceOps.Registry.ReleaseChain do
   def derive(%Registry{} = registry) do
     train = MapSet.new(packages(registry))
 
-    with {:ok, providers} <- providers(registry, train) do
-      chain =
-        Map.new(providers, fn {package, project} ->
-          {package, prerequisites(registry, package, project, train)}
-        end)
-
+    with {:ok, providers} <- providers(registry, train),
+         {:ok, chain} <- chain(registry, providers, train) do
       case cycles(chain) do
         [] -> {:ok, chain}
         found -> {:error, {:release_chain_cycle, found}}
@@ -65,6 +61,17 @@ defmodule MixWorkspaceOps.Registry.ReleaseChain do
     end
   end
 
+  defp chain(registry, providers, train) do
+    providers
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.reduce_while({:ok, %{}}, fn {package, project}, {:ok, acc} ->
+      case prerequisites(registry, package, project, train) do
+        {:ok, required} -> {:cont, {:ok, Map.put(acc, package, required)}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
   defp providers(registry, train) do
     train
     |> Enum.sort()
@@ -79,10 +86,12 @@ defmodule MixWorkspaceOps.Registry.ReleaseChain do
   defp prerequisites(registry, package, project, train) do
     repository = Registry.repository!(registry, project.repository)
 
-    (derived(registry, package, project, repository, train) ++
-       Map.get(repository.release_chain, package, []))
-    |> Enum.uniq()
-    |> Enum.sort()
+    with {:ok, derived} <- derived(registry, package, project, repository, train) do
+      {:ok,
+       (derived ++ Map.get(repository.release_chain, package, []))
+       |> Enum.uniq()
+       |> Enum.sort()}
+    end
   end
 
   defp derived(registry, package, project, repository, train) do
@@ -92,18 +101,31 @@ defmodule MixWorkspaceOps.Registry.ReleaseChain do
         else: {project.dependency_sources, false}
 
     table
-    |> Map.keys()
-    |> Enum.filter(&MapSet.member?(train, &1))
-    |> Enum.reject(&(&1 == package))
-    |> Enum.filter(&visible?(registry, &1, project.repository, cross_repository_only?))
+    |> Enum.filter(fn {app, _declaration} ->
+      MapSet.member?(train, app) and app != package
+    end)
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.reduce_while({:ok, []}, fn {app, declaration}, {:ok, acc} ->
+      case visible?(registry, app, declaration, project.repository, cross_repository_only?) do
+        {:ok, true} -> {:cont, {:ok, [app | acc]}}
+        {:ok, false} -> {:cont, {:ok, acc}}
+        {:error, reason} -> {:halt, {:error, {:release_prerequisite, package, app, reason}}}
+      end
+    end)
   end
 
-  defp visible?(_registry, _app, _repository_id, false), do: true
+  defp visible?(_registry, _app, _declaration, _repository_id, false), do: {:ok, true}
 
-  defp visible?(registry, app, repository_id, true) do
-    case Registry.provider_for(registry, app) do
-      {:ok, provider} -> provider.repository != repository_id
-      {:error, _reason} -> false
+  # A repository-scoped table cannot attribute an entry to one of its own
+  # projects, so an entry provided from inside the repository is not an edge.
+  # The declaration's own provider selection answers the question where several
+  # projects provide the application; an unresolved provider is an error, never
+  # a dropped edge.
+  defp visible?(registry, app, declaration, repository_id, true) do
+    case Registry.resolve_dependency(registry, app, declaration.provider) do
+      {:ok, provider} -> {:ok, provider.repository != repository_id}
+      {:error, reason} -> {:error, reason}
+      :unknown -> {:error, {:unprovided_application, app}}
     end
   end
 

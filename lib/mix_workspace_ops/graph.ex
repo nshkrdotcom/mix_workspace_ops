@@ -7,6 +7,7 @@ defmodule MixWorkspaceOps.Graph do
           projects: [Registry.project()],
           edges: [{String.t(), String.t()}],
           external_dependencies: [{String.t(), String.t()}],
+          known_unselected: [{String.t(), String.t(), [String.t()]}],
           digest: String.t()
         }
 
@@ -16,19 +17,29 @@ defmodule MixWorkspaceOps.Graph do
     target = to_string(target)
     reader = Keyword.get(opts, :dependency_reader, &Project.dependencies(registry, &1))
     seeds = seed_projects(registry, target)
-    state = %{visiting: MapSet.new(), visited: MapSet.new(), ordered: [], edges: [], external: []}
+
+    state = %{
+      visiting: MapSet.new(),
+      visited: MapSet.new(),
+      ordered: [],
+      edges: [],
+      external: [],
+      known_unselected: []
+    }
 
     with {:ok, final} <- visit_seeds(registry, seeds, reader, state) do
       projects = Enum.reverse(final.ordered)
       edges = final.edges |> Enum.uniq() |> Enum.sort()
       external = final.external |> Enum.uniq() |> Enum.sort()
+      known_unselected = final.known_unselected |> Enum.uniq() |> Enum.sort()
 
       {:ok,
        %{
          projects: projects,
          edges: edges,
          external_dependencies: external,
-         digest: digest(projects, edges, external)
+         known_unselected: known_unselected,
+         digest: digest(projects, edges, external, known_unselected)
        }}
     end
   rescue
@@ -88,17 +99,26 @@ defmodule MixWorkspaceOps.Graph do
     end)
   end
 
+  # A dependency resolves through the declaring project's own dependency-source
+  # table, so a declared `provider` selects among several catalogued providers
+  # instead of the closure refusing an ambiguity the catalog already answered.
   defp reduce_dependency(registry, project, dependency_app, reader, current) do
-    case Registry.project_for_app(registry, dependency_app) do
+    provider = Registry.declared_provider(registry, project, dependency_app)
+
+    case Registry.resolve_dependency(registry, dependency_app, provider) do
       {:ok, dependency} ->
         reduce_managed_dependency(registry, project, dependency, reader, current)
 
-      {:ambiguous, candidates} ->
-        {:halt,
-         {:error,
-          {:ambiguous_application, dependency_app, Enum.map(candidates, & &1.id), project.id}}}
+      {:known_unselected, candidates} ->
+        reduce_known_unselected(project, dependency_app, candidates, current)
 
-      :error ->
+      {:error, {:ambiguous_application, app, candidates}} ->
+        {:halt, {:error, {:ambiguous_application, app, candidates, project.id}}}
+
+      {:error, reason} ->
+        {:halt, {:error, {:dependency_provider, project.id, reason}}}
+
+      :unknown ->
         reduce_external_dependency(project, dependency_app, current)
     end
   end
@@ -117,11 +137,24 @@ defmodule MixWorkspaceOps.Graph do
     {:cont, {:ok, next}}
   end
 
-  defp digest(projects, edges, external) do
+  # The catalog provides this application and the selection excludes it. It is
+  # reported under its own classification and never joins the external packages,
+  # which is what makes a known internal dependency impossible to mistake for a
+  # Hex package.
+  defp reduce_known_unselected(project, dependency_app, candidates, current) do
+    entry = {project.id, dependency_app, candidates}
+    {:cont, {:ok, %{current | known_unselected: [entry | current.known_unselected]}}}
+  end
+
+  defp digest(projects, edges, external, known_unselected) do
     :json.encode(%{
       projects: Enum.map(projects, & &1.id),
       edges: Enum.map(edges, &Tuple.to_list/1),
-      external_dependencies: Enum.map(external, &Tuple.to_list/1)
+      external_dependencies: Enum.map(external, &Tuple.to_list/1),
+      known_unselected:
+        Enum.map(known_unselected, fn {consumer, app, candidates} ->
+          [consumer, app, candidates]
+        end)
     })
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.encode16(case: :lower)

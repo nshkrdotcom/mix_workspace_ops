@@ -19,7 +19,16 @@ defmodule MixWorkspaceOps.Registry do
   alias MixWorkspaceOps.StrictJSON
 
   @enforce_keys [:path, :digest, :schema, :repositories, :projects, :applications]
-  defstruct [:path, :digest, :schema, :repositories, :projects, :applications, bindings: %{}]
+  defstruct [
+    :path,
+    :digest,
+    :schema,
+    :repositories,
+    :projects,
+    :applications,
+    bindings: %{},
+    unselected_applications: %{}
+  ]
 
   @type project :: %{
           id: String.t(),
@@ -53,7 +62,8 @@ defmodule MixWorkspaceOps.Registry do
           repositories: %{String.t() => repository()},
           projects: %{String.t() => project()},
           applications: %{String.t() => [project()]},
-          bindings: %{String.t() => String.t()}
+          bindings: %{String.t() => String.t()},
+          unselected_applications: %{String.t() => [String.t()]}
         }
 
   @doc "The schema identifier this version writes."
@@ -136,6 +146,44 @@ defmodule MixWorkspaceOps.Registry do
     Contract.resolve_provider(applications, to_string(app), provider)
   end
 
+  @doc """
+  Resolves the project a dependency declaration names.
+
+  `provider` is the declaration's explicit provider selection, or `nil`. The
+  result distinguishes four outcomes a caller must not conflate:
+
+    * `{:ok, project}` — one selected project provides the application.
+    * `{:known_unselected, project_ids}` — the catalog provides the application
+      but the current selection excludes every provider. The dependency is
+      catalogued, so it is never an ordinary external package.
+    * `{:error, reason}` — several providers and no usable selection, or a
+      provider naming a project that does not provide the application.
+    * `:unknown` — no catalogued project provides it, so it is external.
+  """
+  @spec resolve_dependency(t(), String.t() | atom(), String.t() | nil) ::
+          {:ok, project()} | {:known_unselected, [String.t()]} | {:error, term()} | :unknown
+  def resolve_dependency(%__MODULE__{} = registry, app, provider \\ nil) do
+    app = to_string(app)
+
+    case Map.get(registry.applications, app, []) do
+      [] -> unselected_providers(registry, app)
+      _candidates -> Contract.resolve_provider(registry.applications, app, provider)
+    end
+  end
+
+  @doc """
+  The provider selection a project's dependency-source table declares for `app`.
+
+  Returns `nil` where the table carries no entry, which is the ordinary case.
+  """
+  @spec declared_provider(t(), project() | String.t(), String.t() | atom()) :: String.t() | nil
+  def declared_provider(registry, project, app) do
+    case Map.fetch(dependency_sources(registry, project), to_string(app)) do
+      {:ok, declaration} -> declaration.provider
+      :error -> nil
+    end
+  end
+
   @doc "Every project providing `app`, sorted by project id."
   @spec providers(t(), String.t() | atom()) :: [project()]
   def providers(%__MODULE__{applications: applications}, app) do
@@ -196,13 +244,34 @@ defmodule MixWorkspaceOps.Registry do
       |> Enum.reject(&(&1.projects == []))
       |> Map.new(&{&1.id, &1})
 
+    applications = Contract.index_applications(Map.values(repositories))
+
     %{
       registry
       | repositories: repositories,
         projects: Map.new(selected_projects, &{&1.id, &1}),
-        applications: Contract.index_applications(Map.values(repositories)),
-        bindings: Map.take(registry.bindings, Map.keys(repositories))
+        applications: applications,
+        bindings: Map.take(registry.bindings, Map.keys(repositories)),
+        unselected_applications: unselected(registry, applications)
     }
+  end
+
+  # Restriction narrows the applications index, so a catalogued application
+  # outside the selection would otherwise be indistinguishable from a Hex
+  # package. The identities it drops are recorded here so resolution can report
+  # them as catalogued-but-unselected instead of external.
+  defp unselected(registry, applications) do
+    registry.applications
+    |> Enum.reject(fn {app, _projects} -> Map.has_key?(applications, app) end)
+    |> Map.new(fn {app, projects} -> {app, Enum.map(projects, & &1.id)} end)
+    |> then(&Map.merge(registry.unselected_applications, &1))
+  end
+
+  defp unselected_providers(registry, app) do
+    case Map.fetch(registry.unselected_applications, app) do
+      {:ok, project_ids} -> {:known_unselected, project_ids}
+      :error -> :unknown
+    end
   end
 
   @spec repository_root(t(), repository() | String.t()) :: String.t()

@@ -29,7 +29,8 @@ defmodule MixWorkspaceOps.Overlay do
     state_root = Keyword.get_lazy(opts, :state_root, &default_state_root/0)
 
     with {:ok, resolution} <- Graph.resolve(registry, target),
-         {:ok, rows} <- source_rows(registry, resolution.projects, mode),
+         {:ok, attributed} <- source_rows(registry, resolution.projects, mode),
+         rows <- Enum.map(attributed, &elem(&1, 1)),
          target_project <- Registry.project!(registry, target),
          target_root <- Registry.project_root(registry, target_project),
          {:ok, lock_bytes} <- source_lock(target_root),
@@ -39,7 +40,7 @@ defmodule MixWorkspaceOps.Overlay do
              to_string(target),
              mode,
              resolution,
-             rows,
+             attributed,
              target_project,
              lock_bytes
            ),
@@ -85,6 +86,7 @@ defmodule MixWorkspaceOps.Overlay do
            projects: Enum.map(resolution.projects, & &1.id),
            edges: resolution.edges,
            external_dependencies: resolution.external_dependencies,
+           known_unselected: resolution.known_unselected,
            rows: rows
          }
        }}
@@ -129,7 +131,7 @@ defmodule MixWorkspaceOps.Overlay do
       path = Registry.project_root(registry, project)
 
       if File.regular?(Path.join(path, "mix.exs")) do
-        {:ok, [project.app, "path", path, Git.head!(path), Git.source_digest(path)]}
+        {:ok, {project, [project.app, "path", path, Git.head!(path), Git.source_digest(path)]}}
       else
         {:error, {:missing_mix_project, project.id, path}}
       end
@@ -144,7 +146,7 @@ defmodule MixWorkspaceOps.Overlay do
       repository = Registry.repository!(registry, project.repository)
       root = Registry.repository_root(registry, repository.id)
       url = "https://github.com/#{repository.github}.git"
-      {:ok, [project.app, "git", url, Git.head!(root), project.path]}
+      {:ok, {project, [project.app, "git", url, Git.head!(root), project.path]}}
     end)
     |> collect_rows()
   end
@@ -196,7 +198,7 @@ defmodule MixWorkspaceOps.Overlay do
          target,
          mode,
          resolution,
-         rows,
+         attributed,
          target_project,
          lock_bytes
        ) do
@@ -214,8 +216,7 @@ defmodule MixWorkspaceOps.Overlay do
     ]
 
     sources =
-      Enum.map(rows, fn [app | _rest] = row ->
-        {:ok, project} = Registry.project_for_app(registry, app)
+      Enum.map(attributed, fn {project, row} ->
         semantic_source(registry, project, row, target_project.repository)
       end)
 

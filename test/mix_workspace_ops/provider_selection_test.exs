@@ -1,15 +1,15 @@
 defmodule MixWorkspaceOps.ProviderSelectionTest do
   use MixWorkspaceOps.WorkspaceCase, async: true
 
-  alias MixWorkspaceOps.{Graph, Registry}
+  alias MixWorkspaceOps.{Graph, Registry, View}
 
   defp two_providers(root, opts \\ []) do
+    declaration = Keyword.get(opts, :declaration, %{"hex" => "~> 0.1.0"})
+
     write_catalog!(root, [
       catalog_repository("alpha",
         projects: [catalog_project("alpha")],
-        dependency_sources: %{
-          "shared" => Keyword.get(opts, :declaration, %{"hex" => "~> 0.1.0"})
-        }
+        dependency_sources: if(is_nil(declaration), do: nil, else: %{"shared" => declaration})
       ),
       catalog_repository("upstream",
         projects: [catalog_project("upstream.shared", app: "shared")]
@@ -45,24 +45,6 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
             {:dependency_source, "alpha",
              {:ambiguous_application, "shared", ["upstream.shared", "vendored.shared"]}}} =
              Registry.load(two_providers(root))
-  end
-
-  test "an explicit provider resolves the ambiguity", context do
-    root = temporary_directory!(context)
-
-    registry =
-      root
-      |> two_providers(declaration: %{"hex" => "~> 0.1.0", "provider" => "vendored.shared"})
-      |> Registry.load!()
-
-    assert {:ok, project} =
-             Registry.provider_for(
-               registry,
-               "shared",
-               Registry.dependency_sources(registry, "alpha")["shared"].provider
-             )
-
-    assert project.id == "vendored.shared"
   end
 
   test "an unknown provider is refused and names the candidates", context do
@@ -119,24 +101,78 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
     assert {:error, {:application_not_provided, "alpha", ["other"]}} = Registry.load(path)
   end
 
-  test "the closure refuses an ambiguous dependency instead of taking the first match", context do
+  test "the closure resolves the provider the declaration names", context do
     root = temporary_directory!(context)
+
+    registry =
+      bound_two_providers(context, root, %{"hex" => "~> 0.1.0", "provider" => "vendored.shared"})
+
+    assert {:ok, resolution} =
+             Graph.resolve(registry, "alpha", dependency_reader: shared_reader())
+
+    assert Enum.map(resolution.projects, & &1.id) == ["vendored.shared", "alpha"]
+    assert resolution.edges == [{"alpha", "vendored.shared"}]
+    assert resolution.external_dependencies == []
+    assert resolution.known_unselected == []
+  end
+
+  test "a declaration naming no provider leaves the closure ambiguous", context do
+    root = temporary_directory!(context)
+    registry = bound_two_providers(context, root, nil)
+
+    assert {:error, {:ambiguous_application, "shared", candidates, "alpha"}} =
+             Graph.resolve(registry, "alpha", dependency_reader: shared_reader())
+
+    assert candidates == ["upstream.shared", "vendored.shared"]
+  end
+
+  test "a catalogued provider outside the selection is not an external package", context do
+    root = temporary_directory!(context)
+
+    registry =
+      bound_two_providers(context, root, %{"hex" => "~> 0.1.0", "provider" => "vendored.shared"})
+
+    view = write_catalog_view!(root, "consumer", %{"repository_ids" => ["alpha"]})
+    {:ok, view} = View.load(view)
+    {:ok, projects} = View.select(registry, view)
+    selected = Registry.restrict(registry, projects)
+
+    assert {:ok, resolution} =
+             Graph.resolve(selected, "alpha", dependency_reader: shared_reader())
+
+    assert resolution.external_dependencies == []
+
+    assert resolution.known_unselected == [
+             {"alpha", "shared", ["upstream.shared", "vendored.shared"]}
+           ]
+  end
+
+  test "an uncatalogued dependency is still an external package", context do
+    root = temporary_directory!(context)
+
+    registry =
+      bound_two_providers(context, root, %{"hex" => "~> 0.1.0", "provider" => "vendored.shared"})
+
+    reader = fn project -> {:ok, if(project.id == "alpha", do: ["telemetry"], else: [])} end
+
+    assert {:ok, resolution} = Graph.resolve(registry, "alpha", dependency_reader: reader)
+    assert resolution.external_dependencies == [{"alpha", "telemetry"}]
+    assert resolution.known_unselected == []
+  end
+
+  defp bound_two_providers(_context, root, declaration) do
     initialize_repository!(Path.join(root, "alpha"))
     initialize_repository!(Path.join(root, "upstream"))
     initialize_repository!(Path.join(root, "vendored"))
 
-    registry =
-      root
-      |> two_providers(declaration: %{"hex" => "~> 0.1.0", "provider" => "upstream.shared"})
-      |> Registry.load!()
-      |> bind!(root)
+    root
+    |> two_providers(declaration: declaration)
+    |> Registry.load!()
+    |> bind!(root)
+  end
 
-    reader = fn project -> {:ok, if(project.id == "alpha", do: ["shared"], else: [])} end
-
-    assert {:error, {:ambiguous_application, "shared", candidates, "alpha"}} =
-             Graph.resolve(registry, "alpha", dependency_reader: reader)
-
-    assert candidates == ["upstream.shared", "vendored.shared"]
+  defp shared_reader do
+    fn project -> {:ok, if(project.id == "alpha", do: ["shared"], else: [])} end
   end
 
   test "a v1 document keeps its global application uniqueness rule", context do

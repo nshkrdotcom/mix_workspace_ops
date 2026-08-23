@@ -148,7 +148,8 @@ defmodule MixWorkspaceOps.CLI do
          graph_digest: resolution.digest,
          projects: Enum.map(resolution.projects, & &1.id),
          edges: resolution.edges,
-         external_dependencies: resolution.external_dependencies
+         external_dependencies: resolution.external_dependencies,
+         known_unselected: known_unselected(resolution)
        }}
     end
   end
@@ -302,6 +303,12 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   defp option_name(key), do: key |> to_string() |> String.replace("_", "-")
+
+  defp known_unselected(resolution) do
+    Enum.map(resolution.known_unselected, fn {consumer, application, candidates} ->
+      %{consumer: consumer, application: application, candidates: candidates}
+    end)
+  end
 
   defp multiply_provided(registry) do
     Enum.count(registry.applications, fn {_app, projects} -> length(projects) > 1 end)
