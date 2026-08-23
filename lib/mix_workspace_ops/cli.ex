@@ -69,13 +69,16 @@ defmodule MixWorkspaceOps.CLI do
          :ok <- require_options(options, [:registry, :view]),
          {:ok, registry} <- Registry.load(options.registry),
          {:ok, view} <- View.load(options.view),
+         {:ok, repositories} <- View.select_repositories(registry, view),
          {:ok, projects} <- View.select(registry, view) do
       {:ok,
        %{
-         schema: "mix_workspace_ops.selection/v1",
+         schema: "mix_workspace_ops.selection/v2",
          registry_digest: registry.digest,
          view: view.id,
+         view_schema: view.schema,
          view_digest: view.digest,
+         repositories: Enum.map(repositories, & &1.id),
          projects: Enum.map(projects, & &1.id)
        }}
     end
