@@ -22,6 +22,20 @@ defmodule MixWorkspaceOps.Git do
   @spec head!(String.t()) :: String.t()
   def head!(repo), do: output!(repo, ["rev-parse", "HEAD"])
 
+  @doc """
+  The revision `repo` is at, or why it could not be read.
+
+  A caller pinning a coordinate to a checkout has something else to do when the
+  checkout cannot answer, so it asks rather than being raised at.
+  """
+  @spec head(String.t()) :: {:ok, String.t()} | {:error, term()}
+  def head(repo) do
+    case Command.run("git", ["rev-parse", "HEAD"], cd: repo) do
+      {:ok, result} -> {:ok, String.trim(result.output)}
+      {:error, result} -> {:error, {:git_head, result.output}}
+    end
+  end
+
   @spec upstream_head!(String.t()) :: String.t()
   def upstream_head!(repo), do: output!(repo, ["rev-parse", "@{u}"])
 

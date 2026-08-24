@@ -88,12 +88,18 @@ defmodule MixWorkspaceOps.Resolution do
   disagreement is visible rather than silently resolved.
   """
 
-  alias MixWorkspaceOps.{Graph, LocalOverrides, Project, Registry}
+  alias MixWorkspaceOps.{Git, Graph, LocalOverrides, Project, Registry}
   alias MixWorkspaceOps.Registry.Source
 
   @local "local"
   @github "github"
   @hex "hex"
+
+  # The two gestures in which an operator names a source outright for a whole
+  # run or for one dependency. Both override the declaration's intent, which is
+  # what makes falling back to catalogued identity right for them and wrong for
+  # an order walk.
+  @explicit_gestures [:run_mode, :dependency_override]
 
   # The Mix option keys the catalog carries, converted through a fixed table so
   # no catalog content can name an option key that does not already exist.
@@ -532,8 +538,8 @@ defmodule MixWorkspaceOps.Resolution do
     end
   end
 
-  defp build(_registry, app, declaration, @github, reason, considered, opts) do
-    case github(declaration, override(opts, app)) do
+  defp build(registry, app, declaration, @github, reason, considered, opts) do
+    case github(registry, app, declaration, reason, override(opts, app)) do
       %{repo: repo} = coordinates when is_binary(repo) ->
         {:ok, decision(app, @github, reason, considered, nil, coordinates, declaration)}
 
@@ -557,9 +563,62 @@ defmodule MixWorkspaceOps.Resolution do
   # The override merges into the declaration's coordinates rather than
   # replacing them, so an operator can move one branch without restating the
   # repository.
-  defp github(declaration, override) do
-    base = declaration.github || %{repo: nil, branch: nil, ref: nil, tag: nil, subdir: nil}
+  #
+  # Where the declaration carries no GitHub block at all, an explicit request
+  # falls back to the catalogued provider's own repository identity, which the
+  # catalog has held the whole time. An order walk does not: an order states the
+  # declaration's intent, and making `github` universally available there would
+  # change how a declaration that names no GitHub coordinates resolves in
+  # ordinary development. An explicit gesture is the operator overriding that
+  # intent, which is a different thing.
+  defp github(registry, app, declaration, reason, override) do
+    base =
+      cond do
+        not is_nil(declaration.github) -> declaration.github
+        reason in @explicit_gestures -> catalogued_coordinates(registry, app, declaration)
+        true -> nil
+      end
 
+    merge_github(base || %{repo: nil, branch: nil, ref: nil, tag: nil, subdir: nil}, override)
+  end
+
+  defp catalogued_coordinates(registry, app, declaration) do
+    with {:ok, project} <- provider(registry, app, declaration),
+         repository = Registry.repository!(registry, project.repository),
+         true <- is_binary(repository.github) do
+      pin(
+        %{
+          repo: repository.github,
+          branch: nil,
+          ref: nil,
+          tag: nil,
+          subdir: subdirectory(project.path)
+        },
+        registry,
+        repository
+      )
+    else
+      _uncatalogued -> nil
+    end
+  end
+
+  # An explicit `--mode git` run has to be reproducible, so the coordinate is
+  # pinned to the revision the operator's checkout is at. Where there is no
+  # checkout to read there is nothing to pin to, and the repository's own
+  # default branch is what remains.
+  defp pin(coordinates, registry, repository) do
+    with {:bound, root} <- Registry.checkout(registry, repository.id),
+         {:ok, revision} <- Git.head(root) do
+      %{coordinates | ref: revision}
+    else
+      _unpinnable -> %{coordinates | branch: repository.default_branch}
+    end
+  end
+
+  defp subdirectory("."), do: nil
+  defp subdirectory(path), do: path
+
+  defp merge_github(base, override) do
     Enum.reduce(override.github, base, fn {key, value}, acc ->
       case key do
         "repo" -> %{acc | repo: value}

@@ -632,14 +632,72 @@ defmodule MixWorkspaceOps.ResolutionTest do
       declaration = %{"hex" => "~> 1.0"}
       registry = registry(root, declaration)
 
-      assert {:error, {:unavailable_source, "core", "github", :run_mode}} =
-               decide(registry, root, "core", declaration, mode: "github")
-
       assert {:error, {:unavailable_source, "core", "local", :dependency_override}} =
                decide(registry, root, "core", declaration,
                  sources: %{"core" => "local"},
                  overrides: %{"core" => %{LocalOverrides.empty() | path: ["/nowhere/at/all"]}}
                )
+    end
+
+    # An explicit request is the operator overriding the declaration's intent,
+    # and the catalog has held the provider's repository identity the whole
+    # time. Refusing a declaration that carries no GitHub block made 82 of the
+    # live catalog's 558 declarations unable to serve `--mode git` at all.
+    test "an explicit git request falls back to the catalogued repository identity", context do
+      root = temporary_directory!(context)
+      core = initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+      declaration = %{"hex" => "~> 1.0"}
+      registry = registry(root, declaration)
+      head = MixWorkspaceOps.Git.head!(core)
+
+      for opts <- [[mode: "github"], [sources: %{"core" => "github"}]] do
+        assert {:ok, decision} = decide(registry, root, "core", declaration, opts)
+        assert decision.source == "github"
+
+        assert decision.location == %{
+                 repo: "example-org/core",
+                 branch: nil,
+                 ref: head,
+                 tag: nil,
+                 subdir: nil
+               }
+      end
+    end
+
+    test "an explicit git request for an absent checkout pins the default branch", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+      declaration = %{"hex" => "~> 1.0"}
+      registry = registry(root, declaration)
+      File.rm_rf!(Path.join(root, "core"))
+      registry = bind!(registry, root)
+
+      assert {:ok, decision} = decide(registry, root, "core", declaration, mode: "github")
+      assert decision.location.branch == "main"
+      assert decision.location.ref == nil
+    end
+
+    # An order states the declaration's intent. Falling back there would change
+    # how every declaration with no GitHub block resolves in development.
+    test "the order walk does not fall back to the catalogued identity", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+      declaration = %{"hex" => "~> 1.0"}
+      registry = registry(root, declaration)
+      File.rm_rf!(Path.join(root, "core"))
+      registry = bind!(registry, root)
+
+      assert {:ok, decision} = decide(registry, root, "core", declaration)
+      assert decision.source == "hex"
+
+      assert decision.considered == [
+               %{source: "local", outcome: :absent_checkout},
+               %{source: "github", outcome: :no_github_coordinates},
+               %{source: "hex", outcome: :chosen}
+             ]
     end
 
     test "resolve reads the override file from the consuming repository root", context do

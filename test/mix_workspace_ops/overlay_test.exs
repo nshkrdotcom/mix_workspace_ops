@@ -145,8 +145,15 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {:error, {:unavailable_run_mode, "hex", ["core"]}} =
              Overlay.activate(registry, "consumer", mode: :hex, state_root: state_root)
 
-    assert {:error, {:unavailable_run_mode, "github", ["core"]}} =
+    # `git` is the one mode that always has an answer: the catalog knows the
+    # provider's repository, and an explicit request falls back to it.
+    assert {:ok, activation} =
              Overlay.activate(registry, "consumer", mode: :git, state_root: state_root)
+
+    assert {:ok, overlay} = Overlay.read(activation.path)
+    assert overlay.sources["core"].kind == :github
+    assert overlay.sources["core"].repo == "example-org/core"
+    assert overlay.sources["core"].revision_kind == "ref"
   end
 
   test "a per-dependency source overrides the run mode", context do
