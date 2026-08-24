@@ -242,6 +242,7 @@ defmodule MixWorkspaceOpsBootstrap do
   defp parse_overlay!(path) do
     case path |> File.read!() |> String.split("\n", trim: true) do
       [@schema_header, "registry_digest\t" <> _registry_digest,
+       "selection_digest\t" <> _selection_digest,
        "graph_digest\t" <> _graph_digest, "context_digest\t" <> _context_digest,
        "target\t" <> _target, "mode\t" <> mode, "publish\t" <> publish,
        "target_head\t" <> _target_head,

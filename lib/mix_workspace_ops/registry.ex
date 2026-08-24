@@ -510,8 +510,16 @@ defmodule MixWorkspaceOps.Registry do
     end
   end
 
-  defp selection_digest(%__MODULE__{selection: nil}), do: nil
-  defp selection_digest(%__MODULE__{selection: selection}), do: selection.digest
+  @doc """
+  The digest of the current selection, or `nil` where nothing narrowed the
+  catalog.
+
+  Two views over one catalog decide different things, so an artifact that
+  attests to what was decided has to name the view as well as the document.
+  """
+  @spec selection_digest(t()) :: String.t() | nil
+  def selection_digest(%__MODULE__{selection: nil}), do: nil
+  def selection_digest(%__MODULE__{selection: selection}), do: selection.digest
 
   defp selection_digest(repository_ids, project_ids) do
     :json.encode(%{repositories: repository_ids, projects: project_ids})

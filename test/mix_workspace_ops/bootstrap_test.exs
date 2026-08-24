@@ -342,6 +342,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
         [
           "mix_workspace_ops.overlay/v2",
           "registry_digest\tdigest",
+          "selection_digest\t#{Keyword.get(opts, :selection_digest, "-")}",
           "graph_digest\tgraph",
           "context_digest\tcontext",
           "target\texample_consumer",

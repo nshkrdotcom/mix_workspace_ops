@@ -135,6 +135,36 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert hex_overlay.sources["core"] == %{kind: :hex, requirement: "~> 1.0", opts: []}
   end
 
+  # The overlay is content-addressed, so what it attests to has to name the view
+  # it was decided under. Two views over one catalog decide different rows, and
+  # an overlay that recorded only the document digest gave them one identity.
+  test "an overlay attests to the selection it was decided under", context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    initialize_repository!(Path.join(root, "core"))
+    initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
+    initialize_repository!(Path.join(root, "spare"))
+    registry = registry(root, spare: true)
+
+    assert {:ok, whole} = Overlay.activate(registry, "consumer", state_root: state_root)
+    assert {:ok, unselected} = Overlay.read(whole.path)
+    assert unselected.selection_digest == nil
+    assert whole.report.selection_digest == nil
+
+    narrowed =
+      Registry.select(registry, Enum.map(~w(core consumer), &Registry.project!(registry, &1)))
+
+    assert {:ok, viewed} = Overlay.activate(narrowed, "consumer", state_root: state_root)
+    assert {:ok, selected} = Overlay.read(viewed.path)
+    assert selected.selection_digest == Registry.selection_digest(narrowed)
+    assert viewed.report.selection_digest == selected.selection_digest
+
+    # Same catalog, same rows, different view: two identities, not one.
+    assert Map.keys(unselected.sources) == Map.keys(selected.sources)
+    refute whole.path == viewed.path
+    refute whole.report.context_digest == viewed.report.context_digest
+  end
+
   test "a mode naming a source the catalog cannot reach is a typed error", context do
     root = temporary_directory!(context)
     state_root = Path.join(root, "operator-state")
@@ -294,14 +324,21 @@ defmodule MixWorkspaceOps.OverlayTest do
         "hex" => "~> 1.0"
       })
 
+    spare =
+      if Keyword.get(opts, :spare, false),
+        do: [catalog_repository("spare", projects: [catalog_project("spare")])],
+        else: []
+
     root
-    |> write_catalog!([
-      catalog_repository("core", projects: [catalog_project("core")]),
-      catalog_repository("consumer",
-        projects: [catalog_project("consumer")],
-        dependency_sources: %{"core" => declaration}
-      )
-    ])
+    |> write_catalog!(
+      [
+        catalog_repository("core", projects: [catalog_project("core")]),
+        catalog_repository("consumer",
+          projects: [catalog_project("consumer")],
+          dependency_sources: %{"core" => declaration}
+        )
+      ] ++ spare
+    )
     |> Registry.load!()
     |> bind!(root)
   end

@@ -187,13 +187,17 @@ defmodule MixWorkspaceOps.CLI do
          {:ok, view} <- View.load(options.view),
          {:ok, repositories} <- View.select_repositories(registry, view),
          {:ok, projects} <- View.select(registry, view) do
+      selected = Registry.select(registry, projects)
+
       {:ok,
        %{
          schema: "mix_workspace_ops.selection/v2",
          registry_digest: registry.digest,
+         selection_digest: Registry.selection_digest(selected),
          view: view.id,
          view_schema: view.schema,
          view_digest: view.digest,
+         sets: Registry.sets(selected),
          repositories: Enum.map(repositories, & &1.id),
          projects: Enum.map(projects, & &1.id)
        }}
@@ -237,6 +241,7 @@ defmodule MixWorkspaceOps.CLI do
          schema: "mix_workspace_ops.plan/v2",
          target: options.project,
          registry_digest: registry.digest,
+         selection_digest: Registry.selection_digest(registry),
          graph_digest: resolution.digest,
          sets: Registry.sets(registry),
          mode: options.mode,
@@ -260,6 +265,7 @@ defmodule MixWorkspaceOps.CLI do
          schema: "mix_workspace_ops.sources/v1",
          target: options.project,
          registry_digest: registry.digest,
+         selection_digest: Registry.selection_digest(registry),
          sets: Registry.sets(registry),
          mode: options.mode,
          publish: decided.publish?,

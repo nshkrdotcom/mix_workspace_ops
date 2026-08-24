@@ -16,6 +16,11 @@ defmodule MixWorkspaceOps.Overlay do
       app \\t github \\t <owner/repo>     \\t <branch|ref|tag|-> \\t <value|-> \\t <subdir|-> \\t <opts>
       app \\t hex    \\t <requirement>    \\t <opts>
 
+  The header names both digests the rows were decided under. The document digest
+  says which catalog was read; the selection digest says which view of it was in
+  force. Two views over one catalog decide different rows, so an artifact
+  attesting only to the document would give two different overlays one identity.
+
   `<opts>` is `-` when there are none, and otherwise `key=value` pairs joined
   by `,`, keys in alphabetical order. A boolean value is `true` or `false`; the
   value of `only` or `targets` is its names joined by `|`. Keys convert through
@@ -114,6 +119,7 @@ defmodule MixWorkspaceOps.Overlay do
            mode: mode,
            publish: decided.publish?,
            registry_digest: registry.digest,
+           selection_digest: Registry.selection_digest(registry),
            graph_digest: resolution.digest,
            sets: Registry.sets(registry),
            overlay_digest: overlay_digest,
@@ -301,6 +307,7 @@ defmodule MixWorkspaceOps.Overlay do
     metadata = [
       @header,
       "registry_digest\t#{registry.digest}",
+      "selection_digest\t#{selection_digest(registry)}",
       "graph_digest\t#{resolution.digest}",
       "context_digest\t#{context_digest}",
       "target\t#{decided.target}",
@@ -322,6 +329,7 @@ defmodule MixWorkspaceOps.Overlay do
 
     metadata = [
       @context_header,
+      "selection_digest\t#{selection_digest(registry)}",
       "graph_digest\t#{decided.closure.digest}",
       "target\t#{decided.target}",
       "publish\t#{decided.publish?}",
@@ -393,6 +401,10 @@ defmodule MixWorkspaceOps.Overlay do
 
   defp join(parts), do: Enum.join(parts, "\t")
 
+  # A catalog read under no view has no selection to attest to, and `-` is what
+  # every other absent field in this format is written as.
+  defp selection_digest(registry), do: Registry.selection_digest(registry) || @absent
+
   defp reported_decision(decision) do
     %{
       application: decision.application,
@@ -444,6 +456,7 @@ defmodule MixWorkspaceOps.Overlay do
       [
         @header,
         "registry_digest\t" <> registry_digest,
+        "selection_digest\t" <> selection_digest,
         "graph_digest\t" <> graph_digest,
         "context_digest\t" <> context_digest,
         "target\t" <> target,
@@ -460,6 +473,7 @@ defmodule MixWorkspaceOps.Overlay do
            %{
              schema: @header,
              registry_digest: registry_digest,
+             selection_digest: absent(selection_digest),
              graph_digest: graph_digest,
              context_digest: context_digest,
              target: target,

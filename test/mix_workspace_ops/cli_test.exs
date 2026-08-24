@@ -128,6 +128,14 @@ defmodule MixWorkspaceOps.CLITest do
     assert report.schema == "mix_workspace_ops.selection/v2"
     assert report.repositories == ["alpha"]
     assert report.projects == ["alpha"]
+
+    # This is the one command whose whole subject is the selection, and it
+    # reported neither the selection's own digest nor the three sets.
+    assert is_binary(report.selection_digest)
+    refute report.selection_digest == report.registry_digest
+    assert report.sets.catalogued.repositories == 2
+    assert report.sets.selected.repositories == 1
+    assert report.sets.selected.digest == report.selection_digest
   end
 
   test "registry select requires both a registry and a view", context do
@@ -359,6 +367,7 @@ defmodule MixWorkspaceOps.CLITest do
     assert report.sets.materialized.absent == 0
     assert report.sets.catalogued.digest == report.registry_digest
     assert report.sets.selected.unselected_applications == ["plane", "plane_legacy"]
+    assert report.selection_digest == report.sets.selected.digest
   end
 
   test "sources reports where every dependency resolves from", context do
