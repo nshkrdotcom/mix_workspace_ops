@@ -78,8 +78,20 @@ defmodule MixWorkspaceOps.Registry do
   def load(path) do
     path = Path.expand(path)
 
-    with {:ok, bytes} <- File.read(path),
-         {:ok, decoded} <- StrictJSON.decode(bytes),
+    with {:ok, bytes} <- File.read(path), do: load_document(bytes, path)
+  end
+
+  @doc """
+  Loads a catalog document held in memory.
+
+  `path` names where the bytes came from and is carried in the loaded registry;
+  nothing is read from it. Every rule a document read from disk must satisfy is
+  applied here, so a document assembled from somewhere other than a file is held
+  to the same contract.
+  """
+  @spec load_document(binary(), String.t()) :: {:ok, t()} | {:error, term()}
+  def load_document(bytes, path) do
+    with {:ok, decoded} <- StrictJSON.decode(bytes),
          {:ok, {schema, repositories}} <- Document.parse(decoded),
          {:ok, projects} <- index_projects(repositories),
          applications = Contract.index_applications(repositories),

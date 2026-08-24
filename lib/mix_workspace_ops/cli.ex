@@ -13,7 +13,7 @@ defmodule MixWorkspaceOps.CLI do
     View
   }
 
-  alias MixWorkspaceOps.Registry.ReleaseChain
+  alias MixWorkspaceOps.Registry.{Examples, ReleaseChain}
   alias MixWorkspaceOps.Release.{Descriptor, LocalAdapter, Transaction}
 
   @usage """
@@ -24,6 +24,7 @@ defmodule MixWorkspaceOps.CLI do
     registry select --registry PATH --view PATH
     registry workspace --registry PATH [--repository ID]
     registry chain --registry PATH [--package APP]
+    registry examples --guide PATH
     registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
     inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
     doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
@@ -44,6 +45,7 @@ defmodule MixWorkspaceOps.CLI do
     ["registry", "select"] => [:registry, :view],
     ["registry", "workspace"] => [:registry, :repository],
     ["registry", "chain"] => [:registry, :package],
+    ["registry", "examples"] => [:guide],
     ["registry", "discover"] => [:checkout_root, :github_owner, :output],
     ["inventory"] => [:registry, :checkout_root, :view, :binding, :output],
     ["doctor"] => [:registry, :checkout_root, :view, :binding],
@@ -137,6 +139,13 @@ defmodule MixWorkspaceOps.CLI do
          order: order,
          prerequisites: chain
        }}
+    end
+  end
+
+  def dispatch(["registry", "examples" | args]) do
+    with {:ok, options, []} <- options(["registry", "examples"], args),
+         :ok <- require_option(options, :guide) do
+      Examples.validate(options.guide)
     end
   end
 
@@ -311,7 +320,16 @@ defmodule MixWorkspaceOps.CLI do
     do: parse_options(rest, command, accepted, options, [argument | positional])
 
   defp normalize_paths({:ok, options, rest}) do
-    path_keys = [:registry, :checkout_root, :binding, :view, :state_root, :output, :descriptor]
+    path_keys = [
+      :registry,
+      :checkout_root,
+      :binding,
+      :view,
+      :state_root,
+      :output,
+      :descriptor,
+      :guide
+    ]
 
     normalized =
       Enum.reduce(path_keys, options, fn key, acc ->

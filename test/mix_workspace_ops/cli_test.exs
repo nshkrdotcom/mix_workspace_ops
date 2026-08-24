@@ -61,6 +61,7 @@ defmodule MixWorkspaceOps.CLITest do
              ["plan"],
              ["registry", "chain"],
              ["registry", "discover"],
+             ["registry", "examples"],
              ["registry", "select"],
              ["registry", "validate"],
              ["registry", "workspace"],

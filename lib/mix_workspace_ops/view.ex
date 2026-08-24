@@ -6,7 +6,7 @@ defmodule MixWorkspaceOps.View do
   Mix project is still reachable: `select_repositories/2` returns it and
   `registry select` reports it, even though it contributes no project.
 
-  No command operates on such a repository yet. `Registry.restrict/2` drops a
+  No command operates on such a repository yet. `MixWorkspaceOps.Registry.restrict/2` drops a
   repository once none of its projects is selected, so a repository-scoped unit
   of work has nothing to run against. Repository-scoped units arrive with the
   fan-out work; until then the selection is data, not an execution target.
@@ -69,8 +69,18 @@ defmodule MixWorkspaceOps.View do
   def load(path) do
     path = Path.expand(path)
 
-    with {:ok, bytes} <- File.read(path),
-         {:ok, decoded} <- StrictJSON.decode(bytes, maximum_bytes: 1024 * 1024),
+    with {:ok, bytes} <- File.read(path), do: load_document(bytes, path)
+  end
+
+  @doc """
+  Loads a view document held in memory.
+
+  `path` names where the bytes came from and is carried in the loaded view;
+  nothing is read from it.
+  """
+  @spec load_document(binary(), String.t()) :: {:ok, t()} | {:error, term()}
+  def load_document(bytes, path) do
+    with {:ok, decoded} <- StrictJSON.decode(bytes, maximum_bytes: 1024 * 1024),
          {:ok, view} <- parse(decoded) do
       {:ok, struct!(__MODULE__, Map.merge(view, %{path: path, digest: digest(bytes)}))}
     end
