@@ -21,6 +21,14 @@ defmodule MixWorkspaceOps.Resolution do
   Nothing available is an error naming the application and the order that was
   walked, because a dependency that resolves from nowhere cannot be built.
 
+  Publishing takes precedence over every other rule. A publishing command
+  resolves through `publish_order`, which is `hex` alone unless a declaration
+  names otherwise, so a published package never carries a local path. A
+  declaration that names another source there is honoured rather than refused:
+  a dependency with no Hex release and no prospect of one still has to resolve
+  from somewhere while its dependent publishes, and refusing it would make
+  every such package unpublishable.
+
   The local path is derived, never configured: the checkout root of the
   repository holding the catalogued provider, joined to that project's path
   inside the repository. A declared `provider` selects among several catalogued
@@ -87,7 +95,8 @@ defmodule MixWorkspaceOps.Resolution do
   `:closure` supplies an already-computed `MixWorkspaceOps.Graph` resolution;
   without it the closure is derived here. `:consumer_root` is the checkout root
   of the project doing the resolving and defaults to the target's own checkout;
-  the Mix `deps/` test is relative to it.
+  the Mix `deps/` test is relative to it. `:publish?` says the command about to
+  run publishes, and defaults to false.
   """
   @spec resolve(Registry.t(), String.t() | atom(), keyword()) ::
           {:ok, report()} | {:error, term()}
@@ -194,7 +203,11 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   defp select(registry, app, declaration, opts) do
-    from_order(registry, app, declaration, declaration.order, :order, opts)
+    if Keyword.get(opts, :publish?, false) do
+      from_order(registry, app, declaration, declaration.publish_order, :publish, opts)
+    else
+      from_order(registry, app, declaration, declaration.order, :order, opts)
+    end
   end
 
   defp from_order(registry, app, declaration, order, reason, opts) do

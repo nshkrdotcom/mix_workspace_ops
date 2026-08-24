@@ -4,7 +4,14 @@ defmodule MixWorkspaceOpsBootstrap do
   @schema_header "mix_workspace_ops.overlay/v1"
   @overlay_env "MIX_WORKSPACE_OPS_OVERLAY"
   @lockfile_env "MIX_WORKSPACE_OPS_LOCKFILE"
-  @publish_tasks MapSet.new(["hex.build", "hex.publish", "deps.publish_preflight"])
+  # The publish and quiet task lists, and the parser that reads them, are
+  # duplicated from `MixWorkspaceOps.PublishMode` on purpose: this file is
+  # loaded standalone by a `mix.exs` that has no access to Mix Workspace Ops.
+  # A test holds the two implementations to the same table of argv cases so
+  # they cannot drift.
+  @publish_tasks ["hex.publish", "hex.build", "deps.publish_preflight"]
+  @quiet_tasks ["run", "eval", "cmd", "app.start", "app.config", "escript.build",
+                "deps.sources", "deps.publish_preflight"]
   @maximum_overlay_bytes 16 * 1024 * 1024
 
   def dep(app, requirement, _project_root, extra_opts \\ []) when is_atom(app) do
@@ -67,7 +74,7 @@ defmodule MixWorkspaceOpsBootstrap do
       raise "#{@overlay_env} points to an oversized overlay"
     end
 
-    if Enum.any?(System.argv(), &MapSet.member?(@publish_tasks, &1)) do
+    if publish_mode?(System.argv()) do
       raise "a non-Hex Mix Workspace Ops overlay is active; rerun publication without #{@overlay_env}"
     end
 
@@ -132,6 +139,40 @@ defmodule MixWorkspaceOpsBootstrap do
         raise "invalid Mix Workspace Ops overlay row: #{inspect(row)}"
     end
   end
+
+  # Task position only: `mix do compile, hex.publish` publishes and
+  # `mix run --arg hex.publish` does not.
+  def publish_mode?(argv) when is_list(argv) do
+    argv |> task_tokens() |> Enum.any?(&(&1 in @publish_tasks))
+  end
+
+  def quiet_task?(argv) when is_list(argv) do
+    argv |> task_tokens() |> Enum.any?(&(&1 in @quiet_tasks))
+  end
+
+  def task_tokens(argv) when is_list(argv) do
+    argv
+    |> Enum.flat_map(&split_separators/1)
+    |> collect_tasks([], true)
+    |> Enum.reverse()
+  end
+
+  defp split_separators(argument) do
+    case String.split(argument, ",") do
+      [single] -> [single]
+      parts -> parts |> Enum.intersperse(",") |> Enum.reject(&(&1 == ""))
+    end
+  end
+
+  defp collect_tasks([], acc, _task?), do: acc
+
+  defp collect_tasks([token | rest], acc, _task?) when token in [",", "+"],
+    do: collect_tasks(rest, acc, true)
+
+  defp collect_tasks(["do" | rest], acc, true), do: collect_tasks(rest, acc, true)
+  defp collect_tasks(["" | rest], acc, true), do: collect_tasks(rest, acc, true)
+  defp collect_tasks([token | rest], acc, true), do: collect_tasks(rest, [token | acc], false)
+  defp collect_tasks([_token | rest], acc, false), do: collect_tasks(rest, acc, false)
 
   defp verify_content_address!(path) do
     bytes = File.read!(path)

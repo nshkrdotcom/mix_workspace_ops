@@ -233,12 +233,62 @@ defmodule MixWorkspaceOps.ResolutionTest do
     end
   end
 
+  describe "publish mode" do
+    test "resolves through the publish order rather than the ordinary one", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+      declaration = %{"github" => %{"repo" => "example-org/core"}, "hex" => "~> 1.0"}
+      registry = registry(root, declaration)
+
+      assert {:ok, development} = decide(registry, root, "core", declaration)
+      assert development.source == "local"
+
+      assert {:ok, publishing} = decide(registry, root, "core", declaration, publish?: true)
+      assert publishing.source == "hex"
+      assert publishing.reason == :publish
+      assert publishing.location == "~> 1.0"
+    end
+
+    test "a configured publish order naming another source is honoured", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+
+      declaration = %{
+        "github" => %{"repo" => "example-org/core", "branch" => "main"},
+        "order" => ["local", "github"],
+        "publish_order" => ["github"]
+      }
+
+      registry = registry(root, declaration)
+
+      assert {:ok, publishing} = decide(registry, root, "core", declaration, publish?: true)
+      assert publishing.source == "github"
+      assert publishing.reason == :publish
+    end
+
+    test "publishing a dependency with nothing to publish from is a typed error", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+      declaration = %{"github" => %{"repo" => "example-org/core"}, "order" => ["local", "github"]}
+      registry = registry(root, declaration)
+
+      assert {:error, {:no_available_source, "core", ["hex"]}} =
+               decide(registry, root, "core", declaration, publish?: true)
+    end
+  end
+
   defp reader(%{id: "consumer"}), do: {:ok, ["core", "third_party"]}
   defp reader(_project), do: {:ok, []}
 
-  defp decide(registry, root, app, declaration) do
-    Resolution.decide(registry, app, parse!(declaration),
-      consumer_root: Path.join(root, "consumer")
+  defp decide(registry, root, app, declaration, opts \\ []) do
+    Resolution.decide(
+      registry,
+      app,
+      parse!(declaration),
+      Keyword.put(opts, :consumer_root, Path.join(root, "consumer"))
     )
   end
 
