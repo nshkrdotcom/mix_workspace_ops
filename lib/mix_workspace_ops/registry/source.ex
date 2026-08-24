@@ -23,6 +23,18 @@ defmodule MixWorkspaceOps.Registry.Source do
   @boolean_options ~w(override runtime optional)
   @list_options ~w(only targets)
 
+  # `only` and `targets` name Mix environments and Mix targets. JSON has no
+  # atoms, so the emitter converts their values back to atoms, and an atom is
+  # never collected. The bound is what stops catalog content from minting an
+  # unbounded number of them: at most eight values, each at most 32 bytes, on
+  # top of the identifier grammar every value already has to satisfy. Eight
+  # covers Mix's three standard environments and a handful of custom ones with
+  # room to spare, and 32 bytes is longer than any environment or target name
+  # anyone writes; both sit well above real use and well below the point where
+  # a hostile document could exhaust the atom table.
+  @maximum_option_values 8
+  @maximum_option_value_bytes 32
+
   @type github :: %{
           repo: String.t(),
           branch: String.t() | nil,
@@ -47,6 +59,14 @@ defmodule MixWorkspaceOps.Registry.Source do
 
   @spec default_publish_order() :: [String.t()]
   def default_publish_order, do: @default_publish_order
+
+  @doc "The most values an option naming environments or targets may carry."
+  @spec maximum_option_values() :: pos_integer()
+  def maximum_option_values, do: @maximum_option_values
+
+  @doc "The most bytes one such value may carry."
+  @spec maximum_option_value_bytes() :: pos_integer()
+  def maximum_option_value_bytes, do: @maximum_option_value_bytes
 
   @doc """
   Parses a map of application name to source declaration.
@@ -231,10 +251,18 @@ defmodule MixWorkspaceOps.Registry.Source do
     do: {:ok, value}
 
   defp parse_option(key, value, where) when key in @list_options do
-    if is_list(value) and value != [] and Enum.all?(value, &identifier?/1) do
-      {:ok, value}
-    else
-      {:error, {:invalid_dependency_option, where, key, value}}
+    cond do
+      not (is_list(value) and value != [] and Enum.all?(value, &identifier?/1)) ->
+        {:error, {:invalid_dependency_option, where, key, value}}
+
+      length(value) > @maximum_option_values ->
+        {:error, {:dependency_option_too_long, where, key, @maximum_option_values}}
+
+      Enum.any?(value, &(byte_size(&1) > @maximum_option_value_bytes)) ->
+        {:error, {:dependency_option_value_too_long, where, key, @maximum_option_value_bytes}}
+
+      true ->
+        {:ok, value}
     end
   end
 
