@@ -370,6 +370,50 @@ defmodule MixWorkspaceOps.CLITest do
     assert report.source.mode == :hex
   end
 
+  test "run resolves through the catalog's own order unless a mode is named", context do
+    %{root: root, catalog: catalog, state_root: state_root} = workspace!(context)
+
+    assert {:ok, report} =
+             CLI.dispatch([
+               "run",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--mix-state",
+               "delegated",
+               "--state-root",
+               state_root,
+               "--",
+               "pwd"
+             ])
+
+    assert report.source.mode == :auto
+    refute report.source.publish
+  end
+
+  test "run refuses a source override that does not name an application", context do
+    %{root: root, catalog: catalog} = workspace!(context)
+
+    base = [
+      "run",
+      "--project",
+      "alpha",
+      "--registry",
+      catalog,
+      "--checkout-root",
+      root
+    ]
+
+    assert CLI.dispatch(base ++ ["--source", "plane", "--", "pwd"]) ==
+             {:usage_error, "--source expects APP=SOURCE, got \"plane\""}
+
+    assert CLI.dispatch(base ++ ["--source", "plane=svn", "--", "pwd"]) ==
+             {:usage_error, "invalid source \"svn\""}
+  end
+
   test "run refuses an unknown mode and an unknown Mix-state owner", context do
     %{root: root, catalog: catalog} = workspace!(context)
 

@@ -50,10 +50,33 @@ semantics, or workspace impact scheduling.
 The default repository integration is zero code. Repositories without
 switchable cross-repository internal dependencies need no MWO file, module,
 task, or dependency. Existing `mix.exs` files remain authoritative; only a
-project whose dependency tuple must switch between Hex and an explicit operator
-overlay needs the minimal Mix-load seam. Exceptional repository configuration,
-if ever required, is limited to one declarative manifest rather than a copied
-helper subsystem.
+project whose dependency tuple must switch source needs the minimal Mix-load
+seam. Exceptional repository configuration, if ever required, is limited to one
+declarative manifest rather than a copied helper subsystem.
+
+## The Mix-load seam
+
+```elixir
+defp deps do
+  [
+    workspace_dep(:example_core, "~> 1.0"),
+    workspace_dep(:example_edge, github: "example-org/example_edge", branch: "main")
+  ]
+end
+
+defp workspace_dep(app, committed_default, extra_opts \\ []) do
+  case Code.ensure_loaded(MixWorkspaceOpsBootstrap) do
+    {:module, module} -> apply(module, :dep, [app, committed_default, __DIR__, extra_opts])
+    _other -> {app, committed_default}
+  end
+end
+```
+
+The second argument is the committed default — a Hex requirement, or committed
+git coordinates for a dependency that has no Hex release. It is what the
+repository resolves to on a fresh clone with no tool involved. Where an
+operator has activated an overlay, the row for that application decides
+instead, and the plan records which source it chose and why.
 
 ## Registry-driven usage
 

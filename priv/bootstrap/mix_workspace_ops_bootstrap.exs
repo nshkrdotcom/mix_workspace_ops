@@ -1,35 +1,59 @@
 defmodule MixWorkspaceOpsBootstrap do
   @moduledoc false
 
-  @schema_header "mix_workspace_ops.overlay/v1"
+  # The Mix-load seam. A `mix.exs` loads this file by path and calls `dep/4`
+  # for each cross-repository dependency. It has no access to Mix Workspace Ops
+  # and reads nothing but the two variables the launching process sets, so the
+  # tables and the parsers below are deliberate duplicates of
+  # `MixWorkspaceOps.PublishMode` and `MixWorkspaceOps.Overlay`. Tests hold each
+  # pair to one shared table so they cannot drift.
+
+  @schema_header "mix_workspace_ops.overlay/v2"
   @overlay_env "MIX_WORKSPACE_OPS_OVERLAY"
   @lockfile_env "MIX_WORKSPACE_OPS_LOCKFILE"
-  # The publish and quiet task lists, and the parser that reads them, are
-  # duplicated from `MixWorkspaceOps.PublishMode` on purpose: this file is
-  # loaded standalone by a `mix.exs` that has no access to Mix Workspace Ops.
-  # A test holds the two implementations to the same table of argv cases so
-  # they cannot drift.
+  @maximum_overlay_bytes 16 * 1024 * 1024
+  @modes ["auto", "local", "git", "hex"]
+  @absent "-"
+
   @publish_tasks ["hex.publish", "hex.build", "deps.publish_preflight"]
   @quiet_tasks ["run", "eval", "cmd", "app.start", "app.config", "escript.build",
                 "deps.sources", "deps.publish_preflight"]
-  @maximum_overlay_bytes 16 * 1024 * 1024
 
-  def dep(app, requirement, _project_root, extra_opts \\ []) when is_atom(app) do
-    case source(Atom.to_string(app)) do
-      nil ->
-        dependency_tuple(app, requirement, extra_opts)
+  @option_keys %{
+    "only" => :only,
+    "optional" => :optional,
+    "override" => :override,
+    "runtime" => :runtime,
+    "targets" => :targets
+  }
+  @list_options ["only", "targets"]
+  @maximum_option_values 8
+  @maximum_option_value_bytes 32
+  @revision_keys ["branch", "ref", "tag"]
 
-      %{kind: :path, path: path} ->
-        dependency_tuple(app, requirement, Keyword.merge(extra_opts, path: path, override: true))
+  @doc """
+  The dependency tuple for `app`.
 
-      %{kind: :git, url: url, revision: revision, subdir: subdir} ->
-        dependency_tuple(
-          app,
-          requirement,
-          Keyword.merge(extra_opts, git: url, ref: revision, subdir: subdir, override: true)
-        )
+  `committed_default` is what this repository resolves to with no overlay
+  active — a binary is a Hex requirement, and a keyword list is committed git
+  coordinates such as `[github: "example-org/example_core", branch: "main"]`.
+  A dependency with no Hex release needs the second form, or a fresh clone and
+  a consumer of the published package have nowhere to resolve it from.
+
+  With an overlay carrying the application, the overlay row decides.
+  """
+  def dep(app, committed_default, project_root, extra_opts \\ []) when is_atom(app) do
+    overlay = overlay()
+    notify_local_paths(project_root, overlay)
+
+    case overlay_source(overlay, Atom.to_string(app)) do
+      nil -> committed_tuple(app, committed_default, extra_opts)
+      source -> overlay_tuple(app, source, extra_opts)
     end
   end
+
+  defp overlay_source(nil, _app), do: nil
+  defp overlay_source(overlay, app), do: Map.get(overlay.sources, app)
 
   def active?(_project_root \\ nil), do: not is_nil(overlay_path())
 
@@ -41,17 +65,129 @@ defmodule MixWorkspaceOpsBootstrap do
     end
   end
 
-  def source(_project_root, app), do: source(to_string(app))
-
-  defp source(app) do
-    case overlay_path() do
+  def source(_project_root, app) do
+    case overlay() do
       nil -> nil
-      path -> path |> parse_overlay!() |> Map.get(app)
+      overlay -> Map.get(overlay.sources, to_string(app))
     end
   end
 
-  defp dependency_tuple(app, requirement, []), do: {app, requirement}
-  defp dependency_tuple(app, requirement, opts), do: {app, requirement, opts}
+  # Task position only: `mix do compile, hex.publish` publishes and
+  # `mix run --arg hex.publish` does not.
+  def publish_mode?(argv) when is_list(argv) do
+    argv |> task_tokens() |> Enum.any?(&(&1 in @publish_tasks))
+  end
+
+  # Tasks whose standard output is the product itself never carry the local
+  # path notice, so nothing reading `mix` output has a line injected into it.
+  def quiet_task?(argv) when is_list(argv) do
+    argv |> task_tokens() |> Enum.any?(&(&1 in @quiet_tasks))
+  end
+
+  def task_tokens(argv) when is_list(argv) do
+    argv
+    |> Enum.flat_map(&split_separators/1)
+    |> collect_tasks([], true)
+    |> Enum.reverse()
+  end
+
+  def decode_options(@absent), do: []
+
+  def decode_options(field) do
+    field
+    |> String.split(",")
+    |> Enum.map(&decode_option!/1)
+    |> Enum.sort_by(&elem(&1, 0))
+  end
+
+  defp committed_tuple(app, requirement, extra_opts) when is_binary(requirement) do
+    case extra_opts do
+      [] -> {app, requirement}
+      opts -> {app, requirement, opts}
+    end
+  end
+
+  defp committed_tuple(app, coordinates, extra_opts) when is_list(coordinates) do
+    unless Keyword.keyword?(coordinates) and Keyword.has_key?(coordinates, :github) do
+      raise "committed git coordinates for #{app} must be a keyword list carrying :github"
+    end
+
+    {app, Keyword.merge(coordinates, extra_opts)}
+  end
+
+  defp committed_tuple(app, other, _extra_opts) do
+    raise "committed default for #{app} must be a Hex requirement or git coordinates, got: " <>
+            inspect(other)
+  end
+
+  defp overlay_tuple(app, %{kind: :local, path: path, opts: opts}, extra_opts) do
+    {app, Keyword.merge([path: path], Keyword.merge(opts, extra_opts))}
+  end
+
+  defp overlay_tuple(app, %{kind: :github} = source, extra_opts) do
+    coordinates =
+      [github: source.repo] ++
+        revision_option(source.revision_kind, source.revision) ++
+        subdir_option(source.subdir)
+
+    {app, Keyword.merge(coordinates, Keyword.merge(source.opts, extra_opts))}
+  end
+
+  defp overlay_tuple(app, %{kind: :hex, requirement: requirement, opts: opts}, extra_opts) do
+    case Keyword.merge(opts, extra_opts) do
+      [] -> {app, requirement}
+      merged -> {app, requirement, merged}
+    end
+  end
+
+  # The GitHub option keys the emitted tuple carries, in the order a map of
+  # them yields, which is the order the tuples this seam replaces carried.
+  defp revision_option(@absent, _value), do: []
+  defp revision_option("branch", value), do: [branch: value]
+  defp revision_option("ref", value), do: [ref: value]
+  defp revision_option("tag", value), do: [tag: value]
+
+  defp subdir_option(nil), do: []
+  defp subdir_option(subdir), do: [subdir: subdir]
+
+  defp notify_local_paths(project_root, overlay) do
+    key = {__MODULE__, :local_path_notice, project_root}
+
+    if not is_nil(overlay) and not quiet_task?(System.argv()) and
+         :persistent_term.get(key, nil) == nil do
+      :persistent_term.put(key, true)
+      emit_local_path_notice(overlay)
+    end
+
+    :ok
+  end
+
+  defp emit_local_path_notice(overlay) do
+    case local_applications(overlay) do
+      [] ->
+        :ok
+
+      applications ->
+        message =
+          "[mix_workspace_ops] local path source in use for: " <> Enum.join(applications, ", ")
+
+        if Code.ensure_loaded?(Mix), do: Mix.shell().info(message), else: IO.puts(:stderr, message)
+    end
+  end
+
+  defp local_applications(overlay) do
+    overlay.sources
+    |> Enum.filter(fn {_app, source} -> source.kind == :local end)
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.sort()
+  end
+
+  defp overlay do
+    case overlay_path() do
+      nil -> nil
+      path -> path |> parse_overlay!() |> refuse_development_overlay_while_publishing!()
+    end
+  end
 
   defp overlay_path do
     case System.get_env(@overlay_env) do
@@ -74,11 +210,21 @@ defmodule MixWorkspaceOpsBootstrap do
       raise "#{@overlay_env} points to an oversized overlay"
     end
 
-    if publish_mode?(System.argv()) do
-      raise "a non-Hex Mix Workspace Ops overlay is active; rerun publication without #{@overlay_env}"
+    verify_content_address!(path)
+  end
+
+  # An overlay decided for ordinary development says where a developer's
+  # checkouts are. Publishing from under one would put a local path or a
+  # development ref into a released package, so it is refused; an overlay
+  # decided under publish resolution is exactly what publication should use.
+  defp refuse_development_overlay_while_publishing!(overlay) do
+    if publish_mode?(System.argv()) and not overlay.publish do
+      raise "a Mix Workspace Ops overlay decided for development is active; " <>
+              "rerun publication against an overlay resolved in publish mode, " <>
+              "or without #{@overlay_env}"
     end
 
-    verify_content_address!(path)
+    overlay
   end
 
   defp validate_lockfile!(path) do
@@ -97,13 +243,13 @@ defmodule MixWorkspaceOpsBootstrap do
     case path |> File.read!() |> String.split("\n", trim: true) do
       [@schema_header, "registry_digest\t" <> _registry_digest,
        "graph_digest\t" <> _graph_digest, "context_digest\t" <> _context_digest,
-       "target\t" <> _target, "mode\t" <> mode,
+       "target\t" <> _target, "mode\t" <> mode, "publish\t" <> publish,
        "target_head\t" <> _target_head,
        "target_source_digest\t" <> _target_source_digest,
        "lock_digest\t" <> _lock_digest,
        "toolchain\t" <> _toolchain | rows]
-      when mode in ["local", "git"] ->
-        parse_rows!(rows)
+      when mode in @modes and publish in ["true", "false"] ->
+        %{mode: mode, publish: publish == "true", sources: parse_rows!(rows)}
 
       _lines ->
         raise "invalid Mix Workspace Ops overlay at #{path}"
@@ -124,37 +270,82 @@ defmodule MixWorkspaceOpsBootstrap do
 
   defp parse_row!(row) do
     case String.split(row, "\t") do
-      [app, "path", path, revision, source_digest] ->
+      [app, "local", path, revision, source_digest, opts] ->
         unless Path.type(path) == :absolute and File.regular?(Path.join(path, "mix.exs")) do
           raise "local Mix dependency #{app} has no absolute Mix project at #{path}"
         end
 
         {app,
-         %{kind: :path, path: path, revision: revision, source_digest: source_digest}}
+         %{
+           kind: :local,
+           path: path,
+           revision: revision,
+           source_digest: source_digest,
+           opts: decode_options(opts)
+         }}
 
-      [app, "git", url, revision, subdir] ->
-        {app, %{kind: :git, url: url, revision: revision, subdir: subdir}}
+      [app, "github", repo, kind, value, subdir, opts] ->
+        unless (kind == @absent and value == @absent) or
+                 (kind in @revision_keys and value != @absent) do
+          raise "invalid Mix Workspace Ops revision for #{app}: #{kind} #{value}"
+        end
+
+        {app,
+         %{
+           kind: :github,
+           repo: repo,
+           revision_kind: kind,
+           revision: value,
+           subdir: if(subdir == @absent, do: nil, else: subdir),
+           opts: decode_options(opts)
+         }}
+
+      [app, "hex", requirement, opts] ->
+        {app, %{kind: :hex, requirement: requirement, opts: decode_options(opts)}}
 
       _parts ->
         raise "invalid Mix Workspace Ops overlay row: #{inspect(row)}"
     end
   end
 
-  # Task position only: `mix do compile, hex.publish` publishes and
-  # `mix run --arg hex.publish` does not.
-  def publish_mode?(argv) when is_list(argv) do
-    argv |> task_tokens() |> Enum.any?(&(&1 in @publish_tasks))
+  defp decode_option!(pair) do
+    case String.split(pair, "=", parts: 2) do
+      [key, value] -> decode_option!(key, value)
+      _parts -> raise "invalid Mix Workspace Ops dependency option: #{inspect(pair)}"
+    end
   end
 
-  def quiet_task?(argv) when is_list(argv) do
-    argv |> task_tokens() |> Enum.any?(&(&1 in @quiet_tasks))
+  defp decode_option!(key, value) do
+    case Map.fetch(@option_keys, key) do
+      {:ok, option} when key in @list_options -> {option, decode_names!(option, value)}
+      {:ok, option} -> {option, decode_boolean!(option, value)}
+      :error -> raise "unknown Mix Workspace Ops dependency option: #{inspect(key)}"
+    end
   end
 
-  def task_tokens(argv) when is_list(argv) do
-    argv
-    |> Enum.flat_map(&split_separators/1)
-    |> collect_tasks([], true)
-    |> Enum.reverse()
+  defp decode_boolean!(_option, "true"), do: true
+  defp decode_boolean!(_option, "false"), do: false
+
+  defp decode_boolean!(option, value),
+    do: raise("invalid Mix Workspace Ops option #{option}: #{inspect(value)}")
+
+  # `only` and `targets` name Mix environments and targets, which have to be
+  # atoms and which JSON cannot carry as atoms. Converting them mints atoms
+  # from file content, so the count and the length are bounded: eight values of
+  # at most 32 bytes is far more than Mix's three standard environments and a
+  # handful of custom ones, and far below anything that could exhaust the atom
+  # table.
+  defp decode_names!(option, value) do
+    names = String.split(value, "|")
+
+    if names == [] or Enum.any?(names, &(&1 == "")) or
+         length(names) > @maximum_option_values or
+         Enum.any?(names, &(byte_size(&1) > @maximum_option_value_bytes)) or
+         Enum.any?(names, &(not Regex.match?(~r/^[a-z][a-z0-9_]*$/, &1))) do
+      raise "invalid Mix Workspace Ops option #{option}: #{inspect(value)}"
+    end
+
+    Enum.map(names, &String.to_atom/1)
   end
 
   defp split_separators(argument) do

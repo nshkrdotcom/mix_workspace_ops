@@ -27,10 +27,15 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert String.starts_with?(activation.report.runtime.root, state_root)
     assert File.read!(activation.report.runtime.lockfile) == "%{}\n"
     assert {:ok, overlay} = Overlay.read(activation.path)
+    assert overlay.schema == "mix_workspace_ops.overlay/v2"
+    assert overlay.mode == "auto"
+    refute overlay.publish
     assert overlay.context_digest == activation.report.context_digest
-    assert Map.keys(overlay.sources) == ["consumer", "core"]
+    assert Map.keys(overlay.sources) == ["core"]
+    assert overlay.sources["core"].kind == :local
     assert overlay.sources["core"].path == Path.join(root, "core")
     assert is_binary(overlay.sources["core"].source_digest)
+    assert [%{application: "core", source: "local", reason: :order}] = activation.report.decisions
 
     refute File.exists?(Path.join(root, "core/.mix_workspace_ops"))
     refute File.exists?(Path.join(root, "consumer/.mix_workspace_ops"))
@@ -117,12 +122,87 @@ defmodule MixWorkspaceOps.OverlayTest do
 
     assert {:ok, git} = Overlay.activate(registry, "consumer", mode: :git, state_root: state_root)
     refute git.path == first.path
+    assert {:ok, git_overlay} = Overlay.read(git.path)
+    assert git_overlay.sources["core"].kind == :github
+    assert git_overlay.sources["core"].repo == "example-org/core"
+    assert git_overlay.sources["core"].revision_kind == "branch"
+    assert git_overlay.sources["core"].revision == "main"
 
     assert {:ok, hex} = Overlay.activate(registry, "consumer", mode: :hex, state_root: state_root)
-    assert hex.path == nil
-    assert {"MIX_WORKSPACE_OPS_OVERLAY", nil} in hex.env
-    assert {"MIX_DEPS_PATH", hex.report.runtime.deps_path} in hex.env
-    refute hex.report.runtime.root == first.report.runtime.root
+    refute hex.path == first.path
+    assert {:ok, hex_overlay} = Overlay.read(hex.path)
+    assert hex_overlay.mode == "hex"
+    assert hex_overlay.sources["core"] == %{kind: :hex, requirement: "~> 1.0", opts: []}
+  end
+
+  test "a mode naming a source the catalog cannot reach is a typed error", context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    initialize_repository!(Path.join(root, "core"))
+    initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
+    registry = registry(root, declaration: %{"order" => ["local"]})
+
+    assert {:error, {:unavailable_source, "core", "hex", :run_mode}} =
+             Overlay.activate(registry, "consumer", mode: :hex, state_root: state_root)
+
+    assert {:error, {:unavailable_source, "core", "github", :run_mode}} =
+             Overlay.activate(registry, "consumer", mode: :git, state_root: state_root)
+  end
+
+  test "a per-dependency source overrides the run mode", context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    initialize_repository!(Path.join(root, "core"))
+    initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
+
+    assert {:ok, activation} =
+             Overlay.activate(registry(root), "consumer",
+               mode: :hex,
+               sources: %{"core" => "github"},
+               state_root: state_root
+             )
+
+    assert {:ok, overlay} = Overlay.read(activation.path)
+    assert overlay.mode == "hex"
+    assert overlay.sources["core"].kind == :github
+    assert [%{reason: :dependency_override}] = activation.report.decisions
+  end
+
+  test "publish resolution is recorded in the overlay it produces", context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    initialize_repository!(Path.join(root, "core"))
+    initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
+
+    assert {:ok, activation} =
+             Overlay.activate(registry(root), "consumer",
+               publish?: true,
+               state_root: state_root
+             )
+
+    assert {:ok, overlay} = Overlay.read(activation.path)
+    assert overlay.publish
+    assert overlay.sources["core"] == %{kind: :hex, requirement: "~> 1.0", opts: []}
+    assert activation.report.publish
+  end
+
+  test "the options a declaration carries reach the overlay row", context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    initialize_repository!(Path.join(root, "core"))
+    initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
+
+    registry =
+      registry(root,
+        declaration: %{
+          "hex" => "~> 1.0",
+          "opts" => %{"only" => ["dev", "test"], "runtime" => false}
+        }
+      )
+
+    assert {:ok, activation} = Overlay.activate(registry, "consumer", state_root: state_root)
+    assert {:ok, overlay} = Overlay.read(activation.path)
+    assert overlay.sources["core"].opts == [only: [:dev, :test], runtime: false]
   end
 
   test "rejects an overlay whose content no longer matches its address", context do
@@ -200,11 +280,20 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert File.read!(activation.report.runtime.lockfile) == "%{}\n"
   end
 
-  defp registry(root) do
+  defp registry(root, opts \\ []) do
+    declaration =
+      Keyword.get(opts, :declaration, %{
+        "github" => %{"repo" => "example-org/core", "branch" => "main"},
+        "hex" => "~> 1.0"
+      })
+
     root
-    |> write_registry!([
-      repository("core", [project("core")]),
-      repository("consumer", [project("consumer")])
+    |> write_catalog!([
+      catalog_repository("core", projects: [catalog_project("core")]),
+      catalog_repository("consumer",
+        projects: [catalog_project("consumer")],
+        dependency_sources: %{"core" => declaration}
+      )
     ])
     |> Registry.load!()
     |> bind!(root)

@@ -24,12 +24,58 @@ bootstrap limitation with a small, versioned bootstrap materialized in operator
 state and an explicit operator-generated data overlay. The bootstrap is passed
 by path only to the launched Mix process; it is not copied into every repository.
 
-Version requirements remain in each package's `mix.exs`. A caller-supplied
-registry contains stable repository and project coordinates only. Dependency
-edges are derived from current Mix metadata; they are never copied into the
-registry. With no overlay, a package is an ordinary standalone Hex consumer.
-With an explicit local overlay, managed dependencies resolve to validated
-sibling paths.
+A caller-supplied registry contains stable repository and project coordinates
+only. Dependency edges are derived from current Mix metadata; they are never
+copied into the registry.
+
+## The Mix-load seam
+
+The seam is one function call per cross-repository dependency:
+
+```elixir
+defp deps do
+  [
+    workspace_dep(:example_core, "~> 1.0"),
+    workspace_dep(:example_edge, github: "example-org/example_edge", branch: "main")
+  ]
+end
+
+defp workspace_dep(app, committed_default, extra_opts \\ []) do
+  case Code.ensure_loaded(MixWorkspaceOpsBootstrap) do
+    {:module, module} -> apply(module, :dep, [app, committed_default, __DIR__, extra_opts])
+    _other -> {app, committed_default}
+  end
+end
+```
+
+The second argument is the **committed default**: what this repository resolves
+to with nothing else active, and it is committed to the repository rather than
+supplied by a tool. A binary is a Hex requirement. A keyword list carrying
+`:github` is committed git coordinates, and a dependency with no Hex release
+needs that form — otherwise a fresh clone, and any consumer of the published
+package, has nowhere to resolve it from. The seam has no catalog, so the
+committed default is how a repository states its own answer.
+
+With an overlay carrying the application, the overlay row decides instead, and
+the row states which of `local`, `github` or `hex` the operator's resolution
+chose along with everything the tuple needs:
+
+```
+app 	 local  	 <absolute path> 	 <revision> 	 <source digest> 	 <opts>
+app 	 github 	 <owner/repo>    	 <branch|ref|tag|-> 	 <value|-> 	 <subdir|-> 	 <opts>
+app 	 hex    	 <requirement>   	 <opts>
+```
+
+The emitted tuple is `{app, [path: ...]}`, `{app, [github: ...]}`, or
+`{app, requirement}` — with the dependency's Mix options merged in, and
+call-site options winning over them. A path or git dependency carries no
+requirement, because Mix takes none there.
+
+Publication is fail-closed at the seam. An overlay decided for ordinary
+development names a developer's checkouts, so a publishing task running under
+one is refused rather than allowed to put a local path into a released
+package. An overlay decided under publish resolution is used, because that is
+what publication should resolve against.
 
 The operator tool is separate from registry ownership, package projection,
 workspace impact scheduling, and product acceptance. Its source tree contains

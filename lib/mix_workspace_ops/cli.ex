@@ -8,6 +8,7 @@ defmodule MixWorkspaceOps.CLI do
     Graph,
     Inventory,
     Overlay,
+    PublishMode,
     Registry,
     Report,
     View
@@ -29,7 +30,8 @@ defmodule MixWorkspaceOps.CLI do
     inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
     doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
     plan --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
-    run --project ID --mode local|git|hex --mix-state managed|delegated \
+    run --project ID [--mode auto|local|git|hex] [--source APP=SOURCE] \
+      --mix-state managed|delegated \
       --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
       [--state-root PATH] -- COMMAND [ARG ...]
     release publish --descriptor PATH [--state-root PATH]
@@ -53,6 +55,7 @@ defmodule MixWorkspaceOps.CLI do
     ["run"] => [
       :project,
       :mode,
+      :source,
       :mix_state,
       :registry,
       :checkout_root,
@@ -240,13 +243,20 @@ defmodule MixWorkspaceOps.CLI do
          {:ok, registry} <- load_bound_registry(options),
          :ok <- ensure_project_in_view(registry, options),
          {:ok, mode} <- source_mode(options.mode),
+         {:ok, sources} <- source_overrides(options.source),
          {:ok, mix_state} <- mix_state(options.mix_state) do
       project_root = Registry.project_root(registry, options.project)
 
       Overlay.with_activation(
         registry,
         options.project,
-        [mode: mode, mix_state: mix_state, state_root: options.state_root],
+        [
+          mode: mode,
+          sources: sources,
+          publish?: PublishMode.publish?(PublishMode.task_argv(command)),
+          mix_state: mix_state,
+          state_root: options.state_root
+        ],
         fn source_report, env -> run_command(command, project_root, source_report, env) end
       )
     end
@@ -295,7 +305,8 @@ defmodule MixWorkspaceOps.CLI do
     |> normalize_paths()
   end
 
-  defp default(:mode), do: "local"
+  defp default(:mode), do: "auto"
+  defp default(:source), do: []
   defp default(:mix_state), do: "managed"
   defp default(:state_root), do: default_state_root()
   defp default(_key), do: nil
@@ -306,7 +317,7 @@ defmodule MixWorkspaceOps.CLI do
   defp parse_options(["--" <> option, value | rest], command, accepted, options, positional) do
     with {:ok, key} <- option_key(command, accepted, option),
          false <- String.starts_with?(value, "--") do
-      parse_options(rest, command, accepted, Map.put(options, key, value), positional)
+      parse_options(rest, command, accepted, put_option(options, key, value), positional)
     else
       true -> {:usage_error, "option --#{option} requires a value"}
       {:error, reason} -> {:usage_error, reason}
@@ -318,6 +329,13 @@ defmodule MixWorkspaceOps.CLI do
 
   defp parse_options([argument | rest], command, accepted, options, positional),
     do: parse_options(rest, command, accepted, options, [argument | positional])
+
+  # One `--source` names one dependency, so it is the one option a command may
+  # carry more than once.
+  defp put_option(options, :source, value),
+    do: Map.update(options, :source, [value], &(&1 ++ [value]))
+
+  defp put_option(options, key, value), do: Map.put(options, key, value)
 
   defp normalize_paths({:ok, options, rest}) do
     path_keys = [
@@ -440,10 +458,40 @@ defmodule MixWorkspaceOps.CLI do
 
   defp require_safe_run_command(_command), do: :ok
 
+  defp source_mode("auto"), do: {:ok, :auto}
   defp source_mode("local"), do: {:ok, :local}
   defp source_mode("git"), do: {:ok, :git}
   defp source_mode("hex"), do: {:ok, :hex}
   defp source_mode(mode), do: {:usage_error, "invalid source mode #{inspect(mode)}"}
+
+  defp source_overrides(requested) do
+    Enum.reduce_while(requested, {:ok, %{}}, fn assignment, {:ok, acc} ->
+      case source_override(assignment) do
+        {:ok, application, source} -> {:cont, {:ok, Map.put(acc, application, source)}}
+        {:usage_error, reason} -> {:halt, {:usage_error, reason}}
+      end
+    end)
+  end
+
+  defp source_override(assignment) do
+    case String.split(assignment, "=", parts: 2) do
+      [application, source] when application != "" -> named_source(application, source)
+      _parts -> {:usage_error, "--source expects APP=SOURCE, got #{inspect(assignment)}"}
+    end
+  end
+
+  defp named_source(application, source) do
+    case source_name(source) do
+      {:ok, name} -> {:ok, application, name}
+      :error -> {:usage_error, "invalid source #{inspect(source)}"}
+    end
+  end
+
+  defp source_name("local"), do: {:ok, "local"}
+  defp source_name("git"), do: {:ok, "github"}
+  defp source_name("github"), do: {:ok, "github"}
+  defp source_name("hex"), do: {:ok, "hex"}
+  defp source_name(_source), do: :error
 
   defp mix_state("managed"), do: {:ok, :managed}
   defp mix_state("delegated"), do: {:ok, :delegated}

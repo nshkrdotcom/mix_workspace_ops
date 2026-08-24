@@ -1,12 +1,49 @@
 defmodule MixWorkspaceOps.Overlay do
-  @moduledoc "Content-addressed, operator-owned source overlays activated only in child processes."
+  @moduledoc """
+  Content-addressed, operator-owned source overlays activated only in child
+  processes.
 
-  alias MixWorkspaceOps.{Bootstrap, Git, Graph, Registry, Runtime}
+  An overlay carries one row per application, and each row states the source
+  that application resolved to and everything the seam needs to emit its Mix
+  dependency tuple. `mix_workspace_ops.overlay/v2` replaces the whole-run
+  `local | git` mode of v1: resolution is per dependency, so one mode for the
+  whole run could not describe it. The header keeps a `mode` line for the run
+  mode the operator *requested* — `auto` where they requested nothing — and
+  adds a `publish` line, because whether an overlay was decided for publication
+  changes what the seam may do with it.
+
+      app \\t local  \\t <absolute path>  \\t <revision> \\t <source digest> \\t <opts>
+      app \\t github \\t <owner/repo>     \\t <branch|ref|tag|-> \\t <value|-> \\t <subdir|-> \\t <opts>
+      app \\t hex    \\t <requirement>    \\t <opts>
+
+  `<opts>` is `-` when there are none, and otherwise `key=value` pairs joined
+  by `,`, keys in alphabetical order. A boolean value is `true` or `false`; the
+  value of `only` or `targets` is its names joined by `|`. Keys convert through
+  a fixed table on the way back, and the names under `only` and `targets`
+  convert to atoms under the bound `MixWorkspaceOps.Registry.Source` holds them
+  to, so no overlay can mint an unbounded number of atoms in a process that
+  reads one.
+  """
+
+  alias MixWorkspaceOps.{Bootstrap, Git, Graph, Registry, Resolution, Runtime}
 
   @env "MIX_WORKSPACE_OPS_OVERLAY"
   @context_env "MIX_WORKSPACE_OPS_CONTEXT_DIGEST"
-  @header "mix_workspace_ops.overlay/v1"
+  @header "mix_workspace_ops.overlay/v2"
+  @context_header "mix_workspace_ops.context/v2"
   @maximum_bytes 16 * 1024 * 1024
+  @modes ~w(auto local git hex)
+  @absent "-"
+
+  @option_keys %{
+    "only" => :only,
+    "optional" => :optional,
+    "override" => :override,
+    "runtime" => :runtime,
+    "targets" => :targets
+  }
+  @list_options ~w(only targets)
+  @revision_keys ~w(branch ref tag)
 
   @type activation :: %{
           path: String.t() | nil,
@@ -21,34 +58,33 @@ defmodule MixWorkspaceOps.Overlay do
   @spec context_environment_variable() :: String.t()
   def context_environment_variable, do: @context_env
 
+  @doc "The schema identifier this version writes."
+  @spec schema() :: String.t()
+  def schema, do: @header
+
   @spec activate(Registry.t(), String.t() | atom(), keyword()) ::
           {:ok, activation()} | {:error, term()}
   def activate(registry, target, opts \\ []) do
-    mode = Keyword.get(opts, :mode, :local)
+    mode = Keyword.get(opts, :mode, :auto)
     mix_state = Keyword.get(opts, :mix_state, :managed)
     state_root = Keyword.get_lazy(opts, :state_root, &default_state_root/0)
 
-    with {:ok, resolution} <- Graph.resolve(registry, target),
-         {:ok, attributed} <- source_rows(registry, resolution.projects, mode),
+    with :ok <- known_mode(mode),
+         {:ok, resolution} <- Graph.resolve(registry, target),
+         {:ok, decided} <- decide(registry, target, resolution, mode, opts),
+         {:ok, attributed} <- source_rows(decided),
          rows <- Enum.map(attributed, &elem(&1, 1)),
+         :ok <- printable(rows),
          target_project <- Registry.project!(registry, target),
          target_root <- Registry.project_root(registry, target_project),
          {:ok, lock_bytes} <- source_lock(target_root),
          context <-
-           context_contents(
-             registry,
-             to_string(target),
-             mode,
-             resolution,
-             attributed,
-             target_project,
-             lock_bytes
-           ),
+           context_contents(registry, decided, target_project, attributed, lock_bytes),
          context_digest <- digest(context),
          contents <-
            contents(
              registry,
-             to_string(target),
+             decided,
              mode,
              resolution,
              rows,
@@ -57,7 +93,7 @@ defmodule MixWorkspaceOps.Overlay do
              context_digest
            ),
          overlay_digest <- digest(contents),
-         {:ok, path} <- materialize(state_root, overlay_digest, contents, mode),
+         {:ok, path} <- materialize(state_root, overlay_digest, contents),
          {:ok, bootstrap_path} <- Bootstrap.materialize(state_root),
          {:ok, runtime} <- prepare_runtime(mix_state, state_root, context_digest, lock_bytes) do
       env =
@@ -76,6 +112,7 @@ defmodule MixWorkspaceOps.Overlay do
            schema: @header,
            target: to_string(target),
            mode: mode,
+           publish: decided.publish?,
            registry_digest: registry.digest,
            graph_digest: resolution.digest,
            overlay_digest: overlay_digest,
@@ -87,6 +124,7 @@ defmodule MixWorkspaceOps.Overlay do
            edges: resolution.edges,
            external_dependencies: resolution.external_dependencies,
            known_unselected: resolution.known_unselected,
+           decisions: Enum.map(decided.decisions, &reported_decision/1),
            rows: rows
          }
        }}
@@ -124,35 +162,106 @@ defmodule MixWorkspaceOps.Overlay do
     end
   end
 
-  defp source_rows(registry, projects, :local) do
-    projects
-    |> Enum.reject(&is_nil(&1.app))
-    |> Enum.map(fn project ->
-      path = Registry.project_root(registry, project)
+  @doc "Encodes a dependency's Mix options into one overlay field."
+  @spec encode_options(keyword()) :: String.t()
+  def encode_options([]), do: @absent
 
-      if File.regular?(Path.join(path, "mix.exs")) do
-        {:ok, {project, [project.app, "path", path, Git.head!(path), Git.source_digest(path)]}}
-      else
-        {:error, {:missing_mix_project, project.id, path}}
+  def encode_options(opts) do
+    opts
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map_join(",", fn {key, value} -> "#{key}=#{encode_option_value(value)}" end)
+  end
+
+  @doc "Reads one overlay options field back into a keyword list."
+  @spec decode_options(String.t()) :: {:ok, keyword()} | {:error, term()}
+  def decode_options(@absent), do: {:ok, []}
+
+  def decode_options(field) do
+    field
+    |> String.split(",")
+    |> Enum.reduce_while({:ok, []}, fn pair, {:ok, acc} ->
+      case decode_option(pair) do
+        {:ok, option} -> {:cont, {:ok, [option | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
+    |> case do
+      {:ok, options} -> {:ok, options |> Enum.reverse() |> Enum.sort_by(&elem(&1, 0))}
+      error -> error
+    end
+  end
+
+  defp known_mode(mode) when is_atom(mode) do
+    if to_string(mode) in @modes, do: :ok, else: {:error, {:unsupported_source_mode, mode}}
+  end
+
+  defp known_mode(mode), do: {:error, {:unsupported_source_mode, mode}}
+
+  defp decide(registry, target, resolution, mode, opts) do
+    Resolution.resolve(registry, target,
+      closure: resolution,
+      mode: resolution_mode(mode),
+      sources: Keyword.get(opts, :sources, %{}),
+      publish?: Keyword.get(opts, :publish?, false)
+    )
+  end
+
+  # `git` is what the command line calls the source the catalog calls `github`.
+  defp resolution_mode(:auto), do: nil
+  defp resolution_mode(:git), do: "github"
+  defp resolution_mode(mode), do: to_string(mode)
+
+  defp source_rows(decided) do
+    decided.decisions
+    |> Enum.map(&source_row/1)
     |> collect_rows()
   end
 
-  defp source_rows(registry, projects, :git) do
-    projects
-    |> Enum.reject(&is_nil(&1.app))
-    |> Enum.map(fn project ->
-      repository = Registry.repository!(registry, project.repository)
-      root = Registry.repository_root(registry, repository.id)
-      url = "https://github.com/#{repository.github}.git"
-      {:ok, {project, [project.app, "git", url, Git.head!(root), project.path]}}
+  defp source_row(%{source: "local", location: path} = decision) do
+    if File.regular?(Path.join(path, "mix.exs")) do
+      {:ok,
+       {decision,
+        [
+          decision.application,
+          "local",
+          path,
+          Git.head!(path),
+          Git.source_digest(path),
+          encode_options(decision.opts)
+        ]}}
+    else
+      {:error, {:missing_mix_project, decision.application, path}}
+    end
+  end
+
+  defp source_row(%{source: "github", location: coordinates} = decision) do
+    {kind, value} = revision(coordinates)
+
+    {:ok,
+     {decision,
+      [
+        decision.application,
+        "github",
+        coordinates.repo,
+        kind,
+        value,
+        coordinates.subdir || @absent,
+        encode_options(decision.opts)
+      ]}}
+  end
+
+  defp source_row(%{source: "hex", location: requirement} = decision) do
+    {:ok, {decision, [decision.application, "hex", requirement, encode_options(decision.opts)]}}
+  end
+
+  defp revision(coordinates) do
+    Enum.find_value(@revision_keys, {@absent, @absent}, fn key ->
+      case Map.get(coordinates, String.to_existing_atom(key)) do
+        nil -> nil
+        value -> {key, value}
+      end
     end)
-    |> collect_rows()
   end
-
-  defp source_rows(_registry, _projects, :hex), do: {:ok, []}
-  defp source_rows(_registry, _projects, mode), do: {:error, {:unsupported_source_mode, mode}}
 
   defp collect_rows(rows) do
     Enum.reduce_while(rows, {:ok, []}, fn
@@ -165,9 +274,22 @@ defmodule MixWorkspaceOps.Overlay do
     end)
   end
 
+  # Rows are tab-separated lines, so a field carrying a tab or a newline would
+  # produce an overlay that parses back into something other than what was
+  # written.
+  defp printable(rows) do
+    rows
+    |> List.flatten()
+    |> Enum.find(&String.contains?(&1, ["\t", "\n"]))
+    |> case do
+      nil -> :ok
+      field -> {:error, {:unprintable_overlay_field, field}}
+    end
+  end
+
   defp contents(
          registry,
-         target,
+         decided,
          mode,
          resolution,
          rows,
@@ -180,8 +302,9 @@ defmodule MixWorkspaceOps.Overlay do
       "registry_digest\t#{registry.digest}",
       "graph_digest\t#{resolution.digest}",
       "context_digest\t#{context_digest}",
-      "target\t#{target}",
+      "target\t#{decided.target}",
       "mode\t#{mode}",
+      "publish\t#{decided.publish?}",
       "target_head\t#{Git.head!(target_root)}",
       "target_source_digest\t#{Git.source_digest(target_root)}",
       "lock_digest\t#{digest(lock_bytes)}",
@@ -193,22 +316,14 @@ defmodule MixWorkspaceOps.Overlay do
     |> Kernel.<>("\n")
   end
 
-  defp context_contents(
-         registry,
-         target,
-         mode,
-         resolution,
-         attributed,
-         target_project,
-         lock_bytes
-       ) do
+  defp context_contents(registry, decided, target_project, attributed, lock_bytes) do
     target_repository = Registry.repository!(registry, target_project.repository)
 
     metadata = [
-      "mix_workspace_ops.context/v1",
-      "graph_digest\t#{resolution.digest}",
-      "target\t#{target}",
-      "mode\t#{mode}",
+      @context_header,
+      "graph_digest\t#{decided.closure.digest}",
+      "target\t#{decided.target}",
+      "publish\t#{decided.publish?}",
       "target_repository\t#{target_repository.github}",
       "target_project_path\t#{target_project.path}",
       "lock_digest\t#{digest(lock_bytes)}",
@@ -216,8 +331,8 @@ defmodule MixWorkspaceOps.Overlay do
     ]
 
     sources =
-      Enum.map(attributed, fn {project, row} ->
-        semantic_source(registry, project, row, target_project.repository)
+      Enum.map(attributed, fn {decision, row} ->
+        semantic_source(registry, decision, row, target_project.repository)
       end)
 
     (metadata ++ sources)
@@ -225,39 +340,76 @@ defmodule MixWorkspaceOps.Overlay do
     |> Kernel.<>("\n")
   end
 
-  defp semantic_source(registry, project, [app, kind | _rest], target_repository)
-       when project.repository == target_repository do
-    repository = Registry.repository!(registry, project.repository)
-    Enum.join(["source", app, kind, repository.github, project.path, "target-repository"], "\t")
+  # A local source in the target's own repository is identified by where it
+  # sits in that repository, never by its revision: the target's own dirt is
+  # already covered by the overlay digest, and folding it in here would make
+  # the context digest change for every uncommitted edit to the thing being
+  # built.
+  defp semantic_source(
+         registry,
+         decision,
+         [app, "local", _path, revision, source_digest, opts],
+         target_repository
+       ) do
+    {repository, project_path} = provider_coordinates(registry, decision)
+
+    if repository == target_repository do
+      join(["source", app, "local", github(registry, repository), project_path, opts])
+    else
+      join([
+        "source",
+        app,
+        "local",
+        github(registry, repository),
+        project_path,
+        revision,
+        source_digest,
+        opts
+      ])
+    end
   end
 
   defp semantic_source(
-         registry,
-         project,
-         [app, "path", _path, revision, source_digest],
-         _target_repository
-       ) do
-    repository = Registry.repository!(registry, project.repository)
+         _registry,
+         _decision,
+         [app, "github", repo, kind, value, subdir, opts],
+         _t
+       ),
+       do: join(["source", app, "github", repo, kind, value, subdir, opts])
 
-    Enum.join(
-      ["source", app, "path", repository.github, project.path, revision, source_digest],
-      "\t"
-    )
+  defp semantic_source(_registry, _decision, [app, "hex", requirement, opts], _target_repository),
+    do: join(["source", app, "hex", requirement, opts])
+
+  defp provider_coordinates(_registry, %{provider_project_id: nil}), do: {nil, "?"}
+
+  defp provider_coordinates(registry, %{provider_project_id: project_id}) do
+    project = Registry.project!(registry, project_id)
+    {project.repository, project.path}
   end
 
-  defp semantic_source(
-         registry,
-         project,
-         [app, "git", _url, revision, subdir],
-         _target_repository
-       ) do
-    repository = Registry.repository!(registry, project.repository)
-    Enum.join(["source", app, "git", repository.github, project.path, revision, subdir], "\t")
+  defp github(_registry, nil), do: "?"
+  defp github(registry, repository_id), do: Registry.repository!(registry, repository_id).github
+
+  defp join(parts), do: Enum.join(parts, "\t")
+
+  defp reported_decision(decision) do
+    %{
+      application: decision.application,
+      source: decision.source,
+      reason: decision.reason,
+      provider: decision.provider_project_id,
+      location: reported_location(decision),
+      declared_by: decision.declared_by
+    }
   end
 
-  defp materialize(_state_root, _digest, _contents, :hex), do: {:ok, nil}
+  defp reported_location(%{source: "github", location: coordinates}) do
+    coordinates |> Map.reject(fn {_key, value} -> is_nil(value) end) |> Map.new()
+  end
 
-  defp materialize(state_root, digest, contents, _mode) do
+  defp reported_location(decision), do: decision.location
+
+  defp materialize(state_root, digest, contents) do
     directory = state_root |> Path.expand() |> Path.join("overlays")
     path = Path.join(directory, digest <> ".tsv")
     temporary = path <> ".tmp.#{System.unique_integer([:positive])}"
@@ -294,12 +446,13 @@ defmodule MixWorkspaceOps.Overlay do
         "context_digest\t" <> context_digest,
         "target\t" <> target,
         "mode\t" <> mode,
+        "publish\t" <> publish,
         "target_head\t" <> target_head,
         "target_source_digest\t" <> target_source_digest,
         "lock_digest\t" <> lock_digest,
         "toolchain\t" <> toolchain | rows
       ]
-      when mode in ["local", "git"] ->
+      when mode in @modes and publish in ["true", "false"] ->
         with {:ok, sources} <- parse_rows(rows) do
           {:ok,
            %{
@@ -309,6 +462,7 @@ defmodule MixWorkspaceOps.Overlay do
              context_digest: context_digest,
              target: target,
              mode: mode,
+             publish: publish == "true",
              target_head: target_head,
              target_source_digest: target_source_digest,
              lock_digest: lock_digest,
@@ -340,14 +494,90 @@ defmodule MixWorkspaceOps.Overlay do
 
   defp parse_row(row) do
     case String.split(row, "\t") do
-      [app, "path", path, revision, source_digest] ->
-        {:ok, {app, %{kind: :path, path: path, revision: revision, source_digest: source_digest}}}
+      [app, "local", path, revision, source_digest, opts] ->
+        with {:ok, options} <- decode_options(opts) do
+          {:ok,
+           {app,
+            %{
+              kind: :local,
+              path: path,
+              revision: revision,
+              source_digest: source_digest,
+              opts: options
+            }}}
+        end
 
-      [app, "git", url, revision, subdir] ->
-        {:ok, {app, %{kind: :git, url: url, revision: revision, subdir: subdir}}}
+      [app, "github", repo, kind, value, subdir, opts] ->
+        with :ok <- known_revision(kind, value),
+             {:ok, options} <- decode_options(opts) do
+          {:ok,
+           {app,
+            %{
+              kind: :github,
+              repo: repo,
+              revision_kind: kind,
+              revision: value,
+              subdir: absent(subdir),
+              opts: options
+            }}}
+        end
+
+      [app, "hex", requirement, opts] ->
+        with {:ok, options} <- decode_options(opts) do
+          {:ok, {app, %{kind: :hex, requirement: requirement, opts: options}}}
+        end
 
       _parts ->
         {:error, {:invalid_overlay_row, row}}
+    end
+  end
+
+  defp known_revision(@absent, @absent), do: :ok
+  defp known_revision(kind, value) when kind in @revision_keys and value != @absent, do: :ok
+  defp known_revision(kind, value), do: {:error, {:invalid_overlay_revision, kind, value}}
+
+  defp absent(@absent), do: nil
+  defp absent(value), do: value
+
+  defp encode_option_value(value) when is_boolean(value), do: to_string(value)
+  defp encode_option_value(values) when is_list(values), do: Enum.join(values, "|")
+
+  defp decode_option(pair) do
+    case String.split(pair, "=", parts: 2) do
+      [key, value] -> decode_option(key, value)
+      _parts -> {:error, {:invalid_overlay_option, pair}}
+    end
+  end
+
+  defp decode_option(key, value) do
+    case Map.fetch(@option_keys, key) do
+      {:ok, option} when key in @list_options -> decode_list_option(option, value)
+      {:ok, option} -> decode_boolean_option(option, value)
+      :error -> {:error, {:unknown_overlay_option, key}}
+    end
+  end
+
+  defp decode_boolean_option(option, "true"), do: {:ok, {option, true}}
+  defp decode_boolean_option(option, "false"), do: {:ok, {option, false}}
+
+  defp decode_boolean_option(option, value),
+    do: {:error, {:invalid_overlay_option, option, value}}
+
+  defp decode_list_option(option, value) do
+    names = String.split(value, "|")
+
+    cond do
+      names == [] or Enum.any?(names, &(&1 == "")) ->
+        {:error, {:invalid_overlay_option, option, value}}
+
+      length(names) > Registry.Source.maximum_option_values() ->
+        {:error, {:overlay_option_too_long, option}}
+
+      Enum.any?(names, &(byte_size(&1) > Registry.Source.maximum_option_value_bytes())) ->
+        {:error, {:overlay_option_value_too_long, option}}
+
+      true ->
+        {:ok, {option, Enum.map(names, &String.to_atom/1)}}
     end
   end
 
