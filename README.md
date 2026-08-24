@@ -139,6 +139,10 @@ verified against its Git origin and Git common directory.
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \
   --project example.consumer
+./mix_workspace_ops seam \
+  --registry /path/to/registry.json \
+  --checkout-root /path/to/checkouts \
+  --project example.consumer
 ./mix_workspace_ops run \
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \

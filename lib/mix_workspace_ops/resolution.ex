@@ -275,6 +275,79 @@ defmodule MixWorkspaceOps.Resolution do
   @spec sources(report()) :: [source_entry()]
   def sources(report), do: Enum.map(report.decisions, &source_entry/1)
 
+  @doc """
+  The `mix.exs` seam call for each of a project's managed dependencies.
+
+  **The committed default is the tuple publish resolution would produce, options
+  included.** That is what a committed default is for: a fresh clone and a
+  consumer of the published package both have to resolve without this tool, from
+  Hex, or from git where there is no Hex release — which is exactly what publish
+  resolution decides. Writing the line by hand leaves two authorities for one
+  requirement with nothing comparing them; deriving it makes them checkable
+  against each other.
+
+  `only`, `optional`, `runtime` and `targets` decide whether a dependency exists
+  at the call site, so they are emitted as the call's own options. `override` is
+  a resolution fact and stays with the catalog.
+
+  A publish order that resolves to a local checkout has no committed default —
+  a path cannot be published — and is refused by name.
+  """
+  @spec seam_lines(report()) :: {:ok, [String.t()]} | {:error, term()}
+  def seam_lines(report) do
+    Enum.reduce_while(report.decisions, {:ok, []}, fn decision, {:ok, acc} ->
+      case committed_default(decision) do
+        {:ok, default} -> {:cont, {:ok, [seam_line(decision, default) | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, lines} -> {:ok, Enum.reverse(lines)}
+      error -> error
+    end
+  end
+
+  @doc "The seam lines as the `deps/0` an operator pastes into a `mix.exs`."
+  @spec format_seam([String.t()]) :: String.t()
+  def format_seam([]), do: "defp deps, do: []"
+
+  def format_seam(lines) when is_list(lines) do
+    Enum.join(["defp deps do", "  [", "    " <> Enum.join(lines, ",\n    "), "  ]", "end"], "\n")
+  end
+
+  defp seam_line(decision, default) do
+    case call_site_options(decision.opts) do
+      [] -> "workspace_dep(:#{decision.application}, #{default})"
+      opts -> "workspace_dep(:#{decision.application}, #{default}, #{render_options(opts)})"
+    end
+  end
+
+  defp committed_default(%{source: @hex, location: requirement}), do: {:ok, inspect(requirement)}
+
+  defp committed_default(%{source: @github, location: coordinates}),
+    do: {:ok, inspect(github_coordinates(coordinates))}
+
+  defp committed_default(%{source: @local, application: app}),
+    do: {:error, {:local_committed_default, app}}
+
+  defp github_coordinates(coordinates) do
+    revision =
+      Enum.find_value([:branch, :ref, :tag], [], fn key ->
+        case Map.get(coordinates, key) do
+          nil -> nil
+          value -> [{key, value}]
+        end
+      end)
+
+    subdir = if coordinates.subdir, do: [subdir: coordinates.subdir], else: []
+    [github: coordinates.repo] ++ revision ++ subdir
+  end
+
+  defp call_site_options(opts), do: Keyword.take(opts, [:only, :optional, :runtime, :targets])
+
+  defp render_options(opts),
+    do: Enum.map_join(opts, ", ", fn {key, value} -> "#{key}: #{inspect(value)}" end)
+
   @doc "The one-screen form of `sources/1`."
   @spec format_sources([source_entry()]) :: String.t()
   def format_sources([]), do: "dependency sources: (no managed dependencies)"

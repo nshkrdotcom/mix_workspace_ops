@@ -67,6 +67,7 @@ defmodule MixWorkspaceOps.CLITest do
              ["registry", "workspace"],
              ["release", "publish"],
              ["run"],
+             ["seam"],
              ["sources"]
            ]
 
@@ -390,6 +391,42 @@ defmodule MixWorkspaceOps.CLITest do
     assert report.sets.catalogued.repositories == 2
   end
 
+  # The committed default and the catalog both name a source coordinate and a
+  # published requirement, and nothing compared them. The rule is that the
+  # committed default is the tuple publish resolution produces, and this is what
+  # makes the rule mechanical instead of something to remember.
+  test "seam prints the call sites publish resolution implies", context do
+    %{root: root, catalog: catalog} = seam_workspace!(context)
+
+    assert {:ok, report} =
+             CLI.dispatch([
+               "seam",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root
+             ])
+
+    assert report.schema == "mix_workspace_ops.seam/v1"
+
+    assert report.lines == [
+             ~s|workspace_dep(:core, "~> 1.0", only: [:dev, :test], runtime: false)|,
+             ~s|workspace_dep(:third_party, [github: "example-org/third-party", | <>
+               ~s|branch: "main", subdir: "core"])|
+           ]
+
+    assert String.split(report.report, "\n") == [
+             "defp deps do",
+             "  [",
+             "    " <> Enum.at(report.lines, 0) <> ",",
+             "    " <> Enum.at(report.lines, 1),
+             "  ]",
+             "end"
+           ]
+  end
+
   test "sources refuses a publish flag that is not a boolean", context do
     %{root: root, catalog: catalog} = workspace!(context)
 
@@ -675,6 +712,45 @@ defmodule MixWorkspaceOps.CLITest do
       binding: binding,
       state_root: Path.join(root, "state")
     }
+  end
+
+  defp seam_workspace!(context) do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "core"))
+
+    initialize_repository!(
+      Path.join(root, "alpha"),
+      ~s([{:core, path: "../core"}, {:third_party, "~> 1.0"}])
+    )
+
+    catalog =
+      write_catalog!(
+        root,
+        [
+          catalog_repository("core", projects: [catalog_project("core")]),
+          catalog_repository("alpha",
+            projects: [catalog_project("alpha")],
+            dependency_sources: %{
+              "core" => %{
+                "hex" => "~> 1.0",
+                "opts" => %{"only" => ["dev", "test"], "runtime" => false, "override" => true}
+              },
+              "third_party" => %{
+                "github" => %{
+                  "repo" => "example-org/third-party",
+                  "branch" => "main",
+                  "subdir" => "core"
+                },
+                "order" => ["github"],
+                "publish_order" => ["github"]
+              }
+            }
+          )
+        ],
+        name: "seam_registry.json"
+      )
+
+    %{root: root, catalog: catalog}
   end
 
   defp sibling_workspace!(context) do

@@ -33,6 +33,7 @@ defmodule MixWorkspaceOps.CLI do
       [--mode auto|local|git|hex] [--source APP=SOURCE]
     sources --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
       [--mode auto|local|git|hex] [--source APP=SOURCE] [--publish true|false]
+    seam --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
     run --project ID [--mode auto|local|git|hex] [--source APP=SOURCE] \
       --mix-state managed|delegated \
       --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
@@ -65,6 +66,7 @@ defmodule MixWorkspaceOps.CLI do
       :source,
       :publish
     ],
+    ["seam"] => [:project, :registry, :checkout_root, :view, :binding],
     ["run"] => [
       :project,
       :mode,
@@ -277,6 +279,25 @@ defmodule MixWorkspaceOps.CLI do
          publish: decided.publish?,
          sources: entries,
          report: Resolution.format_sources(entries)
+       }}
+    end
+  end
+
+  def dispatch(["seam" | args]) do
+    with {:ok, options, []} <- options(["seam"], args),
+         :ok <- require_option(options, :project),
+         {:ok, registry} <- load_bound_registry(options),
+         :ok <- ensure_project_in_view(registry, options),
+         {:ok, decided} <- Resolution.resolve(registry, options.project, publish?: true),
+         {:ok, lines} <- Resolution.seam_lines(decided) do
+      {:ok,
+       %{
+         schema: "mix_workspace_ops.seam/v1",
+         target: options.project,
+         registry_digest: registry.digest,
+         selection_digest: Registry.selection_digest(registry),
+         lines: lines,
+         report: Resolution.format_seam(lines)
        }}
     end
   end

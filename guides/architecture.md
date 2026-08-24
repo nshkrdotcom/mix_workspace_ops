@@ -99,6 +99,39 @@ The emitted tuple is `{app, [path: ...]}`, `{app, [github: ...]}`, or
 call-site options winning over them. A path or git dependency carries no
 requirement, because Mix takes none there.
 
+### The committed default is what publish resolution produces
+
+With an overlay the published requirement comes from the catalog; with none it
+comes from the committed default in `mix.exs`. Both are correct on their own
+terms, and nothing was reconciling them, so one application could carry two
+published requirements that disagree.
+
+> **The committed default is the tuple publish resolution would produce, options
+> included.**
+
+That is what a committed default is *for*. A fresh clone and a consumer of the
+published package both have to resolve without this tool — from Hex, or from git
+where there is no Hex release — and that is exactly the question publish
+resolution answers. Stating the rule makes the two authorities checkable against
+each other instead of merely coexisting.
+
+`mwo seam --project ID --registry PATH --checkout-root PATH` makes it
+mechanical. It resolves the project in publish mode and prints the `deps/0` the
+seam implies, one `workspace_dep/3` call per managed dependency, ready to paste:
+
+```bash
+./mix_workspace_ops seam \
+  --registry /path/to/registry.json \
+  --checkout-root /path/to/checkouts \
+  --project example.consumer
+```
+
+`only:`, `optional:`, `runtime:` and `targets:` are printed as the call's own
+options, because they say whether the dependency exists at that call site.
+`override:` is not: it is a resolution fact and belongs to the catalog. A
+declaration whose publish order resolves to a local checkout has no committed
+default — a path cannot be published — and is refused by name.
+
 Publication is fail-closed at the seam. An overlay decided for ordinary
 development names a developer's checkouts, so a publishing task running under
 one is refused rather than allowed to put a local path into a released
