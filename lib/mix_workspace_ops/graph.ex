@@ -53,6 +53,7 @@ defmodule MixWorkspaceOps.Graph do
       registry
       |> Registry.repository!(project.repository)
       |> Map.fetch!(:projects)
+      |> Enum.filter(&Registry.selected?(registry, &1.id))
       |> Enum.sort_by(& &1.id)
     else
       [project]

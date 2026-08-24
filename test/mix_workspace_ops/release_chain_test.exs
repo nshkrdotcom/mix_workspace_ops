@@ -182,7 +182,7 @@ defmodule MixWorkspaceOps.ReleaseChainTest do
         )
       ])
 
-    selected = Registry.restrict(registry, [Registry.project!(registry, "plane.core")])
+    selected = Registry.select(registry, [Registry.project!(registry, "plane.core")])
 
     assert ReleaseChain.packages(selected) == ["plane_core", "plane_rpc"]
 

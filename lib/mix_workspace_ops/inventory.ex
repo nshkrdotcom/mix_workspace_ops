@@ -46,9 +46,8 @@ defmodule MixWorkspaceOps.Inventory do
 
   @spec scan_registry(Registry.t()) :: {:ok, [row()]} | {:error, term()}
   def scan_registry(%Registry{} = registry) do
-    registry.repositories
-    |> Map.values()
-    |> Enum.sort_by(& &1.id)
+    registry
+    |> Registry.selected_repositories()
     |> Enum.reduce_while({:ok, []}, &scan_bound_repository(registry, &1, &2))
     |> then(fn
       {:ok, rows} -> {:ok, Enum.sort_by(rows, &{&1.repository_root, &1.helper_path})}

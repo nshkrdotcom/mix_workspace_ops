@@ -50,11 +50,10 @@ defmodule MixWorkspaceOps.Registry.Workspace do
 
   @doc "Every repository declaring a workspace, with its derived members."
   @spec workspaces(Registry.t()) :: [{Registry.repository(), [Registry.project()]}]
-  def workspaces(%Registry{repositories: repositories}) do
-    repositories
-    |> Map.values()
+  def workspaces(%Registry{} = registry) do
+    registry
+    |> Registry.selected_repositories()
     |> Enum.filter(& &1.workspace)
-    |> Enum.sort_by(& &1.id)
     |> Enum.map(&{&1, derive(&1)})
   end
 

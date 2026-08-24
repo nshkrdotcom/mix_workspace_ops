@@ -21,9 +21,9 @@ defmodule MixWorkspaceOps.Registry.ReleaseChain do
 
   @doc "The declared release train: every package with a `release_chain` entry."
   @spec packages(Registry.t()) :: [String.t()]
-  def packages(%Registry{repositories: repositories}) do
-    repositories
-    |> Map.values()
+  def packages(%Registry{} = registry) do
+    registry
+    |> Registry.selected_repositories()
     |> Enum.flat_map(&Map.keys(&1.release_chain))
     |> Enum.uniq()
     |> Enum.sort()

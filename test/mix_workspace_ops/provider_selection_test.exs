@@ -135,7 +135,7 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
     view = write_catalog_view!(root, "consumer", %{"repository_ids" => ["alpha"]})
     {:ok, view} = View.load(view)
     {:ok, projects} = View.select(registry, view)
-    selected = Registry.restrict(registry, projects)
+    selected = Registry.select(registry, projects)
 
     assert {:ok, resolution} =
              Graph.resolve(selected, "alpha", dependency_reader: shared_reader())
@@ -158,6 +158,86 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
     assert {:ok, resolution} = Graph.resolve(registry, "alpha", dependency_reader: reader)
     assert resolution.external_dependencies == [{"alpha", "telemetry"}]
     assert resolution.known_unselected == []
+  end
+
+  # A pruned catalog could change which project an application resolved to,
+  # because the current schema permits several projects to provide one and
+  # pruning removes candidates from the index the resolver reads. Selection
+  # sits beside the catalog instead, and this walks every subset of the
+  # fixture's projects to show the only thing a selection can change is
+  # whether a provider is reachable at all.
+  test "a selection never moves an application to a different provider", context do
+    root = temporary_directory!(context)
+
+    registry =
+      root
+      |> two_providers(declaration: %{"hex" => "~> 0.1.0", "provider" => "vendored.shared"})
+      |> Registry.load!()
+
+    project_ids = registry.projects |> Map.keys() |> Enum.sort()
+
+    for subset <- subsets(project_ids) do
+      selected = Registry.select(registry, Enum.map(subset, &Registry.project!(registry, &1)))
+
+      for app <- Map.keys(registry.applications),
+          provider <- [nil | Enum.map(Registry.providers(registry, app), & &1.id)] do
+        catalogued = Registry.resolve_dependency(registry, app, provider)
+        chosen = Registry.resolve_dependency(selected, app, provider)
+
+        assert preserved?(catalogued, chosen, subset),
+               "#{app} via #{inspect(provider)} moved under selection #{inspect(subset)}: " <>
+                 "#{inspect(catalogued)} -> #{inspect(chosen)}"
+      end
+    end
+  end
+
+  test "a selection that removes the named provider says so rather than choosing another",
+       context do
+    root = temporary_directory!(context)
+
+    registry =
+      root
+      |> two_providers(declaration: %{"hex" => "~> 0.1.0", "provider" => "vendored.shared"})
+      |> Registry.load!()
+
+    assert {:ok, %{id: "vendored.shared"}} =
+             Registry.resolve_dependency(registry, "shared", "vendored.shared")
+
+    without_vendored =
+      Registry.select(registry, [
+        Registry.project!(registry, "alpha"),
+        Registry.project!(registry, "upstream.shared")
+      ])
+
+    assert {:error, {:unknown_provider, "shared", "vendored.shared", ["upstream.shared"]}} =
+             Registry.resolve_dependency(without_vendored, "shared", "vendored.shared")
+
+    without_either = Registry.select(registry, [Registry.project!(registry, "alpha")])
+
+    assert {:known_unselected, ["upstream.shared", "vendored.shared"]} =
+             Registry.resolve_dependency(without_either, "shared", "vendored.shared")
+
+    assert Registry.unselected_application_ids(without_either) == ["shared"]
+  end
+
+  # Where the catalog resolves an application to a project the selection keeps,
+  # the selection must resolve it to the same project. Where the selection
+  # removes that project, it must not resolve to a different one. A catalogued
+  # resolution that was already an error or an ambiguity is the one case a
+  # selection may legitimately change, by removing one of the candidates.
+  defp preserved?({:ok, project}, chosen, subset) do
+    if project.id in subset,
+      do: chosen == {:ok, project},
+      else: chosen != {:ok, project}
+  end
+
+  defp preserved?(_catalogued, _chosen, _subset), do: true
+
+  defp subsets([]), do: [[]]
+
+  defp subsets([head | tail]) do
+    rest = subsets(tail)
+    rest ++ Enum.map(rest, &[head | &1])
   end
 
   defp bound_two_providers(_context, root, declaration) do

@@ -121,9 +121,8 @@ defmodule MixWorkspaceOps.Binding do
     catalogued = catalogued_identities(registry)
     empty = %{bound: %{}, absent: %{}}
 
-    registry.repositories
-    |> Map.values()
-    |> Enum.sort_by(& &1.id)
+    registry
+    |> Registry.selected_repositories()
     |> Enum.reduce_while({:ok, empty}, fn repository, {:ok, report} ->
       path = Map.get(overrides, repository.id, conventional_path(checkout_root, repository))
 

@@ -5,6 +5,7 @@ defmodule MixWorkspaceOps.Doctor do
   A repository with no checkout is reported, not fatal. Absence is a fact about
   one operator's disk, and a report that stops at the first repository someone
   has not cloned tells that operator nothing about the ones they have.
+
   """
 
   alias MixWorkspaceOps.{Binding, Git, Project, Registry}
@@ -14,9 +15,8 @@ defmodule MixWorkspaceOps.Doctor do
     catalogued = Binding.catalogued_identities(registry)
 
     repositories =
-      registry.repositories
-      |> Map.values()
-      |> Enum.sort_by(& &1.id)
+      registry
+      |> Registry.selected_repositories()
       |> Enum.map(&inspect_repository(registry, &1, catalogued))
 
     checks = Enum.flat_map(repositories, & &1.checks)

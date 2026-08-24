@@ -21,13 +21,16 @@ defmodule MixWorkspaceOps.Registry.Contract do
   """
   @spec index_applications([map()]) :: %{String.t() => [map()]}
   def index_applications(repositories) do
-    for repository <- repositories,
-        project <- repository.projects,
-        app <- project.provides,
-        reduce: %{} do
+    repositories |> Enum.flat_map(& &1.projects) |> index_projects()
+  end
+
+  @doc "Indexes a list of projects to the applications they provide."
+  @spec index_projects([map()]) :: %{String.t() => [map()]}
+  def index_projects(projects) do
+    for project <- projects, app <- project.provides, reduce: %{} do
       acc -> Map.update(acc, app, [project], &[project | &1])
     end
-    |> Map.new(fn {app, projects} -> {app, Enum.sort_by(projects, & &1.id)} end)
+    |> Map.new(fn {app, matches} -> {app, Enum.sort_by(matches, & &1.id)} end)
   end
 
   @doc "Applies every rule that needs the whole document."

@@ -12,6 +12,19 @@ defmodule MixWorkspaceOps.Registry do
   Two schemas load. `portfolio_registry.registry/v2` is current;
   `mix_workspace_ops.registry/v1` still loads and is normalized onto the same
   records.
+
+  ## Selection sits beside the catalog, not in place of it
+
+  A view narrows what an operation acts on. It does not narrow the catalog:
+  `select/2` records which repositories and projects a view reached and leaves
+  every catalogued record where it was. A pruned catalog would keep the whole
+  document's `path` and `digest` while no longer describing that document, so a
+  receipt naming the digest would describe a catalog that was never used — and
+  because the current schema permits several projects to provide one
+  application, pruning could change which project an application resolves to,
+  silently, with the same digest on the record.
+
+  The selection carries its own digest. The registry keeps the document's.
   """
 
   alias MixWorkspaceOps.Binding
@@ -26,9 +39,9 @@ defmodule MixWorkspaceOps.Registry do
     :repositories,
     :projects,
     :applications,
+    :selection,
     bindings: %{},
-    absent_checkouts: %{},
-    unselected_applications: %{}
+    absent_checkouts: %{}
   ]
 
   @type project :: %{
@@ -56,6 +69,13 @@ defmodule MixWorkspaceOps.Registry do
           dependency_sources: %{String.t() => Source.t()},
           release_chain: %{String.t() => [String.t()]}
         }
+  @type selection :: %{
+          digest: String.t(),
+          repository_ids: [String.t()],
+          project_ids: [String.t()],
+          applications: %{String.t() => [project()]},
+          unselected_applications: %{String.t() => [String.t()]}
+        }
   @type t :: %__MODULE__{
           path: String.t(),
           digest: String.t(),
@@ -63,9 +83,9 @@ defmodule MixWorkspaceOps.Registry do
           repositories: %{String.t() => repository()},
           projects: %{String.t() => project()},
           applications: %{String.t() => [project()]},
+          selection: selection() | nil,
           bindings: %{String.t() => String.t()},
-          absent_checkouts: %{String.t() => String.t()},
-          unselected_applications: %{String.t() => [String.t()]}
+          absent_checkouts: %{String.t() => String.t()}
         }
 
   @doc "The schema identifier this version writes."
@@ -213,8 +233,8 @@ defmodule MixWorkspaceOps.Registry do
   """
   @spec project_for_app(t(), String.t() | atom()) ::
           {:ok, project()} | {:ambiguous, [project()]} | :error
-  def project_for_app(%__MODULE__{applications: applications}, app) do
-    case Map.get(applications, to_string(app), []) do
+  def project_for_app(%__MODULE__{} = registry, app) do
+    case Map.get(selected_applications(registry), to_string(app), []) do
       [project] -> {:ok, project}
       [] -> :error
       several -> {:ambiguous, several}
@@ -224,8 +244,8 @@ defmodule MixWorkspaceOps.Registry do
   @doc "Resolves the provider of `app`, honouring an explicit provider project id."
   @spec provider_for(t(), String.t() | atom(), String.t() | nil) ::
           {:ok, project()} | {:error, term()}
-  def provider_for(%__MODULE__{applications: applications}, app, provider \\ nil) do
-    Contract.resolve_provider(applications, to_string(app), provider)
+  def provider_for(%__MODULE__{} = registry, app, provider \\ nil) do
+    Contract.resolve_provider(selected_applications(registry), to_string(app), provider)
   end
 
   @doc """
@@ -246,10 +266,11 @@ defmodule MixWorkspaceOps.Registry do
           {:ok, project()} | {:known_unselected, [String.t()]} | {:error, term()} | :unknown
   def resolve_dependency(%__MODULE__{} = registry, app, provider \\ nil) do
     app = to_string(app)
+    applications = selected_applications(registry)
 
-    case Map.get(registry.applications, app, []) do
+    case Map.get(applications, app, []) do
       [] -> unselected_providers(registry, app)
-      _candidates -> Contract.resolve_provider(registry.applications, app, provider)
+      _candidates -> Contract.resolve_provider(applications, app, provider)
     end
   end
 
@@ -268,8 +289,8 @@ defmodule MixWorkspaceOps.Registry do
 
   @doc "Every project providing `app`, sorted by project id."
   @spec providers(t(), String.t() | atom()) :: [project()]
-  def providers(%__MODULE__{applications: applications}, app) do
-    Map.get(applications, to_string(app), [])
+  def providers(%__MODULE__{} = registry, app) do
+    Map.get(selected_applications(registry), to_string(app), [])
   end
 
   @doc """
@@ -327,48 +348,124 @@ defmodule MixWorkspaceOps.Registry do
     repositories |> Map.values() |> Enum.flat_map(& &1.groups) |> Enum.uniq() |> Enum.sort()
   end
 
-  @spec restrict(t(), [project()]) :: t()
-  def restrict(%__MODULE__{} = registry, selected_projects) when is_list(selected_projects) do
-    selected_ids = MapSet.new(selected_projects, & &1.id)
+  @doc """
+  Records which catalogued projects a selection reached.
 
-    repositories =
-      registry.repositories
-      |> Map.values()
-      |> Enum.map(fn repository ->
-        %{repository | projects: Enum.filter(repository.projects, &(&1.id in selected_ids))}
-      end)
-      |> Enum.reject(&(&1.projects == []))
-      |> Map.new(&{&1.id, &1})
+  The catalog is untouched. What comes back is the same registry carrying a
+  selection: the repository and project identities the view reached, the
+  application index those projects provide, and the catalogued applications the
+  selection leaves out, so a dependency on one of them can be reported as
+  catalogued-but-unselected instead of being indistinguishable from a Hex
+  package.
+  """
+  @spec select(t(), [project()]) :: t()
+  def select(%__MODULE__{} = registry, selected_projects) when is_list(selected_projects) do
+    projects =
+      selected_projects
+      |> Enum.map(& &1.id)
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.map(&project!(registry, &1))
 
-    applications = Contract.index_applications(Map.values(repositories))
+    project_ids = Enum.map(projects, & &1.id)
+    repository_ids = projects |> Enum.map(& &1.repository) |> Enum.uniq() |> Enum.sort()
+    applications = Contract.index_projects(projects)
+
+    selection = %{
+      digest: selection_digest(repository_ids, project_ids),
+      repository_ids: repository_ids,
+      project_ids: project_ids,
+      applications: applications,
+      unselected_applications: unselected(registry, applications)
+    }
 
     %{
       registry
-      | repositories: repositories,
-        projects: Map.new(selected_projects, &{&1.id, &1}),
-        applications: applications,
-        bindings: Map.take(registry.bindings, Map.keys(repositories)),
-        absent_checkouts: Map.take(registry.absent_checkouts, Map.keys(repositories)),
-        unselected_applications: unselected(registry, applications)
+      | selection: selection,
+        bindings: Map.take(registry.bindings, repository_ids),
+        absent_checkouts: Map.take(registry.absent_checkouts, repository_ids)
     }
   end
 
-  # Restriction narrows the applications index, so a catalogued application
-  # outside the selection would otherwise be indistinguishable from a Hex
-  # package. The identities it drops are recorded here so resolution can report
-  # them as catalogued-but-unselected instead of external.
+  @doc "What the current selection permits, or `nil` where nothing narrowed the catalog."
+  @spec selection(t()) :: selection() | nil
+  def selection(%__MODULE__{selection: selection}), do: selection
+
+  @doc "The projects the selection permits, sorted by project id."
+  @spec selected_projects(t()) :: [project()]
+  def selected_projects(%__MODULE__{selection: nil} = registry),
+    do: registry.projects |> Map.values() |> Enum.sort_by(& &1.id)
+
+  def selected_projects(%__MODULE__{selection: selection} = registry),
+    do: Enum.map(selection.project_ids, &Map.fetch!(registry.projects, &1))
+
+  @doc """
+  The repositories the selection permits, sorted by repository id.
+
+  Each carries only the projects the selection reached, so a caller walking a
+  repository's projects sees the selection rather than the catalog. The catalog
+  record itself is unchanged and still reachable through `repository!/2`.
+  """
+  @spec selected_repositories(t()) :: [repository()]
+  def selected_repositories(%__MODULE__{selection: nil} = registry),
+    do: registry.repositories |> Map.values() |> Enum.sort_by(& &1.id)
+
+  def selected_repositories(%__MODULE__{selection: selection} = registry) do
+    permitted = MapSet.new(selection.project_ids)
+
+    Enum.map(selection.repository_ids, fn id ->
+      repository = Map.fetch!(registry.repositories, id)
+
+      %{
+        repository
+        | projects: Enum.filter(repository.projects, &MapSet.member?(permitted, &1.id))
+      }
+    end)
+  end
+
+  @doc "The application index the selection permits."
+  @spec selected_applications(t()) :: %{String.t() => [project()]}
+  def selected_applications(%__MODULE__{selection: nil} = registry), do: registry.applications
+  def selected_applications(%__MODULE__{selection: selection}), do: selection.applications
+
+  @doc "True when the selection permits `project_id`."
+  @spec selected?(t(), String.t() | atom()) :: boolean()
+  def selected?(%__MODULE__{selection: nil} = registry, project_id),
+    do: Map.has_key?(registry.projects, to_string(project_id))
+
+  def selected?(%__MODULE__{selection: selection}, project_id),
+    do: to_string(project_id) in selection.project_ids
+
+  @doc "Catalogued applications the selection leaves out, sorted."
+  @spec unselected_application_ids(t()) :: [String.t()]
+  def unselected_application_ids(%__MODULE__{selection: nil}), do: []
+
+  def unselected_application_ids(%__MODULE__{selection: selection}),
+    do: selection.unselected_applications |> Map.keys() |> Enum.sort()
+
+  # A selection narrows the applications index, so a catalogued application
+  # outside it would otherwise be indistinguishable from a Hex package. The
+  # identities it leaves out are recorded so resolution can report them as
+  # catalogued-but-unselected.
   defp unselected(registry, applications) do
     registry.applications
     |> Enum.reject(fn {app, _projects} -> Map.has_key?(applications, app) end)
     |> Map.new(fn {app, projects} -> {app, Enum.map(projects, & &1.id)} end)
-    |> then(&Map.merge(registry.unselected_applications, &1))
   end
 
-  defp unselected_providers(registry, app) do
-    case Map.fetch(registry.unselected_applications, app) do
+  defp unselected_providers(%__MODULE__{selection: nil}, _app), do: :unknown
+
+  defp unselected_providers(%__MODULE__{selection: selection}, app) do
+    case Map.fetch(selection.unselected_applications, app) do
       {:ok, project_ids} -> {:known_unselected, project_ids}
       :error -> :unknown
     end
+  end
+
+  defp selection_digest(repository_ids, project_ids) do
+    :json.encode(%{repositories: repository_ids, projects: project_ids})
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   @spec repository_root(t(), repository() | String.t()) :: String.t()

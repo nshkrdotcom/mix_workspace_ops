@@ -209,10 +209,19 @@ defmodule MixWorkspaceOps.RegistryTest do
       ])
       |> Registry.load!()
 
-    restricted = Registry.restrict(registry, [Registry.project!(registry, "alpha")])
-    assert {:ok, bound} = Registry.bind(restricted, root)
-    assert Map.keys(bound.repositories) == ["alpha"]
+    selected = Registry.select(registry, [Registry.project!(registry, "alpha")])
+    assert {:ok, bound} = Registry.bind(selected, root)
     assert Map.keys(bound.bindings) == ["alpha"]
+
+    # The catalog is intact and still describes the document its digest names;
+    # what narrowed is the selection beside it.
+    assert Map.keys(bound.repositories) == ["alpha", "beta"]
+    assert bound.digest == registry.digest
+    assert Registry.selection(bound).repository_ids == ["alpha"]
+    assert Registry.selection(bound).project_ids == ["alpha"]
+    assert Enum.map(Registry.selected_repositories(bound), & &1.id) == ["alpha"]
+    refute Registry.selected?(bound, "beta")
+    assert Registry.selection(bound).digest != registry.digest
   end
 
   # D1: one repository an operator has not cloned used to fail every operation,

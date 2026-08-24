@@ -275,24 +275,24 @@ defmodule MixWorkspaceOps.CLI do
   defp load_bound_registry(options) do
     with :ok <- require_options(options, [:registry, :checkout_root]),
          {:ok, registry} <- Registry.load(options.registry),
-         {:ok, registry} <- restrict_to_view(registry, options.view) do
+         {:ok, registry} <- select_view(registry, options.view) do
       Registry.bind(registry, options.checkout_root, binding_file: options.binding)
     end
   end
 
-  defp restrict_to_view(registry, nil), do: {:ok, registry}
+  defp select_view(registry, nil), do: {:ok, registry}
 
-  defp restrict_to_view(registry, view_path) do
+  defp select_view(registry, view_path) do
     with {:ok, view} <- View.load(view_path),
          {:ok, projects} <- View.select(registry, view) do
-      {:ok, Registry.restrict(registry, projects)}
+      {:ok, Registry.select(registry, projects)}
     end
   end
 
   defp ensure_project_in_view(_registry, %{view: nil}), do: :ok
 
   defp ensure_project_in_view(registry, options) do
-    if Map.has_key?(registry.projects, options.project),
+    if Registry.selected?(registry, options.project),
       do: :ok,
       else: {:error, {:project_outside_view, options.project, options.view}}
   end
