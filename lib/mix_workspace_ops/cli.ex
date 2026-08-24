@@ -27,12 +27,41 @@ defmodule MixWorkspaceOps.CLI do
     registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
     inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
     doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
-    plan --project ID --registry PATH --checkout-root PATH [--view PATH]
+    plan --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
     run --project ID --mode local|git|hex --mix-state managed|delegated \
-      --registry PATH --checkout-root PATH -- COMMAND [ARG ...]
+      --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
+      [--state-root PATH] -- COMMAND [ARG ...]
     release publish --descriptor PATH [--state-root PATH]
     help
   """
+
+  # Every option each command accepts, which is every option its usage line
+  # documents and no other. One global table would let an option reach a command
+  # that has no use for it and would report a documented option as unknown when
+  # only the table was missed.
+  @accepted %{
+    ["registry", "validate"] => [:registry],
+    ["registry", "select"] => [:registry, :view],
+    ["registry", "workspace"] => [:registry, :repository],
+    ["registry", "chain"] => [:registry, :package],
+    ["registry", "discover"] => [:checkout_root, :github_owner, :output],
+    ["inventory"] => [:registry, :checkout_root, :view, :binding, :output],
+    ["doctor"] => [:registry, :checkout_root, :view, :binding],
+    ["plan"] => [:project, :registry, :checkout_root, :view, :binding],
+    ["run"] => [
+      :project,
+      :mode,
+      :mix_state,
+      :registry,
+      :checkout_root,
+      :view,
+      :binding,
+      :state_root
+    ],
+    ["release", "publish"] => [:descriptor, :state_root]
+  }
+
+  @vocabulary @accepted |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
 
   @spec main([String.t()]) :: no_return()
   def main(args) do
@@ -76,7 +105,7 @@ defmodule MixWorkspaceOps.CLI do
   def dispatch([]), do: :usage
 
   def dispatch(["registry", "validate" | args]) do
-    with {:ok, options, []} <- registry_options(args),
+    with {:ok, options, []} <- options(["registry", "validate"], args),
          :ok <- require_option(options, :registry),
          {:ok, registry} <- Registry.load(options.registry) do
       {:ok,
@@ -95,7 +124,7 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(["registry", "chain" | args]) do
-    with {:ok, options, []} <- registry_options(args, package: nil),
+    with {:ok, options, []} <- options(["registry", "chain"], args),
          :ok <- require_option(options, :registry),
          {:ok, registry} <- Registry.load(options.registry),
          {:ok, chain} <- ReleaseChain.derive(registry),
@@ -112,7 +141,7 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(["registry", "workspace" | args]) do
-    with {:ok, options, []} <- registry_options(args, repository: nil),
+    with {:ok, options, []} <- options(["registry", "workspace"], args),
          :ok <- require_option(options, :registry),
          {:ok, registry} <- Registry.load(options.registry),
          {:ok, workspaces} <- workspaces(registry, options.repository) do
@@ -127,7 +156,7 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(["registry", "select" | args]) do
-    with {:ok, options, []} <- registry_options(args),
+    with {:ok, options, []} <- options(["registry", "select"], args),
          :ok <- require_options(options, [:registry, :view]),
          {:ok, registry} <- Registry.load(options.registry),
          {:ok, view} <- View.load(options.view),
@@ -147,8 +176,7 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(["registry", "discover" | args]) do
-    with {:ok, options, []} <-
-           parse_options(args, checkout_root: nil, github_owner: nil, output: nil),
+    with {:ok, options, []} <- options(["registry", "discover"], args),
          :ok <- require_options(options, [:checkout_root, :github_owner]),
          {:ok, discovery} <- Discovery.scan(options.checkout_root, options.github_owner),
          :ok <- maybe_write_report(options.output, discovery) do
@@ -157,7 +185,7 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(["inventory" | args]) do
-    with {:ok, options, []} <- registry_options(args, output: nil),
+    with {:ok, options, []} <- options(["inventory"], args),
          {:ok, registry} <- load_bound_registry(options),
          {:ok, rows} <- Inventory.scan_registry(registry),
          report = Inventory.summary(rows),
@@ -167,7 +195,7 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(["doctor" | args]) do
-    with {:ok, options, []} <- registry_options(args),
+    with {:ok, options, []} <- options(["doctor"], args),
          {:ok, registry} <- load_bound_registry(options) do
       report = Doctor.inspect(registry)
       if report.healthy, do: {:ok, report}, else: {:error, {:unhealthy_workspace, report}}
@@ -175,7 +203,7 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(["plan" | args]) do
-    with {:ok, options, []} <- registry_options(args, project: nil),
+    with {:ok, options, []} <- options(["plan"], args),
          :ok <- require_option(options, :project),
          {:ok, registry} <- load_bound_registry(options),
          :ok <- ensure_project_in_view(registry, options),
@@ -196,8 +224,7 @@ defmodule MixWorkspaceOps.CLI do
 
   def dispatch(["run" | args]) do
     with {:ok, option_args, command} <- split_command(args),
-         {:ok, options, []} <-
-           registry_options(option_args, project: nil, mode: "local", mix_state: "managed"),
+         {:ok, options, []} <- options(["run"], option_args),
          :ok <- require_option(options, :project),
          :ok <- require_command(command),
          :ok <- require_safe_run_command(command),
@@ -217,8 +244,7 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(["release", "publish" | args]) do
-    with {:ok, options, []} <-
-           parse_options(args, descriptor: nil, state_root: default_state_root()),
+    with {:ok, options, []} <- options(["release", "publish"], args),
          :ok <- require_option(options, :descriptor),
          {:ok, plan} <- Descriptor.load(options.descriptor) do
       Transaction.run(plan, LocalAdapter, state_root: options.state_root)
@@ -252,45 +278,37 @@ defmodule MixWorkspaceOps.CLI do
       else: {:error, {:project_outside_view, options.project, options.view}}
   end
 
-  defp registry_options(args, defaults \\ []) do
-    defaults =
-      Keyword.merge(
-        [
-          registry: nil,
-          checkout_root: nil,
-          binding: nil,
-          view: nil,
-          state_root: default_state_root()
-        ],
-        defaults
-      )
+  defp options(command, args) do
+    accepted = Map.fetch!(@accepted, command)
 
-    parse_options(args, defaults)
-  end
-
-  defp parse_options(args, defaults) do
     args
-    |> parse_options(Map.new(defaults), [])
+    |> parse_options(command, MapSet.new(accepted), Map.new(accepted, &{&1, default(&1)}), [])
     |> normalize_paths()
   end
 
-  defp parse_options([], options, positional), do: {:ok, options, Enum.reverse(positional)}
+  defp default(:mode), do: "local"
+  defp default(:mix_state), do: "managed"
+  defp default(:state_root), do: default_state_root()
+  defp default(_key), do: nil
 
-  defp parse_options(["--" <> option, value | rest], options, positional) do
-    with {:ok, key} <- option_key(option),
+  defp parse_options([], _command, _accepted, options, positional),
+    do: {:ok, options, Enum.reverse(positional)}
+
+  defp parse_options(["--" <> option, value | rest], command, accepted, options, positional) do
+    with {:ok, key} <- option_key(command, accepted, option),
          false <- String.starts_with?(value, "--") do
-      parse_options(rest, Map.put(options, key, value), positional)
+      parse_options(rest, command, accepted, Map.put(options, key, value), positional)
     else
       true -> {:usage_error, "option --#{option} requires a value"}
       {:error, reason} -> {:usage_error, reason}
     end
   end
 
-  defp parse_options(["--" <> option], _options, _positional),
+  defp parse_options(["--" <> option], _command, _accepted, _options, _positional),
     do: {:usage_error, "option --#{option} requires a value"}
 
-  defp parse_options([argument | rest], options, positional),
-    do: parse_options(rest, options, [argument | positional])
+  defp parse_options([argument | rest], command, accepted, options, positional),
+    do: parse_options(rest, command, accepted, options, [argument | positional])
 
   defp normalize_paths({:ok, options, rest}) do
     path_keys = [:registry, :checkout_root, :binding, :view, :state_root, :output, :descriptor]
@@ -315,20 +333,19 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp option_key("registry"), do: {:ok, :registry}
-  defp option_key("checkout-root"), do: {:ok, :checkout_root}
-  defp option_key("binding"), do: {:ok, :binding}
-  defp option_key("view"), do: {:ok, :view}
-  defp option_key("state-root"), do: {:ok, :state_root}
-  defp option_key("project"), do: {:ok, :project}
-  defp option_key("mode"), do: {:ok, :mode}
-  defp option_key("mix-state"), do: {:ok, :mix_state}
-  defp option_key("output"), do: {:ok, :output}
-  defp option_key("github-owner"), do: {:ok, :github_owner}
-  defp option_key("descriptor"), do: {:ok, :descriptor}
-  defp option_key("package"), do: {:ok, :package}
-  defp option_key("repository"), do: {:ok, :repository}
-  defp option_key(option), do: {:error, "unknown option --#{option}"}
+  # An option no command takes is unknown; an option another command takes is
+  # named against the command that does not.
+  defp option_key(command, accepted, option) do
+    case Enum.find(@vocabulary, &(option_name(&1) == option)) do
+      nil ->
+        {:error, "unknown option --#{option}"}
+
+      key ->
+        if MapSet.member?(accepted, key),
+          do: {:ok, key},
+          else: {:error, "#{Enum.join(command, " ")} does not accept --#{option}"}
+    end
+  end
 
   defp require_options(options, keys) do
     Enum.reduce_while(keys, :ok, fn key, :ok ->

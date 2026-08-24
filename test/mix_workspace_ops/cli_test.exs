@@ -35,6 +35,23 @@ defmodule MixWorkspaceOps.CLITest do
     end
   end
 
+  # The other direction. A single global option table accepts every option on
+  # every command, so a proof that documented options are accepted says nothing
+  # about options reaching commands that have no use for them.
+  test "no command accepts an option it does not document" do
+    documented = documented_options()
+    vocabulary = documented |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
+
+    for {command, options} <- Enum.group_by(documented, &elem(&1, 0), &elem(&1, 1)),
+        option <- vocabulary -- options do
+      arguments = command ++ ["--#{option}", "value"] ++ command_terminator(command)
+
+      assert CLI.dispatch(arguments) ==
+               {:usage_error, "#{Enum.join(command, " ")} does not accept --#{option}"},
+             "#{Enum.join(command, " ")} accepts undocumented --#{option}"
+    end
+  end
+
   test "the usage text documents at least one option for every command that takes one" do
     documented = documented_options()
 
