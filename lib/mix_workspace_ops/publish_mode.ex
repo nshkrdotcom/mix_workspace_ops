@@ -2,9 +2,19 @@ defmodule MixWorkspaceOps.PublishMode do
   @moduledoc """
   Whether the command about to run publishes, read from the tasks it names.
 
-  Publishing is detected from the command, never requested by an operator and
-  never carried in an environment variable, because a published package that
-  quietly kept a local path or a git ref is the failure this exists to prevent.
+  Publishing is detected from the command and never requested by an operator or
+  carried in an environment variable, so that resolving for publication is a
+  consequence of publishing rather than of remembering to ask.
+
+  ## What reading a task name can and cannot do
+
+  This is a **user-error check, not a security boundary**, and it cannot be one:
+  a name is not a capability. Someone who means to publish under a development
+  overlay can run the publisher directly, and nothing here would see it. What
+  makes a development overlay unusable for publication is the seam's own refusal
+  at the point the overlay is read, which does not depend on recognising a task
+  name; and what keeps credentials away from ordinary work is that they are
+  supplied only to the release transaction's publishing step.
 
   Detection reads task position only. `mix do compile, hex.publish` publishes;
   `mix run --arg hex.publish` does not, and a membership test over raw argv
@@ -28,10 +38,6 @@ defmodule MixWorkspaceOps.PublishMode do
   @doc "The tasks that publish."
   @spec publish_tasks() :: [String.t()]
   def publish_tasks, do: @publish_tasks
-
-  @doc "The tasks whose output is the product, and which carry no notice."
-  @spec quiet_tasks() :: [String.t()]
-  def quiet_tasks, do: @quiet_tasks
 
   @doc "True when `argv` names a publishing task in task position."
   @spec publish?([String.t()]) :: boolean()
@@ -62,15 +68,31 @@ defmodule MixWorkspaceOps.PublishMode do
   @doc """
   The task tokens of a command Mix Workspace Ops is about to launch.
 
-  The command carries its executable, which Mix would have stripped. A command
-  that does not run `mix` runs no Mix task, so it names none.
+  The command carries its executable, which Mix would have stripped. Three
+  shapes reach the same `mix`: `mix …`, `elixir -S mix …`, and either of those
+  behind `env` with or without leading assignments. A command that reaches no
+  `mix` runs no Mix task, so it names none.
   """
   @spec task_argv([String.t()]) :: [String.t()]
   def task_argv([executable | argv]) do
-    if Path.basename(executable) == "mix", do: argv, else: []
+    case Path.basename(executable) do
+      "mix" -> argv
+      "elixir" -> scripted_task_argv(argv)
+      "env" -> argv |> Enum.drop_while(&String.contains?(&1, "=")) |> task_argv()
+      _other -> []
+    end
   end
 
   def task_argv([]), do: []
+
+  # `elixir -S mix` asks the launcher to find `mix` on PATH and run it, so the
+  # tokens after it are exactly what `mix` itself would have received.
+  defp scripted_task_argv(argv) do
+    case Enum.drop_while(argv, &(&1 != "-S")) do
+      ["-S", script | rest] -> if Path.basename(script) == "mix", do: rest, else: []
+      _unscripted -> []
+    end
+  end
 
   defp split_separators(argument) do
     case String.split(argument, ",") do

@@ -581,23 +581,42 @@ defmodule MixWorkspaceOps.CLITest do
     assert CLI.dispatch(["run", "--project", "alpha", "--"]) == {:usage_error, "empty command"}
   end
 
-  test "run refuses a publishing task", context do
+  # The guard read argv position 2 while the parser beside it read task position,
+  # so the two disagreed about what "the publish task" is. Every shape the parser
+  # calls a publication is refused here, and every shape it does not is allowed.
+  test "run refuses a publishing task in every shape that names one", context do
     %{root: root, catalog: catalog} = workspace!(context)
 
-    assert CLI.dispatch([
-             "run",
-             "--project",
-             "alpha",
-             "--registry",
-             catalog,
-             "--checkout-root",
-             root,
-             "--",
-             "mix",
-             "hex.publish"
-           ]) ==
-             {:usage_error,
-              "hex.publish is available only through the fail-closed release transaction"}
+    refused = [
+      {["mix", "hex.publish"], "hex.publish"},
+      {["mix", "do", "compile,", "hex.publish"], "hex.publish"},
+      {["mix", "do", "compile", "+", "hex.publish"], "hex.publish"},
+      {["mix", "do", "compile,hex.publish"], "hex.publish"},
+      {["elixir", "-S", "mix", "hex.publish"], "hex.publish"},
+      {["/usr/bin/env", "mix", "hex.publish"], "hex.publish"},
+      {["env", "MIX_ENV=prod", "mix", "hex.publish"], "hex.publish"},
+      {["mix", "deps.publish_preflight"], "deps.publish_preflight"}
+    ]
+
+    for {command, task} <- refused do
+      assert run(root, catalog, command) ==
+               {:usage_error, "#{task} publishes; run it through the release transaction"},
+             "#{Enum.join(command, " ")} was not refused"
+    end
+
+    # Reading the registry is not publishing, and a task name in an argument is
+    # not a task.
+    for command <- [["mix", "hex.info"], ["mix", "run", "--arg", "hex.publish"]] do
+      refute match?({:usage_error, _reason}, run(root, catalog, command)),
+             "#{Enum.join(command, " ")} was refused"
+    end
+  end
+
+  defp run(root, catalog, command) do
+    CLI.dispatch(
+      ["run", "--project", "alpha", "--registry", catalog, "--checkout-root", root, "--"] ++
+        command
+    )
   end
 
   test "release publish requires a descriptor" do

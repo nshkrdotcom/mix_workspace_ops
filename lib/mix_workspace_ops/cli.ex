@@ -81,6 +81,12 @@ defmodule MixWorkspaceOps.CLI do
 
   @vocabulary @accepted |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
 
+  # The two tasks that mutate a package registry. `hex.build` is a publish task
+  # for resolution and is not refused here: it writes a tarball and nothing else,
+  # and building one against a publish overlay is how an operator checks what
+  # would be published.
+  @refused_run_tasks ~w(hex.publish deps.publish_preflight)
+
   @spec main([String.t()]) :: no_return()
   def main(args) do
     args
@@ -516,15 +522,24 @@ defmodule MixWorkspaceOps.CLI do
   defp require_command([]), do: {:usage_error, "empty command"}
   defp require_command(_command), do: :ok
 
-  defp require_safe_run_command([executable, task | _arguments]) do
-    if Path.basename(executable) == "mix" and task in ["hex.publish", "deps.publish_preflight"] do
-      {:usage_error, "#{task} is available only through the fail-closed release transaction"}
-    else
-      :ok
+  # A guard reading argv position 2 refused `mix hex.publish` and let
+  # `mix do compile, hex.publish` and `elixir -S mix hex.publish` past, while the
+  # parser beside it read every one of them correctly. It is the same parser now.
+  #
+  # This refusal is a user-error check on a task name and not a boundary, because
+  # a name is not a capability: publication is kept safe by the seam refusing a
+  # development overlay when one is read and by credentials reaching only the
+  # release transaction's publishing step.
+  defp require_safe_run_command(command) do
+    command
+    |> PublishMode.task_argv()
+    |> PublishMode.task_tokens()
+    |> Enum.find(&(&1 in @refused_run_tasks))
+    |> case do
+      nil -> :ok
+      task -> {:usage_error, "#{task} publishes; run it through the release transaction"}
     end
   end
-
-  defp require_safe_run_command(_command), do: :ok
 
   defp source_mode("auto"), do: {:ok, :auto}
   defp source_mode("local"), do: {:ok, :local}

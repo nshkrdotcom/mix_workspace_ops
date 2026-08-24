@@ -63,6 +63,25 @@ defmodule MixWorkspaceOps.PublishModeTest do
     refute PublishMode.publish?(PublishMode.task_argv(["echo", "hex.publish"]))
   end
 
+  # The same `mix` is reached three ways, and a caller asking what a command
+  # will run has to see all three or it sees only the shape it thought of.
+  test "elixir -S mix and env reach the same tasks as mix itself" do
+    assert PublishMode.task_argv(["elixir", "-S", "mix", "hex.publish"]) == ["hex.publish"]
+
+    assert PublishMode.task_argv(["elixir", "--erl", "-x", "-S", "mix", "do", "compile,", "test"]) ==
+             ["do", "compile,", "test"]
+
+    assert PublishMode.task_argv(["/usr/bin/env", "mix", "hex.publish"]) == ["hex.publish"]
+    assert PublishMode.task_argv(["env", "MIX_ENV=prod", "mix", "compile"]) == ["compile"]
+
+    assert PublishMode.task_argv(["env", "A=1", "elixir", "-S", "mix", "hex.build"]) ==
+             ["hex.build"]
+
+    assert PublishMode.task_argv(["elixir", "script.exs"]) == []
+    assert PublishMode.task_argv(["elixir", "-S", "other", "hex.publish"]) == []
+    assert PublishMode.task_argv(["env"]) == []
+  end
+
   test "the publish tasks are exactly the three that mutate the registry" do
     assert Enum.sort(PublishMode.publish_tasks()) ==
              Enum.sort(~w(hex.publish hex.build deps.publish_preflight))
