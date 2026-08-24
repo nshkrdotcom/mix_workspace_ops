@@ -27,6 +27,7 @@ defmodule MixWorkspaceOps.Registry do
     :projects,
     :applications,
     bindings: %{},
+    absent_checkouts: %{},
     unselected_applications: %{}
   ]
 
@@ -63,6 +64,7 @@ defmodule MixWorkspaceOps.Registry do
           projects: %{String.t() => project()},
           applications: %{String.t() => [project()]},
           bindings: %{String.t() => String.t()},
+          absent_checkouts: %{String.t() => String.t()},
           unselected_applications: %{String.t() => [String.t()]}
         }
 
@@ -116,12 +118,80 @@ defmodule MixWorkspaceOps.Registry do
     end
   end
 
+  @doc """
+  Binds every catalogued repository against an operator checkout root.
+
+  A repository with no checkout is recorded in `absent_checkouts` with the path
+  it was looked for at, and binding continues; a checkout that contradicts the
+  catalog is an error. Which repositories an operation cannot proceed without is
+  the operation's question, asked through `require_bound/2`.
+  """
   @spec bind(t(), String.t(), keyword()) :: {:ok, t()} | {:error, term()}
   def bind(registry, checkout_root, opts \\ []) do
     case Binding.resolve(registry, checkout_root, opts) do
-      {:ok, bindings} -> {:ok, %{registry | bindings: bindings}}
-      {:error, reason} -> {:error, reason}
+      {:ok, report} ->
+        {:ok, %{registry | bindings: report.bound, absent_checkouts: report.absent}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  @doc """
+  What binding found for one repository.
+
+  `{:bound, root}` for a verified checkout, `{:absent, expected_path}` for a
+  catalogued repository with no checkout, and `:unknown` for an id the catalog
+  does not carry.
+  """
+  @spec checkout(t(), repository() | String.t()) ::
+          {:bound, String.t()} | {:absent, String.t()} | :unknown
+  def checkout(registry, repository) when is_map(repository),
+    do: checkout(registry, repository.id)
+
+  def checkout(%__MODULE__{} = registry, repository_id) when is_binary(repository_id) do
+    case Map.fetch(registry.bindings, repository_id) do
+      {:ok, root} ->
+        {:bound, root}
+
+      :error ->
+        case Map.fetch(registry.absent_checkouts, repository_id) do
+          {:ok, expected} -> {:absent, expected}
+          :error -> :unknown
+        end
+    end
+  end
+
+  @doc "Repository ids with a verified checkout, sorted."
+  @spec bound_repository_ids(t()) :: [String.t()]
+  def bound_repository_ids(%__MODULE__{bindings: bindings}),
+    do: bindings |> Map.keys() |> Enum.sort()
+
+  @doc "Repository ids with no checkout, sorted."
+  @spec absent_repository_ids(t()) :: [String.t()]
+  def absent_repository_ids(%__MODULE__{absent_checkouts: absent}),
+    do: absent |> Map.keys() |> Enum.sort()
+
+  @doc """
+  Refuses to continue where a repository an operation needs has no checkout.
+
+  Eligibility is what the catalog and the selection permit; requirement is what
+  one operation cannot proceed without. Only the second is fatal, and the error
+  names the path the checkout was looked for at so an operator can clone it or
+  record it in a binding file.
+  """
+  @spec require_bound(t(), [String.t()]) :: :ok | {:error, term()}
+  def require_bound(%__MODULE__{} = registry, repository_ids) do
+    repository_ids
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.reduce_while(:ok, fn id, :ok ->
+      case checkout(registry, id) do
+        {:bound, _root} -> {:cont, :ok}
+        {:absent, expected} -> {:halt, {:error, {:absent_required_checkout, id, expected}}}
+        :unknown -> {:halt, {:error, {:unknown_repository, id}}}
+      end
+    end)
   end
 
   @spec project!(t(), String.t() | atom()) :: project()
@@ -278,6 +348,7 @@ defmodule MixWorkspaceOps.Registry do
         projects: Map.new(selected_projects, &{&1.id, &1}),
         applications: applications,
         bindings: Map.take(registry.bindings, Map.keys(repositories)),
+        absent_checkouts: Map.take(registry.absent_checkouts, Map.keys(repositories)),
         unselected_applications: unselected(registry, applications)
     }
   end
@@ -302,9 +373,16 @@ defmodule MixWorkspaceOps.Registry do
 
   @spec repository_root(t(), repository() | String.t()) :: String.t()
   def repository_root(registry, repository_id) when is_binary(repository_id) do
-    case Map.fetch(registry.bindings, repository_id) do
-      {:ok, root} -> root
-      :error -> raise ArgumentError, "registry repository #{inspect(repository_id)} is not bound"
+    case checkout(registry, repository_id) do
+      {:bound, root} ->
+        root
+
+      {:absent, expected} ->
+        raise ArgumentError,
+              "registry repository #{inspect(repository_id)} has no checkout at #{expected}"
+
+      :unknown ->
+        raise ArgumentError, "registry repository #{inspect(repository_id)} is not bound"
     end
   end
 

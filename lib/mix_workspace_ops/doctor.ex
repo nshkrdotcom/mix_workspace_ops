@@ -1,5 +1,11 @@
 defmodule MixWorkspaceOps.Doctor do
-  @moduledoc "Read-only validation of bound repositories and Mix-project identities."
+  @moduledoc """
+  Read-only validation of catalogued repositories and Mix-project identities.
+
+  A repository with no checkout is reported, not fatal. Absence is a fact about
+  one operator's disk, and a report that stops at the first repository someone
+  has not cloned tells that operator nothing about the ones they have.
+  """
 
   alias MixWorkspaceOps.{Binding, Git, Project, Registry}
 
@@ -25,7 +31,30 @@ defmodule MixWorkspaceOps.Doctor do
   end
 
   defp inspect_repository(registry, repository, catalogued) do
-    root = Registry.repository_root(registry, repository)
+    case Registry.checkout(registry, repository) do
+      {:bound, root} -> inspect_bound_repository(registry, repository, root, catalogued)
+      {:absent, expected} -> absent_repository(repository, expected)
+      :unknown -> absent_repository(repository, nil)
+    end
+  end
+
+  # An absent checkout carries no checks, so it neither passes nor fails: there
+  # is nothing on disk to hold to the catalog. It is still a row, because a
+  # report that omitted it would be indistinguishable from one where every
+  # repository was present.
+  defp absent_repository(repository, expected) do
+    %{
+      id: repository.id,
+      status: "absent",
+      root: nil,
+      expected_root: expected,
+      healthy: true,
+      checks: [],
+      projects: []
+    }
+  end
+
+  defp inspect_bound_repository(registry, repository, root, catalogued) do
     projects = Enum.map(repository.projects, &inspect_project(registry, &1))
 
     checks =
@@ -39,7 +68,9 @@ defmodule MixWorkspaceOps.Doctor do
 
     %{
       id: repository.id,
+      status: "bound",
       root: root,
+      expected_root: root,
       healthy: all_pass?(checks),
       checks: checks,
       projects: projects
@@ -50,7 +81,9 @@ defmodule MixWorkspaceOps.Doctor do
 
       %{
         id: repository.id,
-        root: Map.get(registry.bindings, repository.id),
+        status: "bound",
+        root: root,
+        expected_root: root,
         healthy: false,
         checks: [check],
         projects: []

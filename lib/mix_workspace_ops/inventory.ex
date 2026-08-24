@@ -1,5 +1,10 @@
 defmodule MixWorkspaceOps.Inventory do
-  @moduledoc "Read-only discovery of copied dependency-source helpers and their Git identity."
+  @moduledoc """
+  Read-only discovery of copied dependency-source helpers and their Git identity.
+
+  A catalogued repository with no checkout contributes no rows and is not an
+  error: there is nothing on this disk to inventory.
+  """
 
   alias MixWorkspaceOps.{Command, Git, Registry}
 
@@ -44,19 +49,28 @@ defmodule MixWorkspaceOps.Inventory do
     registry.repositories
     |> Map.values()
     |> Enum.sort_by(& &1.id)
-    |> Enum.reduce_while({:ok, []}, fn repository, {:ok, rows} ->
-      root = Registry.repository_root(registry, repository)
-
-      case scan(root) do
-        {:ok, repository_rows} -> {:cont, {:ok, repository_rows ++ rows}}
-        {:error, reason} -> {:halt, {:error, {:inventory_repository, repository.id, reason}}}
-      end
-    end)
+    |> Enum.reduce_while({:ok, []}, &scan_bound_repository(registry, &1, &2))
     |> then(fn
       {:ok, rows} -> {:ok, Enum.sort_by(rows, &{&1.repository_root, &1.helper_path})}
       error -> error
     end)
   end
+
+  # A catalogued repository with no checkout contributes no rows: there is
+  # nothing on this disk to inventory, which is a fact about the disk rather
+  # than a contradiction of the catalog.
+  defp scan_bound_repository(registry, repository, {:ok, rows}) do
+    case Registry.checkout(registry, repository) do
+      {:bound, root} -> merge_scan(scan(root), repository, rows)
+      _absent -> {:cont, {:ok, rows}}
+    end
+  end
+
+  defp merge_scan({:ok, repository_rows}, _repository, rows),
+    do: {:cont, {:ok, repository_rows ++ rows}}
+
+  defp merge_scan({:error, reason}, repository, _rows),
+    do: {:halt, {:error, {:inventory_repository, repository.id, reason}}}
 
   defp find_arguments(root) do
     prunes =

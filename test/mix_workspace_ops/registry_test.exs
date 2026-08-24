@@ -215,6 +215,100 @@ defmodule MixWorkspaceOps.RegistryTest do
     assert Map.keys(bound.bindings) == ["alpha"]
   end
 
+  # D1: one repository an operator has not cloned used to fail every operation,
+  # including the read-only ones. Absence is a fact about a disk, not a
+  # contradiction of the catalog, so it is recorded and binding continues.
+  test "binding records an absent checkout and binds the rest", context do
+    root = temporary_directory!(context)
+    alpha = initialize_repository!(Path.join(root, "alpha"))
+
+    registry =
+      root
+      |> write_registry!([
+        repository("alpha", [project("alpha")]),
+        repository("beta", [project("beta")]),
+        repository("gamma", [project("gamma")])
+      ])
+      |> Registry.load!()
+
+    assert {:ok, bound} = Registry.bind(registry, root)
+    assert bound.bindings == %{"alpha" => alpha}
+
+    assert bound.absent_checkouts == %{
+             "beta" => Path.join(root, "beta"),
+             "gamma" => Path.join(root, "gamma")
+           }
+
+    assert Registry.bound_repository_ids(bound) == ["alpha"]
+    assert Registry.absent_repository_ids(bound) == ["beta", "gamma"]
+    assert Registry.checkout(bound, "alpha") == {:bound, alpha}
+    assert Registry.checkout(bound, "beta") == {:absent, Path.join(root, "beta")}
+    assert Registry.checkout(bound, "delta") == :unknown
+  end
+
+  # An invalid checkout still stops binding. A directory that is not a Git root
+  # contradicts the catalog rather than describing what an operator has cloned.
+  test "binding still refuses an invalid checkout while others are absent", context do
+    root = temporary_directory!(context)
+    File.mkdir_p!(Path.join(root, "alpha"))
+
+    registry =
+      root
+      |> write_registry!([
+        repository("alpha", [project("alpha")]),
+        repository("beta", [project("beta")])
+      ])
+      |> Registry.load!()
+
+    assert {:error, {:git_root, _reason}} = Registry.bind(registry, root)
+  end
+
+  # An operator binding file reaches a checkout outside the conventional root,
+  # which is how a repository cloned somewhere else stops being absent.
+  test "a binding file resolves a checkout outside the conventional root", context do
+    root = temporary_directory!(context)
+    elsewhere = temporary_directory!(context)
+    beta = initialize_repository!(Path.join(elsewhere, "beta"))
+    initialize_repository!(Path.join(root, "alpha"))
+
+    registry =
+      root
+      |> write_registry!([
+        repository("alpha", [project("alpha")]),
+        repository("beta", [project("beta")])
+      ])
+      |> Registry.load!()
+
+    binding_file = Path.join(root, "binding.json")
+    File.write!(binding_file, :json.encode(%{"beta" => beta}))
+
+    assert {:ok, bound} = Registry.bind(registry, root, binding_file: binding_file)
+    assert bound.absent_checkouts == %{}
+    assert bound.bindings["beta"] == beta
+  end
+
+  # Item 7: eligibility is what the catalog permits, requirement is what one
+  # operation cannot proceed without, and only the second is fatal.
+  test "require_bound names the path an absent required repository was sought at", context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "alpha"))
+
+    registry =
+      root
+      |> write_registry!([
+        repository("alpha", [project("alpha")]),
+        repository("beta", [project("beta")])
+      ])
+      |> Registry.load!()
+
+    assert {:ok, bound} = Registry.bind(registry, root)
+    assert Registry.require_bound(bound, ["alpha"]) == :ok
+    expected = Path.join(root, "beta")
+
+    assert Registry.require_bound(bound, ["alpha", "beta"]) ==
+             {:error, {:absent_required_checkout, "beta", expected}}
+  end
+
   test "strict JSON refuses oversized input before decoding" do
     assert {:error, {:json_too_large, 7, 4}} =
              MixWorkspaceOps.StrictJSON.decode("{\"a\":1}", maximum_bytes: 4)

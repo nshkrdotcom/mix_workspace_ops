@@ -16,15 +16,34 @@ defmodule MixWorkspaceOps.Binding do
   @scp_remote ~r{^(?<authority>[^/:]+):(?<path>.+)$}
   @segment ~r{^[A-Za-z0-9_.\-]+$}
 
-  @spec resolve(Registry.t(), String.t(), keyword()) ::
-          {:ok, %{String.t() => String.t()}} | {:error, term()}
+  @typedoc """
+  What binding found for every catalogued repository.
+
+  `bound` maps a repository id to its verified checkout root. `absent` maps a
+  repository id to the path a checkout was looked for at. Every catalogued
+  repository appears in exactly one of the two.
+  """
+  @type report :: %{bound: %{String.t() => String.t()}, absent: %{String.t() => String.t()}}
+
+  @doc """
+  Binds every catalogued repository against `checkout_root`.
+
+  Absence is data: a repository with no checkout is recorded in `absent` with
+  the path it was looked for at, and binding continues. An invalid checkout is
+  an error and stops the whole binding — a directory that is not a Git root, a
+  non-canonical common directory, an origin naming the wrong catalogued
+  repository or two of them, and two repositories bound to one Git directory are
+  all statements that contradict the catalog rather than facts about what an
+  operator has cloned.
+  """
+  @spec resolve(Registry.t(), String.t(), keyword()) :: {:ok, report()} | {:error, term()}
   def resolve(registry, checkout_root, opts \\ []) do
     checkout_root = Path.expand(checkout_root)
 
     with {:ok, overrides} <- load_overrides(Keyword.get(opts, :binding_file)),
-         {:ok, bindings} <- bind_all(registry, checkout_root, overrides),
-         :ok <- reject_duplicate_common_dirs(bindings) do
-      {:ok, bindings}
+         {:ok, report} <- bind_all(registry, checkout_root, overrides),
+         :ok <- reject_duplicate_common_dirs(report.bound) do
+      {:ok, report}
     end
   end
 
@@ -100,16 +119,23 @@ defmodule MixWorkspaceOps.Binding do
 
   defp bind_all(registry, checkout_root, overrides) do
     catalogued = catalogued_identities(registry)
+    empty = %{bound: %{}, absent: %{}}
 
     registry.repositories
     |> Map.values()
     |> Enum.sort_by(& &1.id)
-    |> Enum.reduce_while({:ok, %{}}, fn repository, {:ok, bindings} ->
+    |> Enum.reduce_while({:ok, empty}, fn repository, {:ok, report} ->
       path = Map.get(overrides, repository.id, conventional_path(checkout_root, repository))
 
       case verify(repository, path, catalogued) do
-        {:ok, root} -> {:cont, {:ok, Map.put(bindings, repository.id, root)}}
-        {:error, reason} -> {:halt, {:error, reason}}
+        {:ok, root} ->
+          {:cont, {:ok, put_in(report.bound[repository.id], root)}}
+
+        {:absent, expected} ->
+          {:cont, {:ok, put_in(report.absent[repository.id], expected)}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
       end
     end)
   end
@@ -117,7 +143,7 @@ defmodule MixWorkspaceOps.Binding do
   defp verify(repository, path, catalogued) do
     path = Path.expand(path)
 
-    with true <- File.dir?(path) || {:error, {:missing_checkout, repository.id, path}},
+    with true <- File.dir?(path) || {:absent, path},
          {:ok, root} <- Git.root(path),
          true <- root == path || {:error, {:checkout_not_git_root, repository.id, path, root}},
          {:ok, common_dir} <- Git.common_dir(path),
@@ -127,6 +153,7 @@ defmodule MixWorkspaceOps.Binding do
          :ok <- verify_identity(repository, path, catalogued) do
       {:ok, root}
     else
+      {:absent, expected} -> {:absent, expected}
       {:error, reason} -> {:error, reason}
     end
   end
