@@ -700,7 +700,7 @@ defmodule MixWorkspaceOps.ResolutionTest do
              ]
     end
 
-    test "resolve reads the override file from the consuming repository root", context do
+    test "resolve reads the override file from the consuming project root", context do
       root = temporary_directory!(context)
       initialize_repository!(Path.join(root, "core"))
       consumer = initialize_repository!(Path.join(root, "consumer"))
@@ -729,6 +729,64 @@ defmodule MixWorkspaceOps.ResolutionTest do
       assert decision.source == "local"
       assert decision.reason == :local_override
       assert Map.keys(report.overrides) == ["core"]
+    end
+  end
+
+  describe "where the consumer is" do
+    # The file this replaces read its override from the Mix project root, and
+    # ten of the fifty-two live installs sit in a subproject. Reading from the
+    # repository checkout instead means those ten read a file that is not there
+    # and silently apply no override.
+    test "a project inside a repository reads its own override file", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      repository = initialize_repository!(Path.join(root, "workspace"))
+      leaf = Path.join(repository, "apps/leaf")
+      File.mkdir_p!(leaf)
+      File.write!(Path.join(leaf, "mix.exs"), "# leaf\n")
+
+      registry =
+        root
+        |> write_catalog!([
+          catalog_repository("core", projects: [catalog_project("core")]),
+          catalog_repository("workspace",
+            projects: [
+              catalog_project("workspace", kind: "workspace_root", app: nil),
+              catalog_project("workspace.leaf", app: "leaf", path: "apps/leaf")
+            ],
+            dependency_sources: %{"core" => %{"hex" => "~> 1.0", "order" => ["hex"]}}
+          )
+        ])
+        |> Registry.load!()
+        |> bind!(root)
+
+      reader = fn
+        %{id: "workspace.leaf"} -> {:ok, ["core"]}
+        _project -> {:ok, []}
+      end
+
+      # At the repository root, where the file is not, the override is absent.
+      File.write!(
+        Path.join(repository, LocalOverrides.filename()),
+        ~s|%{deps: %{core: %{source: :path}}}|
+      )
+
+      assert {:ok, unread} =
+               Resolution.resolve(registry, "workspace.leaf", dependency_reader: reader)
+
+      assert unread.consumer_root == leaf
+      assert [%{source: "hex"}] = unread.decisions
+
+      # Beside the project, where a Mix command runs, it is read.
+      File.write!(
+        Path.join(leaf, LocalOverrides.filename()),
+        ~s|%{deps: %{core: %{source: :path}}}|
+      )
+
+      assert {:ok, read} =
+               Resolution.resolve(registry, "workspace.leaf", dependency_reader: reader)
+
+      assert [%{source: "local", reason: :local_override}] = read.decisions
     end
   end
 

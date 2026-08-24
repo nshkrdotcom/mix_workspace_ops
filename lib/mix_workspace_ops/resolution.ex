@@ -13,8 +13,8 @@ defmodule MixWorkspaceOps.Resolution do
   Availability is a property of the declaration and of the operator's disk:
 
     * `local` is available when a catalogued project provides the application,
-      its repository has a checkout, the derived path exists, and that path is
-      not inside a Mix `deps/` directory the consumer is itself running out of.
+      its repository has a checkout, the derived path exists, and the consumer
+      is not itself running out of a Mix `deps/` directory that contains it.
     * `github` is available when the declaration carries GitHub coordinates.
     * `hex` is available when the declaration carries a published requirement.
 
@@ -152,9 +152,13 @@ defmodule MixWorkspaceOps.Resolution do
   Resolves every catalogued application the target's closure depends on.
 
   `:closure` supplies an already-computed `MixWorkspaceOps.Graph` resolution;
-  without it the closure is derived here. `:consumer_root` is the checkout root
-  of the project doing the resolving and defaults to the target's own checkout;
-  the Mix `deps/` test is relative to it. `:publish?` says the command about to
+  without it the closure is derived here. `:consumer_root` is the Mix project
+  root of the project doing the resolving and defaults to the target's own —
+  its repository checkout joined to its path inside it, which for a project at
+  the repository root is the same directory. The override file is read from
+  there and the Mix `deps/` test is relative to it, because both are facts about
+  the directory a Mix command actually runs in, and ten of the live installs
+  this replaces sit in subprojects. `:publish?` says the command about to
   run publishes, and defaults to false. `:mode` overrides the source for the
   whole closure, `:sources` overrides one application, and `:overrides` carries
   the parsed override file; without `:overrides` the file is read from
@@ -223,8 +227,14 @@ defmodule MixWorkspaceOps.Resolution do
   @doc """
   True when a derived local path is a developer checkout.
 
-  A path that exists but resolves inside the Mix `deps/` directory the consumer
-  is running out of is another Mix-fetched dependency, not a sibling checkout.
+  The test is on the **consumer**: where its own root sits under a path segment
+  named `deps`, it was fetched by Mix rather than cloned by an operator, and
+  everything beside it under that same directory was too. A candidate there is
+  another Mix-fetched dependency, not a sibling checkout. Where the consumer is
+  not under such a directory, nothing is rejected on this ground — including a
+  candidate that happens to sit in the consumer's own `deps/`, which is a
+  different directory from the one the consumer is running out of.
+
   Without this test, `mix deps.get` from a fresh clone materializes siblings
   under `deps/`, resolution running as `<parent>/deps/<child>` mistakes one for
   a developer checkout, picks `local`, and Mix refuses with "overriding a child
@@ -236,7 +246,10 @@ defmodule MixWorkspaceOps.Resolution do
     File.exists?(absolute) and not under_mix_deps_dir?(consumer_root, absolute)
   end
 
-  @doc "True when `absolute` sits under the Mix `deps/` directory `consumer_root` runs out of."
+  @doc """
+  True when `consumer_root` is itself under a Mix `deps/` directory that also
+  contains `absolute`.
+  """
   @spec under_mix_deps_dir?(String.t() | nil, String.t()) :: boolean()
   def under_mix_deps_dir?(nil, _absolute), do: false
 
@@ -739,9 +752,14 @@ defmodule MixWorkspaceOps.Resolution do
     project = Registry.project!(registry, target)
 
     case Registry.checkout(registry, project.repository) do
-      {:bound, root} -> {:ok, root}
-      {:absent, expected} -> {:error, {:absent_required_checkout, project.repository, expected}}
-      :unknown -> {:error, {:unknown_repository, project.repository}}
+      {:bound, root} ->
+        {:ok, root |> Path.join(project.path) |> Path.expand()}
+
+      {:absent, expected} ->
+        {:error, {:absent_required_checkout, project.repository, expected}}
+
+      :unknown ->
+        {:error, {:unknown_repository, project.repository}}
     end
   end
 

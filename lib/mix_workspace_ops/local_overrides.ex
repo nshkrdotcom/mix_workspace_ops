@@ -1,6 +1,10 @@
 defmodule MixWorkspaceOps.LocalOverrides do
   @moduledoc """
-  The operator's `.dependency_sources.local.exs`, read from a repository root.
+  The operator's `.dependency_sources.local.exs`, read from the Mix project root
+  of the project doing the resolving — its repository checkout joined to its path
+  inside it, which for a project at the repository root is the same directory.
+  That is the directory a Mix command actually runs in, and it is where the file
+  this replaces looked.
 
   This is the one gesture for a source switch an operator wants to keep across
   runs, and the one place a machine-local absolute path belongs: the catalog
