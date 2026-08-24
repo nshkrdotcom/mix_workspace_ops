@@ -31,7 +31,10 @@ defmodule MixWorkspaceOps.LocalOverrides do
       `path` is accepted as a name for `local`, which is what the file this
       replaces called it.
     * `path` — replaces the derived local path, and is what makes a checkout
-      outside the conventional root reachable.
+      outside the conventional root reachable. It may be a list, in which case
+      the first candidate that is a usable checkout wins; that is how one
+      override file serves two machines that keep their checkouts in different
+      places.
     * `hex` — replaces the published requirement.
     * `repo`, `branch`, `ref`, `tag`, `subdir` — merge into the declaration's
       GitHub coordinates, so one branch moves without restating the
@@ -58,7 +61,7 @@ defmodule MixWorkspaceOps.LocalOverrides do
   @type override :: %{
           source: String.t() | nil,
           requested_source: String.t() | nil,
-          path: String.t() | nil,
+          path: String.t() | [String.t()] | nil,
           hex: String.t() | nil,
           github: %{String.t() => String.t()}
         }
@@ -171,12 +174,13 @@ defmodule MixWorkspaceOps.LocalOverrides do
   defp override(app, raw, path) when is_map(raw) do
     with :ok <- known_keys(app, raw, path),
          :ok <- single_revision(app, raw, path),
+         {:ok, candidates} <- candidates(app, Map.get(raw, "path"), path),
          {:ok, source, requested} <- source(app, Map.get(raw, "source"), path) do
       {:ok,
        %{
          source: source,
          requested_source: requested,
-         path: Map.get(raw, "path"),
+         path: candidates,
          hex: Map.get(raw, "hex"),
          github: Map.take(raw, @github_keys)
        }}
@@ -191,6 +195,18 @@ defmodule MixWorkspaceOps.LocalOverrides do
       unknown -> {:error, {:unknown_override_keys, path, app, Enum.sort(unknown)}}
     end
   end
+
+  defp candidates(_app, nil, _path), do: {:ok, nil}
+  defp candidates(_app, candidate, _path) when is_binary(candidate), do: {:ok, [candidate]}
+
+  defp candidates(app, candidates, path) when is_list(candidates) do
+    if candidates != [] and Enum.all?(candidates, &is_binary/1),
+      do: {:ok, candidates},
+      else: {:error, {:invalid_override_path, path, app, candidates}}
+  end
+
+  defp candidates(app, candidates, path),
+    do: {:error, {:invalid_override_path, path, app, candidates}}
 
   defp single_revision(app, raw, path) do
     case Enum.filter(@revision_keys, &Map.has_key?(raw, &1)) do

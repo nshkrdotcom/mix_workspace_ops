@@ -349,12 +349,38 @@ defmodule MixWorkspaceOps.ResolutionTest do
       declaration = %{"hex" => "~> 1.0", "order" => ["hex"]}
       registry = registry(root, declaration)
 
-      override = %{LocalOverrides.empty() | source: "local", path: elsewhere}
+      override = %{LocalOverrides.empty() | source: "local", path: [elsewhere]}
 
       assert {:ok, decision} =
                decide(registry, root, "core", declaration, overrides: %{"core" => override})
 
       assert decision.location == elsewhere
+    end
+
+    test "an override path takes the first candidate that is a checkout", context do
+      root = temporary_directory!(context)
+      elsewhere = Path.join(root, "elsewhere/core")
+      initialize_repository!(elsewhere)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+      declaration = %{"hex" => "~> 1.0", "order" => ["hex"]}
+      registry = registry(root, declaration)
+
+      override = %{
+        LocalOverrides.empty()
+        | source: "local",
+          path: [Path.join(root, "nowhere"), elsewhere, Path.join(root, "core")]
+      }
+
+      assert {:ok, decision} =
+               decide(registry, root, "core", declaration, overrides: %{"core" => override})
+
+      assert decision.location == elsewhere
+
+      unusable = %{LocalOverrides.empty() | source: "local", path: [Path.join(root, "nowhere")]}
+
+      assert {:error, {:unavailable_source, "core", "local", :local_override}} =
+               decide(registry, root, "core", declaration, overrides: %{"core" => unusable})
     end
 
     test "an override replaces the requirement and merges the coordinates", context do
@@ -484,7 +510,7 @@ defmodule MixWorkspaceOps.ResolutionTest do
       assert {:error, {:unavailable_source, "core", "local", :dependency_override}} =
                decide(registry, root, "core", declaration,
                  sources: %{"core" => "local"},
-                 overrides: %{"core" => %{LocalOverrides.empty() | path: "/nowhere/at/all"}}
+                 overrides: %{"core" => %{LocalOverrides.empty() | path: ["/nowhere/at/all"]}}
                )
     end
 

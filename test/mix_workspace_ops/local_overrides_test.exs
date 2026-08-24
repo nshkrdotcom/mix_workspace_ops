@@ -21,13 +21,30 @@ defmodule MixWorkspaceOps.LocalOverridesTest do
 
     assert overrides["example_core"].source == "local"
     assert overrides["example_core"].requested_source == "path"
-    assert overrides["example_core"].path == "/checkouts/example_core"
+    assert overrides["example_core"].path == ["/checkouts/example_core"]
     assert overrides["example_edge"].source == "hex"
 
     assert overrides["example_forked"].github == %{
              "branch" => "trial",
              "subdir" => "core/forked"
            }
+  end
+
+  test "a path may name several candidates", context do
+    root = temporary_directory!(context)
+    write!(root, ~s|%{deps: %{example_core: %{source: :path, path: ["/a/core", "/b/core"]}}}|)
+
+    assert {:ok, overrides} = LocalOverrides.load(root)
+    assert overrides["example_core"].path == ["/a/core", "/b/core"]
+
+    write!(root, ~s|%{deps: %{example_core: %{path: "/a/core"}}}|)
+    assert {:ok, overrides} = LocalOverrides.load(root)
+    assert overrides["example_core"].path == ["/a/core"]
+
+    write!(root, ~s|%{deps: %{example_core: %{path: []}}}|)
+
+    assert {:error, {:invalid_override_path, _path, "example_core", []}} =
+             LocalOverrides.load(root)
   end
 
   test "a repository with no file has no overrides", context do

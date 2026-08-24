@@ -391,7 +391,7 @@ defmodule MixWorkspaceOps.Resolution do
   defp local_source(registry, app, declaration, opts) do
     case override(opts, app).path do
       nil -> derived_local(registry, app, declaration, opts)
-      path -> overridden_local(registry, app, declaration, path, opts)
+      candidates -> overridden_local(registry, app, declaration, candidates, opts)
     end
   end
 
@@ -408,22 +408,27 @@ defmodule MixWorkspaceOps.Resolution do
 
   # An override path is the operator saying where the checkout is, so it stands
   # in for the derived one both in the order walk and in the emitted location.
-  # It is still held to the sibling test: a path inside the consumer's own Mix
-  # `deps/` is not a developer checkout however it was named.
-  defp overridden_local(registry, app, declaration, path, opts) do
+  # Several candidates may be named and the first usable one wins, which is how
+  # one override file serves two machines. Every candidate is still held to the
+  # sibling test: a path inside the consumer's own Mix `deps/` is not a
+  # developer checkout however it was named.
+  defp overridden_local(registry, app, declaration, candidates, opts) do
     consumer_root = Keyword.get(opts, :consumer_root)
-    absolute = Path.expand(path, consumer_root || File.cwd!())
+    base = consumer_root || File.cwd!()
 
-    if usable_sibling_path?(absolute, consumer_root) do
-      provider_id =
-        case provider(registry, app, declaration) do
-          {:ok, project} -> project.id
-          :unavailable -> nil
-        end
+    candidates
+    |> Enum.map(&Path.expand(&1, base))
+    |> Enum.find(&usable_sibling_path?(&1, consumer_root))
+    |> case do
+      nil -> :unavailable
+      absolute -> {:ok, absolute, provider_id(registry, app, declaration)}
+    end
+  end
 
-      {:ok, absolute, provider_id}
-    else
-      :unavailable
+  defp provider_id(registry, app, declaration) do
+    case provider(registry, app, declaration) do
+      {:ok, project} -> project.id
+      :unavailable -> nil
     end
   end
 
