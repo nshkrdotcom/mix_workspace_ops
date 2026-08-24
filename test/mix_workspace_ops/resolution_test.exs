@@ -81,8 +81,10 @@ defmodule MixWorkspaceOps.ResolutionTest do
       registry = registry(root, %{"hex" => "~> 1.0"})
       File.rm_rf!(Path.join(root, "core"))
 
-      assert {:error, {:no_available_source, "core", ["local"]}} =
+      assert {:error, {:no_available_source, "core", ["local"], considered}} =
                decide(registry, root, "core", %{"hex" => "~> 1.0", "order" => ["local"]})
+
+      assert considered == [%{source: "local", outcome: :missing_path}]
     end
 
     test "an absent checkout falls through instead of failing", context do
@@ -129,8 +131,62 @@ defmodule MixWorkspaceOps.ResolutionTest do
       assert decision.provider_project_id == "fork"
       assert decision.location == Path.join(root, "fork")
 
-      assert {:ok, ambiguous} = decide(registry, root, "shared", %{"hex" => "~> 1.0"})
-      assert ambiguous.source == "hex"
+      # Without a provider the catalog cannot say which project this is, and
+      # answering from Hex would answer a question nobody asked — and answer it
+      # differently from the closure, which refuses the same input.
+      assert {:error, {:ambiguous_application, "shared", ["fork", "upstream"]}} =
+               decide(registry, root, "shared", %{"hex" => "~> 1.0"})
+    end
+
+    test "a provider naming a project that does not provide the application is an error",
+         context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "consumer"))
+      initialize_repository!(Path.join(root, "upstream"))
+
+      registry =
+        root
+        |> write_catalog!([
+          catalog_repository("consumer", projects: [catalog_project("consumer")]),
+          catalog_repository("upstream", projects: [catalog_project("upstream", app: "shared")])
+        ])
+        |> Registry.load!()
+        |> bind!(root)
+
+      assert {:error, {:unknown_provider, "shared", "absent", ["upstream"]}} =
+               Resolution.decide(
+                 registry,
+                 "shared",
+                 %{
+                   github: nil,
+                   hex: "~> 1.0",
+                   provider: "absent",
+                   order: Source.default_order(),
+                   publish_order: Source.default_publish_order(),
+                   opts: %{}
+                 },
+                 consumer_root: Path.join(root, "consumer")
+               )
+    end
+
+    test "an application the catalog does not provide falls through to its declaration",
+         context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "consumer"))
+      registry = registry(root, %{"hex" => "~> 1.0"})
+
+      assert {:ok, decision} =
+               decide(registry, root, "third_party", %{
+                 "github" => %{"repo" => "example-org/third-party", "branch" => "main"}
+               })
+
+      assert decision.source == "github"
+
+      assert decision.considered == [
+               %{source: "local", outcome: :no_catalogued_provider},
+               %{source: "github", outcome: :chosen},
+               %{source: "hex", outcome: :not_reached}
+             ]
     end
 
     test "an explicit order is walked exactly as declared", context do
@@ -233,6 +289,76 @@ defmodule MixWorkspaceOps.ResolutionTest do
     end
   end
 
+  describe "which applications are decided" do
+    # A catalogued application no table declares was never managed: the file
+    # this replaces raised for one, and iterated its table and nothing else.
+    # Deciding it anyway invented a declaration whose publish order is `hex`
+    # with no requirement, so publish resolution could never complete.
+    test "an application no dependency-source table declares is not decided", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "third_party"))
+      initialize_repository!(Path.join(root, "consumer"))
+
+      registry =
+        root
+        |> write_catalog!([
+          catalog_repository("core", projects: [catalog_project("core")]),
+          catalog_repository("third_party", projects: [catalog_project("third_party")]),
+          catalog_repository("consumer",
+            projects: [catalog_project("consumer")],
+            dependency_sources: %{"core" => %{"hex" => "~> 1.0"}}
+          )
+        ])
+        |> Registry.load!()
+        |> bind!(root)
+
+      assert {:ok, report} =
+               Resolution.resolve(registry, "consumer", dependency_reader: &reader/1)
+
+      assert Enum.map(report.decisions, & &1.application) == ["core"]
+
+      # And publish resolution completes, which it could not while the
+      # undeclared application inherited a `hex` order with no requirement.
+      assert {:ok, publishing} =
+               Resolution.resolve(registry, "consumer",
+                 dependency_reader: &reader/1,
+                 publish?: true
+               )
+
+      assert Enum.map(publishing.decisions, &{&1.application, &1.source}) == [{"core", "hex"}]
+    end
+
+    test "a whole-closure mode names every application it cannot serve", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "third_party"))
+      initialize_repository!(Path.join(root, "consumer"))
+
+      registry =
+        root
+        |> write_catalog!([
+          catalog_repository("core", projects: [catalog_project("core")]),
+          catalog_repository("third_party", projects: [catalog_project("third_party")]),
+          catalog_repository("consumer",
+            projects: [catalog_project("consumer")],
+            dependency_sources: %{
+              "core" => %{"order" => ["local"]},
+              "third_party" => %{"order" => ["local"]}
+            }
+          )
+        ])
+        |> Registry.load!()
+        |> bind!(root)
+
+      assert {:error, {:unavailable_run_mode, "hex", ["core", "third_party"]}} =
+               Resolution.resolve(registry, "consumer",
+                 dependency_reader: &reader/1,
+                 mode: "hex"
+               )
+    end
+  end
+
   describe "publish mode" do
     test "resolves through the publish order rather than the ordinary one", context do
       root = temporary_directory!(context)
@@ -275,8 +401,10 @@ defmodule MixWorkspaceOps.ResolutionTest do
       declaration = %{"github" => %{"repo" => "example-org/core"}, "order" => ["local", "github"]}
       registry = registry(root, declaration)
 
-      assert {:error, {:no_available_source, "core", ["hex"]}} =
+      assert {:error, {:no_available_source, "core", ["hex"], considered}} =
                decide(registry, root, "core", declaration, publish?: true)
+
+      assert considered == [%{source: "hex", outcome: :no_hex_requirement}]
     end
   end
 
@@ -580,6 +708,11 @@ defmodule MixWorkspaceOps.ResolutionTest do
                application: "core",
                source: "local",
                reason: :order,
+               considered: [
+                 %{source: "local", outcome: :chosen},
+                 %{source: "github", outcome: :not_reached},
+                 %{source: "hex", outcome: :not_reached}
+               ],
                provider: "core",
                location: Path.join(root, "core"),
                version: "0.1.0",

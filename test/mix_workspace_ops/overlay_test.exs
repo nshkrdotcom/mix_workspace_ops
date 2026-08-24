@@ -142,10 +142,10 @@ defmodule MixWorkspaceOps.OverlayTest do
     initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
     registry = registry(root, declaration: %{"order" => ["local"]})
 
-    assert {:error, {:unavailable_source, "core", "hex", :run_mode}} =
+    assert {:error, {:unavailable_run_mode, "hex", ["core"]}} =
              Overlay.activate(registry, "consumer", mode: :hex, state_root: state_root)
 
-    assert {:error, {:unavailable_source, "core", "github", :run_mode}} =
+    assert {:error, {:unavailable_run_mode, "github", ["core"]}} =
              Overlay.activate(registry, "consumer", mode: :git, state_root: state_root)
   end
 

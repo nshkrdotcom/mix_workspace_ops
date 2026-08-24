@@ -22,9 +22,12 @@ defmodule MixWorkspaceOps.ContractExamplesTest do
 
     registry =
       root
-      |> write_registry!([
-        repository("core", [project("core")]),
-        repository("consumer", [project("consumer")])
+      |> write_catalog!([
+        catalog_repository("core", projects: [catalog_project("core")]),
+        catalog_repository("consumer",
+          projects: [catalog_project("consumer")],
+          dependency_sources: %{"core" => %{"hex" => "~> 0.1.0"}}
+        )
       ])
       |> Registry.load!()
       |> bind!(root)

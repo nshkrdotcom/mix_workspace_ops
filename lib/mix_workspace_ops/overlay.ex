@@ -398,6 +398,7 @@ defmodule MixWorkspaceOps.Overlay do
       application: decision.application,
       source: decision.source,
       reason: decision.reason,
+      considered: decision.considered,
       provider: decision.provider_project_id,
       location: reported_location(decision),
       declared_by: decision.declared_by

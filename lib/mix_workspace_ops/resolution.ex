@@ -18,8 +18,23 @@ defmodule MixWorkspaceOps.Resolution do
     * `github` is available when the declaration carries GitHub coordinates.
     * `hex` is available when the declaration carries a published requirement.
 
-  Nothing available is an error naming the application and the order that was
-  walked, because a dependency that resolves from nowhere cannot be built.
+  Nothing available is an error naming the application, the order that was
+  walked, and what each candidate in it was rejected for, because a dependency
+  that resolves from nowhere cannot be built and the remedy depends on which
+  candidate failed and why.
+
+  Every decision records the candidates the walk considered alongside the rule
+  that fired. A `reason` says which rule decided; the candidates say what fell
+  through, which is the whole diagnostic value of an ordered walk.
+
+  A `local` candidate is unavailable — and resolution falls through — when no
+  catalogued project provides the application, when the providing repository has
+  no checkout, when the derived path is missing or sits inside the consumer's
+  Mix `deps/`, or when the selection excludes every provider. Two outcomes are
+  errors instead: an application several catalogued projects provide with no
+  `provider` to choose between them, and a `provider` naming a project that does
+  not provide the application. Both say the catalog cannot answer, and answering
+  from GitHub instead would answer a question nobody asked.
 
   ## Overrides
 
@@ -57,13 +72,15 @@ defmodule MixWorkspaceOps.Resolution do
 
   ## Which applications are decided
 
-  One decision per application anything in the closure depends on: every
-  application provided by a project another closure project depends on, plus
-  every application outside the catalog that a closure project's
-  dependency-source table declares. The second set is what carries a
-  third-party GitHub dependency that will never have a Hex release. A seed
-  project's own application is not decided — it is what is being built, not
-  something being sourced.
+  One decision per application that something in the closure depends on **and**
+  some closure project's dependency-source table declares. Both halves are
+  needed: the table is what says how an application resolves, and the closure is
+  what says the application is wanted here. An application no table declares
+  keeps whatever its `mix.exs` call site committed to, which is what a
+  dependency outside this catalog's business should do.
+
+  A seed project's own application is not decided — it is what is being built,
+  not something being sourced.
 
   Where several closure projects declare the same application, the target
   project's declaration wins; otherwise the declaration of the lowest project
@@ -89,10 +106,12 @@ defmodule MixWorkspaceOps.Resolution do
   }
   @list_options ~w(only targets)
 
+  @type candidate :: %{source: String.t(), outcome: atom()}
   @type decision :: %{
           application: String.t(),
           source: String.t(),
           reason: atom(),
+          considered: [candidate()],
           provider_project_id: String.t() | nil,
           location: term(),
           opts: keyword(),
@@ -112,6 +131,7 @@ defmodule MixWorkspaceOps.Resolution do
           application: String.t(),
           source: String.t(),
           reason: atom(),
+          considered: [candidate()],
           provider: String.t() | nil,
           location: String.t(),
           version: String.t() | nil,
@@ -169,22 +189,9 @@ defmodule MixWorkspaceOps.Resolution do
   @spec decide(Registry.t(), String.t(), Source.t(), keyword()) ::
           {:ok, decision()} | {:error, term()}
   def decide(registry, app, declaration, opts \\ []) do
-    with {:ok, {source, reason}} <- select(registry, app, declaration, opts) do
-      build(registry, app, declaration, source, reason, opts)
+    with {:ok, {source, reason, considered}} <- select(registry, app, declaration, opts) do
+      build(registry, app, declaration, source, reason, considered, opts)
     end
-  end
-
-  @doc "The declaration an application inherits when nothing declares it."
-  @spec default_declaration() :: Source.t()
-  def default_declaration do
-    %{
-      github: nil,
-      hex: nil,
-      provider: nil,
-      order: Source.default_order(),
-      publish_order: Source.default_publish_order(),
-      opts: %{}
-    }
   end
 
   @doc """
@@ -293,6 +300,7 @@ defmodule MixWorkspaceOps.Resolution do
       application: decision.application,
       source: decision.source,
       reason: decision.reason,
+      considered: decision.considered,
       provider: decision.provider_project_id,
       location: location,
       version: version,
@@ -328,13 +336,13 @@ defmodule MixWorkspaceOps.Resolution do
         end
 
       not is_nil(requested) ->
-        {:ok, {requested, :dependency_override}}
+        {:ok, {requested, :dependency_override, chosen(requested)}}
 
       not is_nil(override.source) ->
-        {:ok, {override.source, :local_override}}
+        {:ok, {override.source, :local_override, chosen(override.source)}}
 
       not is_nil(mode) ->
-        {:ok, {mode, :run_mode}}
+        {:ok, {mode, :run_mode, chosen(mode)}}
 
       true ->
         from_order(registry, app, declaration, declaration.order, :order, opts)
@@ -372,21 +380,56 @@ defmodule MixWorkspaceOps.Resolution do
     end
   end
 
+  # An ordered walk that records only which rule fired cannot tell an operator
+  # whether `hex` was first or whether `local` and `github` were tried and
+  # rejected, which is the whole diagnostic value of an order. Every candidate
+  # the walk looked at is recorded with what it found, and the ones after the
+  # winner are recorded as never reached.
   defp from_order(registry, app, declaration, order, reason, opts) do
-    case Enum.find(order, &available?(registry, app, declaration, &1, opts)) do
-      nil -> {:error, {:no_available_source, app, order}}
-      source -> {:ok, {source, reason}}
+    case walk(order, registry, app, declaration, opts, []) do
+      {:ok, source, considered} -> {:ok, {source, reason, considered}}
+      {:exhausted, considered} -> {:error, {:no_available_source, app, order, considered}}
+      {:error, error} -> {:error, error}
     end
   end
 
-  defp available?(registry, app, declaration, @local, opts),
-    do: match?({:ok, _path, _provider}, local_source(registry, app, declaration, opts))
+  defp walk([], _registry, _app, _declaration, _opts, considered),
+    do: {:exhausted, Enum.reverse(considered)}
 
-  defp available?(_registry, _app, declaration, @github, _opts),
-    do: not is_nil(declaration.github)
+  defp walk([source | rest], registry, app, declaration, opts, considered) do
+    case availability(registry, app, declaration, source, opts) do
+      :available ->
+        {:ok, source, Enum.reverse([candidate(source, :chosen) | considered]) ++ unreached(rest)}
 
-  defp available?(_registry, _app, declaration, @hex, _opts), do: not is_nil(declaration.hex)
-  defp available?(_registry, _app, _declaration, _source, _opts), do: false
+      {:error, error} ->
+        {:error, error}
+
+      outcome ->
+        walk(rest, registry, app, declaration, opts, [candidate(source, outcome) | considered])
+    end
+  end
+
+  defp candidate(source, outcome), do: %{source: source, outcome: outcome}
+  defp chosen(source), do: [candidate(source, :chosen)]
+  defp unreached(sources), do: Enum.map(sources, &candidate(&1, :not_reached))
+
+  # `:available`, an error the walk must not swallow, or the reason this
+  # candidate was rejected.
+  defp availability(registry, app, declaration, @local, opts) do
+    case local_source(registry, app, declaration, opts) do
+      {:ok, _path, _provider} -> :available
+      {:error, error} -> {:error, error}
+      outcome -> outcome
+    end
+  end
+
+  defp availability(_registry, _app, declaration, @github, _opts),
+    do: if(is_nil(declaration.github), do: :no_github_coordinates, else: :available)
+
+  defp availability(_registry, _app, declaration, @hex, _opts),
+    do: if(is_nil(declaration.hex), do: :no_hex_requirement, else: :available)
+
+  defp availability(_registry, _app, _declaration, _source, _opts), do: :unknown_source
 
   defp local_source(registry, app, declaration, opts) do
     case override(opts, app).path do
@@ -396,13 +439,31 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   defp derived_local(registry, app, declaration, opts) do
-    with {:ok, project} <- provider(registry, app, declaration),
-         {:bound, root} <- Registry.checkout(registry, project.repository),
-         path = root |> Path.join(project.path) |> Path.expand(),
-         true <- usable_sibling_path?(path, Keyword.get(opts, :consumer_root)) do
-      {:ok, path, project.id}
-    else
-      _unavailable -> :unavailable
+    case provider(registry, app, declaration) do
+      {:ok, project} -> provider_path(registry, project, opts)
+      outcome -> outcome
+    end
+  end
+
+  defp provider_path(registry, project, opts) do
+    case Registry.checkout(registry, project.repository) do
+      {:bound, root} ->
+        path = root |> Path.join(project.path) |> Path.expand()
+        sibling(path, project.id, Keyword.get(opts, :consumer_root))
+
+      {:absent, _expected} ->
+        :absent_checkout
+
+      :unknown ->
+        :unbound_repository
+    end
+  end
+
+  defp sibling(path, provider_id, consumer_root) do
+    cond do
+      not File.exists?(path) -> :missing_path
+      under_mix_deps_dir?(consumer_root, path) -> :inside_mix_deps
+      true -> {:ok, path, provider_id}
     end
   end
 
@@ -410,63 +471,85 @@ defmodule MixWorkspaceOps.Resolution do
   # in for the derived one both in the order walk and in the emitted location.
   # Several candidates may be named and the first usable one wins, which is how
   # one override file serves two machines. Every candidate is still held to the
-  # sibling test: a path inside the consumer's own Mix `deps/` is not a
-  # developer checkout however it was named.
+  # sibling test: a candidate is rejected where the consumer's own checkout root
+  # sits under a Mix `deps/` directory, because everything beside it there was
+  # fetched by Mix rather than cloned by an operator.
+  #
+  # The provider is only the label this path is reported under. Where the
+  # catalog cannot name one the operator has already settled the question by
+  # naming the path, so the label is absent rather than the resolution refused.
   defp overridden_local(registry, app, declaration, candidates, opts) do
-    consumer_root = Keyword.get(opts, :consumer_root)
-    base = consumer_root || File.cwd!()
+    case Keyword.get(opts, :consumer_root) do
+      nil ->
+        {:error, {:override_path_without_consumer_root, app}}
 
-    candidates
-    |> Enum.map(&Path.expand(&1, base))
-    |> Enum.find(&usable_sibling_path?(&1, consumer_root))
-    |> case do
-      nil -> :unavailable
-      absolute -> {:ok, absolute, provider_id(registry, app, declaration)}
+      consumer_root ->
+        candidates
+        |> Enum.map(&Path.expand(&1, consumer_root))
+        |> Enum.find(&usable_sibling_path?(&1, consumer_root))
+        |> case do
+          nil -> :missing_path
+          absolute -> {:ok, absolute, provider_id(registry, app, declaration)}
+        end
     end
   end
 
   defp provider_id(registry, app, declaration) do
     case provider(registry, app, declaration) do
       {:ok, project} -> project.id
-      :unavailable -> nil
+      _unnamed -> nil
     end
   end
 
+  # `Registry.resolve_dependency/3` distinguishes four outcomes its own
+  # documentation says a caller must not conflate, and each means something
+  # different here. No catalogued provider, an absent checkout and a provider
+  # the selection leaves out all make `local` unavailable, so resolution falls
+  # through to the next candidate. An ambiguous application and a provider
+  # naming a project that does not provide it are errors: they say the catalog
+  # cannot answer, and falling through to GitHub answers a question nobody
+  # asked — and answers it differently from `MixWorkspaceOps.Graph`, which
+  # refuses the same input.
   defp provider(registry, app, declaration) do
     case Registry.resolve_dependency(registry, app, declaration.provider) do
       {:ok, project} -> {:ok, project}
-      _other -> :unavailable
+      {:known_unselected, _project_ids} -> :known_unselected
+      :unknown -> :no_catalogued_provider
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  defp build(registry, app, declaration, @local, reason, opts) do
+  defp build(registry, app, declaration, @local, reason, considered, opts) do
     case local_source(registry, app, declaration, opts) do
       {:ok, path, provider_id} ->
-        {:ok, decision(app, @local, reason, provider_id, path, declaration)}
+        {:ok, decision(app, @local, reason, considered, provider_id, path, declaration)}
 
-      :unavailable ->
+      {:error, error} ->
+        {:error, error}
+
+      _unavailable ->
         {:error, {:unavailable_source, app, @local, reason}}
     end
   end
 
-  defp build(_registry, app, declaration, @github, reason, opts) do
+  defp build(_registry, app, declaration, @github, reason, considered, opts) do
     case github(declaration, override(opts, app)) do
       %{repo: repo} = coordinates when is_binary(repo) ->
-        {:ok, decision(app, @github, reason, nil, coordinates, declaration)}
+        {:ok, decision(app, @github, reason, considered, nil, coordinates, declaration)}
 
       _incomplete ->
         {:error, {:unavailable_source, app, @github, reason}}
     end
   end
 
-  defp build(_registry, app, declaration, @hex, reason, opts) do
+  defp build(_registry, app, declaration, @hex, reason, considered, opts) do
     case requirement(declaration, override(opts, app)) do
       nil -> {:error, {:unavailable_source, app, @hex, reason}}
-      requirement -> {:ok, decision(app, @hex, reason, nil, requirement, declaration)}
+      requirement -> {:ok, decision(app, @hex, reason, considered, nil, requirement, declaration)}
     end
   end
 
-  defp build(_registry, app, _declaration, source, reason, _opts),
+  defp build(_registry, app, _declaration, source, reason, _considered, _opts),
     do: {:error, {:unknown_source, app, source, reason}}
 
   defp requirement(declaration, override), do: override.hex || declaration.hex
@@ -488,11 +571,12 @@ defmodule MixWorkspaceOps.Resolution do
     end)
   end
 
-  defp decision(app, source, reason, provider_id, location, declaration) do
+  defp decision(app, source, reason, considered, provider_id, location, declaration) do
     %{
       application: app,
       source: source,
       reason: reason,
+      considered: considered,
       provider_project_id: provider_id,
       location: location,
       opts: options(declaration),
@@ -532,27 +616,52 @@ defmodule MixWorkspaceOps.Resolution do
   defp decide_all(registry, target, closure, opts) do
     declarations = declarations(registry, target, closure)
 
-    registry
-    |> applications(closure, declarations)
-    |> Enum.reduce_while({:ok, []}, fn app, {:ok, acc} ->
-      {declaration, declared_by} = Map.get(declarations, app, {default_declaration(), []})
+    declarations
+    |> applications(closure)
+    |> Enum.map(fn app ->
+      {declaration, declared_by} = Map.fetch!(declarations, app)
 
       case decide(registry, app, declaration, opts) do
-        {:ok, decision} -> {:cont, {:ok, [%{decision | declared_by: declared_by} | acc]}}
-        {:error, reason} -> {:halt, {:error, reason}}
+        {:ok, decision} -> {:ok, %{decision | declared_by: declared_by}}
+        {:error, reason} -> {:error, reason}
       end
     end)
-    |> case do
-      {:ok, decisions} -> {:ok, Enum.reverse(decisions)}
-      error -> error
+    |> collect(Keyword.get(opts, :mode))
+  end
+
+  # A whole-closure mode is one gesture over many applications, so reporting the
+  # first application it cannot serve tells an operator to fix one of them and
+  # find the next. Every application that cannot serve the requested source is
+  # named at once. An order walk is per dependency and still halts on the first
+  # error, which is the failure of that dependency and not of a gesture.
+  defp collect(results, mode) do
+    case Enum.split_with(results, &match?({:ok, _decision}, &1)) do
+      {decided, []} -> {:ok, Enum.map(decided, &elem(&1, 1))}
+      {_decided, errors} -> {:error, refusal(Enum.map(errors, &elem(&1, 1)), mode)}
     end
   end
 
-  # An application is decided when something in the closure depends on it: a
-  # catalogued project another project depends on, or an application outside
-  # the catalog that a closure project declares a source for. A seed is not
-  # decided unless a sibling depends on it.
-  defp applications(_registry, closure, declarations) do
+  defp refusal(errors, mode) when is_binary(mode) do
+    unavailable =
+      Enum.flat_map(errors, fn
+        {:unavailable_source, app, ^mode, :run_mode} -> [app]
+        _other -> []
+      end)
+
+    if length(unavailable) == length(errors),
+      do: {:unavailable_run_mode, mode, Enum.sort(unavailable)},
+      else: hd(errors)
+  end
+
+  defp refusal(errors, _mode), do: hd(errors)
+
+  # An application is decided when something in the closure depends on it *and*
+  # some closure project's dependency-source table declares it. The table says
+  # how an application resolves; without an entry there is nothing to resolve
+  # through, and inventing one produced a decision for two applications in five
+  # that nothing would ever consume — and a publish order of `hex` with no
+  # requirement, which can never complete.
+  defp applications(declarations, closure) do
     projects = Map.new(closure.projects, &{&1.id, &1})
 
     depended =
@@ -564,12 +673,12 @@ defmodule MixWorkspaceOps.Resolution do
         end
       end)
 
-    declared =
-      closure.external_dependencies
-      |> Enum.map(&elem(&1, 1))
-      |> Enum.filter(&Map.has_key?(declarations, &1))
+    external = Enum.map(closure.external_dependencies, &elem(&1, 1))
 
-    (depended ++ declared) |> Enum.uniq() |> Enum.sort()
+    (depended ++ external)
+    |> Enum.filter(&Map.has_key?(declarations, &1))
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
   defp declarations(registry, target, closure) do
