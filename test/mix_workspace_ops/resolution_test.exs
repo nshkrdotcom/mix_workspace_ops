@@ -874,6 +874,44 @@ defmodule MixWorkspaceOps.ResolutionTest do
     end
   end
 
+  describe "explaining a refusal" do
+    # The message the file this replaces printed for a refused override was a
+    # sentence; the tuple that replaced it names the same fact and says nothing
+    # about what to do. Both now reach the operator.
+    test "every error resolution produces reads as a sentence" do
+      sentences = [
+        {{:no_available_source, "weld", ["local", "hex"],
+          [
+            %{source: "local", outcome: :absent_checkout},
+            %{source: "hex", outcome: :no_hex_requirement}
+          ]},
+         "nothing can supply weld. Tried local (the provider's repository has no checkout), " <>
+           "hex (the declaration carries no hex requirement)."},
+        {{:unavailable_source, "weld", "github", :run_mode},
+         "--mode asked for github for weld, and there is nothing to build it from."},
+        {{:unavailable_run_mode, "github", ["blitz", "weld"]},
+         "--mode git cannot serve blitz, weld."},
+        {{:unpublishable_local_override, "execution_plane", "path"},
+         "publish mode resolves Hex sources only; " <>
+           "the local override for execution_plane requests :path."},
+        {{:unpublishable_source_override, "weld", "local"},
+         "publish mode resolves Hex sources only; --source weld=local requests another source."},
+        {{:unpublishable_run_mode, "local"},
+         "publish mode resolves Hex sources only; --mode local requests another source."},
+        {{:absent_required_checkout, "weld", "/checkouts/weld"},
+         "the repository weld has no checkout at /checkouts/weld. Clone it there, " <>
+           "or record where it is in a binding file."}
+      ]
+
+      for {error, sentence} <- sentences, do: assert(Resolution.explain(error) == sentence)
+
+      assert Resolution.explain({:ambiguous_application, "shared", ["fork", "upstream"], "alpha"}) =~
+               "fork and upstream both provide shared"
+
+      assert Resolution.explain({:command_failed, :anything}) == nil
+    end
+  end
+
   defp reader(%{id: "consumer"}), do: {:ok, ["core", "third_party"]}
   defp reader(_project), do: {:ok, []}
 

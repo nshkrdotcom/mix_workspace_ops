@@ -361,6 +361,110 @@ defmodule MixWorkspaceOps.Resolution do
   defp render_options(opts),
     do: Enum.map_join(opts, ", ", fn {key, value} -> "#{key}: #{inspect(value)}" end)
 
+  @doc """
+  A resolution error as a sentence an operator can act on.
+
+  Returns `nil` for anything `resolve/3` does not produce, so a caller can fall
+  back to its own rendering. A typed error is the right thing to carry between
+  functions and the wrong thing to put on a terminal: an operator reading
+  `{:no_available_source, "weld", ["hex"]}` has to know what an order is, and
+  cannot see which candidates were tried or why each was refused.
+  """
+  @spec explain(term()) :: String.t() | nil
+  def explain({:no_available_source, app, _order, considered}) do
+    "nothing can supply #{app}. Tried " <> Enum.map_join(considered, ", ", &rejection/1) <> "."
+  end
+
+  def explain({:unavailable_source, app, source, reason}) do
+    "#{gesture(reason)} asked for #{source} for #{app}, and there is nothing to build it from."
+  end
+
+  def explain({:unavailable_run_mode, mode, applications}) do
+    "#{run_mode(mode)} cannot serve #{Enum.join(applications, ", ")}."
+  end
+
+  def explain({:unknown_source, app, source, reason}) do
+    "#{gesture(reason)} asked for #{inspect(source)} for #{app}, which is not a source."
+  end
+
+  def explain({:unpublishable_local_override, app, requested}) do
+    "publish mode resolves Hex sources only; " <>
+      "the local override for #{app} requests :#{requested}."
+  end
+
+  def explain({:unpublishable_source_override, app, requested}) do
+    "publish mode resolves Hex sources only; " <>
+      "--source #{app}=#{requested} requests another source."
+  end
+
+  def explain({:unpublishable_run_mode, mode}) do
+    "publish mode resolves Hex sources only; #{run_mode(mode)} requests another source."
+  end
+
+  def explain({:ambiguous_application, app, candidates}) do
+    "#{Enum.join(candidates, " and ")} both provide #{app}. " <>
+      "Name one of them as the \"provider\" of #{app} in the dependency-source declaration."
+  end
+
+  def explain({:ambiguous_application, app, candidates, consumer}) do
+    explain({:ambiguous_application, app, candidates}) <> " Reached from #{consumer}."
+  end
+
+  def explain({:unknown_provider, app, provider, candidates}) do
+    "the declaration for #{app} names #{provider} as its provider, and #{provider} " <>
+      "does not provide #{app}. #{Enum.join(candidates, ", ")} do."
+  end
+
+  def explain({:absent_required_checkout, repository, expected}) do
+    "the repository #{repository} has no checkout at #{expected}. Clone it there, " <>
+      "or record where it is in a binding file."
+  end
+
+  def explain({:unknown_repository, repository}) do
+    "the catalog carries no repository #{repository}."
+  end
+
+  def explain({:override_path_without_consumer_root, app}) do
+    "the override for #{app} names a path and nothing said which project is resolving, " <>
+      "so there is nothing to expand it against."
+  end
+
+  def explain({:local_committed_default, app}) do
+    "#{app} resolves to a local checkout while publishing, so it has no committed " <>
+      "default: a path cannot be published. Give it a hex requirement or GitHub " <>
+      "coordinates in its publish order."
+  end
+
+  def explain(_other), do: nil
+
+  defp rejection(%{source: source, outcome: outcome}),
+    do: "#{source} (#{outcome_reason(outcome)})"
+
+  defp outcome_reason(:no_catalogued_provider), do: "no catalogued project provides it"
+  defp outcome_reason(:absent_checkout), do: "the provider's repository has no checkout"
+  defp outcome_reason(:unbound_repository), do: "the provider's repository is not bound"
+  defp outcome_reason(:missing_path), do: "the derived path is not there"
+
+  defp outcome_reason(:inside_mix_deps),
+    do: "it is inside the Mix deps directory this project runs out of"
+
+  defp outcome_reason(:known_unselected), do: "every provider is outside the selection"
+  defp outcome_reason(:no_github_coordinates), do: "the declaration carries no GitHub coordinates"
+  defp outcome_reason(:no_hex_requirement), do: "the declaration carries no hex requirement"
+  defp outcome_reason(:unknown_source), do: "the order names something that is not a source"
+  defp outcome_reason(:not_reached), do: "not reached"
+  defp outcome_reason(:chosen), do: "chosen"
+
+  defp gesture(:run_mode), do: "--mode"
+  defp gesture(:dependency_override), do: "--source"
+  defp gesture(:local_override), do: "the override file"
+  defp gesture(:publish), do: "the declared publish order"
+  defp gesture(_order), do: "the declared order"
+
+  # `git` is what the command line calls the source the catalog calls `github`.
+  defp run_mode(@github), do: "--mode git"
+  defp run_mode(mode), do: "--mode #{mode}"
+
   @doc "The one-screen form of `sources/1`."
   @spec format_sources([source_entry()]) :: String.t()
   def format_sources([]), do: "dependency sources: (no managed dependencies)"

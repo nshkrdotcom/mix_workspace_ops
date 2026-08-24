@@ -626,8 +626,17 @@ defmodule MixWorkspaceOps.CLI do
   defp maybe_write_report(nil, _report), do: :ok
   defp maybe_write_report(path, report), do: Report.write(path, report)
 
+  # A typed error is what one function hands another; a sentence is what an
+  # operator reads. Where resolution can say what happened in words, it does, and
+  # the tuple follows so nothing is lost for a caller reading the output.
   defp format_error({:unhealthy_workspace, report}), do: Report.encode(report)
-  defp format_error(reason), do: inspect(reason, pretty: true, limit: :infinity)
+
+  defp format_error(reason) do
+    case Resolution.explain(reason) do
+      nil -> inspect(reason, pretty: true, limit: :infinity)
+      sentence -> sentence <> "\n  " <> inspect(reason, limit: :infinity)
+    end
+  end
 
   defp default_state_root do
     base = System.get_env("XDG_STATE_HOME") || Path.join(System.user_home!(), ".local/state")
