@@ -30,9 +30,9 @@ defmodule MixWorkspaceOps.CLI do
     inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
     doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
     plan --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
-      [--mode auto|local|git|hex] [--source APP=SOURCE]
+      [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false]
     sources --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
-      [--mode auto|local|git|hex] [--source APP=SOURCE] [--publish true|false]
+      [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false]
     seam --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
     run --project ID [--mode auto|local|git|hex] [--source APP=SOURCE] \
       --mix-state managed|delegated \
@@ -55,7 +55,16 @@ defmodule MixWorkspaceOps.CLI do
     ["registry", "discover"] => [:checkout_root, :github_owner, :output],
     ["inventory"] => [:registry, :checkout_root, :view, :binding, :output],
     ["doctor"] => [:registry, :checkout_root, :view, :binding],
-    ["plan"] => [:project, :registry, :checkout_root, :view, :binding, :mode, :source],
+    ["plan"] => [
+      :project,
+      :registry,
+      :checkout_root,
+      :view,
+      :binding,
+      :mode,
+      :source,
+      :as_publish
+    ],
     ["sources"] => [
       :project,
       :registry,
@@ -64,7 +73,7 @@ defmodule MixWorkspaceOps.CLI do
       :binding,
       :mode,
       :source,
-      :publish
+      :as_publish
     ],
     ["seam"] => [:project, :registry, :checkout_root, :view, :binding],
     ["run"] => [
@@ -347,7 +356,7 @@ defmodule MixWorkspaceOps.CLI do
          :ok <- ensure_project_in_view(registry, options),
          {:ok, mode} <- source_mode(options.mode),
          {:ok, sources} <- source_overrides(options.source),
-         {:ok, publish?} <- publish_option(Map.get(options, :publish)),
+         {:ok, publish?} <- publish_option(Map.get(options, :as_publish)),
          {:ok, decided} <-
            Resolution.resolve(registry, options.project,
              mode: resolution_mode(mode),
@@ -362,10 +371,16 @@ defmodule MixWorkspaceOps.CLI do
   defp resolution_mode(:git), do: "github"
   defp resolution_mode(mode), do: to_string(mode)
 
+  # A projection, not an assertion. Publish mode is read from the command that is
+  # about to run and is never something an operator requests; `--as-publish`
+  # asks a report what publishing *would* resolve to, which is a different
+  # question and now reads like one.
   defp publish_option(nil), do: {:ok, false}
   defp publish_option("true"), do: {:ok, true}
   defp publish_option("false"), do: {:ok, false}
-  defp publish_option(value), do: {:usage_error, "--publish expects true or false, got #{value}"}
+
+  defp publish_option(value),
+    do: {:usage_error, "--as-publish expects true or false, got #{value}"}
 
   defp load_bound_registry(options) do
     with :ok <- require_options(options, [:registry, :checkout_root]),

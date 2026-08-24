@@ -427,20 +427,51 @@ defmodule MixWorkspaceOps.CLITest do
            ]
   end
 
-  test "sources refuses a publish flag that is not a boolean", context do
-    %{root: root, catalog: catalog} = workspace!(context)
+  test "a report projects publish resolution rather than asserting it", context do
+    %{root: root, catalog: catalog} = seam_workspace!(context)
 
-    assert CLI.dispatch([
-             "sources",
-             "--project",
-             "alpha",
-             "--registry",
-             catalog,
-             "--checkout-root",
-             root,
-             "--publish",
-             "maybe"
-           ]) == {:usage_error, "--publish expects true or false, got maybe"}
+    for command <- ["sources", "plan"] do
+      assert CLI.dispatch([
+               command,
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--as-publish",
+               "maybe"
+             ]) == {:usage_error, "--as-publish expects true or false, got maybe"}
+
+      assert {:ok, development} =
+               CLI.dispatch([
+                 command,
+                 "--project",
+                 "alpha",
+                 "--registry",
+                 catalog,
+                 "--checkout-root",
+                 root
+               ])
+
+      assert {:ok, publishing} =
+               CLI.dispatch([
+                 command,
+                 "--project",
+                 "alpha",
+                 "--registry",
+                 catalog,
+                 "--checkout-root",
+                 root,
+                 "--as-publish",
+                 "true"
+               ])
+
+      refute development.publish
+      assert publishing.publish
+      assert Enum.map(development.sources, & &1.source) == ["local", "github"]
+      assert Enum.map(publishing.sources, & &1.source) == ["hex", "github"]
+    end
   end
 
   test "plan refuses a project the view excludes", context do
