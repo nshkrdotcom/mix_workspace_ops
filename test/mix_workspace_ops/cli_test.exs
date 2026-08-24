@@ -417,6 +417,63 @@ defmodule MixWorkspaceOps.CLITest do
     assert CLI.dispatch(["plan"]) == {:usage_error, "missing --project"}
   end
 
+  # The acceptance item names a gesture, not a rule: remove the sibling and it
+  # resolves GitHub. It was true of `Resolution.decide/4` and false of every
+  # command, because deriving the closure evaluated the absent checkout's own
+  # `mix.exs`.
+  test "removing a sibling checkout makes every command resolve GitHub", context do
+    %{root: root, catalog: catalog, core: core} = sibling_workspace!(context)
+
+    for command <- ["sources", "plan"] do
+      assert {:ok, report} =
+               CLI.dispatch([
+                 command,
+                 "--project",
+                 "alpha",
+                 "--registry",
+                 catalog,
+                 "--checkout-root",
+                 root
+               ])
+
+      assert [%{application: "core", source: "local"}] = report.sources
+    end
+
+    File.rm_rf!(core)
+
+    for command <- ["sources", "plan"] do
+      assert {:ok, report} =
+               CLI.dispatch([
+                 command,
+                 "--project",
+                 "alpha",
+                 "--registry",
+                 catalog,
+                 "--checkout-root",
+                 root
+               ])
+
+      assert [%{application: "core", source: "github", location: "example-org/core"}] =
+               report.sources
+    end
+  end
+
+  test "an absent target checkout is a typed error naming its path", context do
+    %{root: root, catalog: catalog, core: core} = sibling_workspace!(context)
+    File.rm_rf!(core)
+
+    assert CLI.dispatch([
+             "plan",
+             "--project",
+             "core",
+             "--registry",
+             catalog,
+             "--checkout-root",
+             root
+           ]) ==
+             {:error, {:absent_required_checkout, "core", core}}
+  end
+
   test "run executes the command in the project root", context do
     %{root: root, catalog: catalog, state_root: state_root} = workspace!(context)
 
@@ -590,6 +647,32 @@ defmodule MixWorkspaceOps.CLITest do
       binding: binding,
       state_root: Path.join(root, "state")
     }
+  end
+
+  defp sibling_workspace!(context) do
+    root = temporary_directory!(context)
+    core = initialize_repository!(Path.join(root, "core"))
+    initialize_repository!(Path.join(root, "alpha"), ~s([{:core, path: "../core"}]))
+
+    catalog =
+      write_catalog!(
+        root,
+        [
+          catalog_repository("core", projects: [catalog_project("core")]),
+          catalog_repository("alpha",
+            projects: [catalog_project("alpha")],
+            dependency_sources: %{
+              "core" => %{
+                "github" => %{"repo" => "example-org/core", "branch" => "main"},
+                "hex" => "~> 1.0"
+              }
+            }
+          )
+        ],
+        name: "sibling_registry.json"
+      )
+
+    %{root: root, catalog: catalog, core: core}
   end
 
   defp documented_options do

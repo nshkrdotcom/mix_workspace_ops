@@ -51,6 +51,36 @@ defmodule MixWorkspaceOps.RegistryTest do
     assert {:error, {:escaping_registry_path, "../bad"}} = Registry.load(escaping)
   end
 
+  # Mix fetches a dependency with no checkout and resolves that dependency's own
+  # dependencies from its own lock. Walking into a checkout that is not there is
+  # both impossible and unnecessary, so the edge is recorded and the walk stops.
+  test "a dependency with no checkout is a leaf rather than a refusal", context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "consumer"))
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("consumer", projects: [catalog_project("consumer")]),
+        catalog_repository("core", projects: [catalog_project("core")]),
+        catalog_repository("deep", projects: [catalog_project("deep")])
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    assert Registry.absent_repository_ids(registry) == ["core", "deep"]
+
+    reader = fn
+      %{id: "consumer"} -> {:ok, ["core"]}
+      %{id: id} -> flunk("read the dependencies of #{id}, which has no checkout")
+    end
+
+    assert {:ok, resolution} = Graph.resolve(registry, "consumer", dependency_reader: reader)
+    assert Enum.map(resolution.projects, & &1.id) == ["core", "consumer"]
+    assert resolution.edges == [{"consumer", "core"}]
+    assert resolution.external_dependencies == []
+  end
+
   test "records dependencies outside the registry", context do
     root = temporary_directory!(context)
     initialize_repository!(Path.join(root, "consumer"))

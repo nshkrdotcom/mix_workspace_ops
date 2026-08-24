@@ -1,5 +1,14 @@
 defmodule MixWorkspaceOps.Graph do
-  @moduledoc "Dependency closure derived from authoritative Mix project metadata."
+  @moduledoc """
+  Dependency closure derived from authoritative Mix project metadata.
+
+  Only the target's own checkout is required. A dependency whose repository has
+  no checkout is a **leaf**: the edge is recorded and its own dependencies are
+  not walked, because Mix fetches that dependency and resolves its dependencies
+  from its own lock. There is no checkout here to read them from, and reading
+  one that is not there is what turned "remove the sibling and it resolves
+  GitHub" into a refusal.
+  """
 
   alias MixWorkspaceOps.{Project, Registry}
 
@@ -27,7 +36,8 @@ defmodule MixWorkspaceOps.Graph do
       known_unselected: []
     }
 
-    with {:ok, final} <- visit_seeds(registry, seeds, reader, state) do
+    with :ok <- require_target_checkout(registry, seeds),
+         {:ok, final} <- visit_seeds(registry, seeds, reader, state) do
       projects = Enum.reverse(final.ordered)
       edges = final.edges |> Enum.uniq() |> Enum.sort()
       external = final.external |> Enum.uniq() |> Enum.sort()
@@ -44,6 +54,17 @@ defmodule MixWorkspaceOps.Graph do
     end
   rescue
     error in ArgumentError -> {:error, {:registry_target, Exception.message(error)}}
+  end
+
+  # Requirement is the operation's question, not the catalog's. The one
+  # repository this operation cannot proceed without is the target's own, and it
+  # is refused through the mechanism that exists to refuse it, so an operator
+  # sees the typed error naming the path rather than a rendered exception.
+  defp require_target_checkout(registry, seeds) do
+    seeds
+    |> Enum.map(& &1.repository)
+    |> Enum.uniq()
+    |> then(&Registry.require_bound(registry, &1))
   end
 
   defp seed_projects(registry, target) do
@@ -79,18 +100,33 @@ defmodule MixWorkspaceOps.Graph do
 
       true ->
         project = Registry.project!(registry, project_id)
-        state = %{state | visiting: MapSet.put(state.visiting, project_id)}
 
-        with {:ok, dependencies} <- reader.(project),
-             {:ok, state} <- visit_dependencies(registry, project, dependencies, reader, state) do
-          {:ok,
-           %{
-             state
-             | visiting: MapSet.delete(state.visiting, project_id),
-               visited: MapSet.put(state.visited, project_id),
-               ordered: [project | state.ordered]
-           }}
+        case Registry.checkout(registry, project.repository) do
+          {:absent, _expected} -> {:ok, leaf(state, project)}
+          _reachable -> walk(registry, project, reader, state)
         end
+    end
+  end
+
+  # An absent checkout ends the walk here. The project is still a closure member
+  # and still carries a resolvable source, so resolution decides it exactly as it
+  # decides any other dependency — `local` is simply unavailable for it.
+  defp leaf(state, project) do
+    %{state | visited: MapSet.put(state.visited, project.id), ordered: [project | state.ordered]}
+  end
+
+  defp walk(registry, project, reader, state) do
+    state = %{state | visiting: MapSet.put(state.visiting, project.id)}
+
+    with {:ok, dependencies} <- reader.(project),
+         {:ok, state} <- visit_dependencies(registry, project, dependencies, reader, state) do
+      {:ok,
+       %{
+         state
+         | visiting: MapSet.delete(state.visiting, project.id),
+           visited: MapSet.put(state.visited, project.id),
+           ordered: [project | state.ordered]
+       }}
     end
   end
 
