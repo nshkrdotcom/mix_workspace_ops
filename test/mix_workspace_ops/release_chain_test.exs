@@ -167,6 +167,29 @@ defmodule MixWorkspaceOps.ReleaseChainTest do
     assert {:ok, ["alpha"]} = ReleaseChain.order(registry)
   end
 
+  test "a train package the selection excludes is named unselected, not unprovided",
+       context do
+    root = temporary_directory!(context)
+
+    registry =
+      catalog(root, [
+        catalog_repository("plane",
+          projects: [
+            catalog_project("plane.core", app: "plane_core", path: "core/plane", kind: "package"),
+            catalog_project("plane.rpc", app: "plane_rpc", path: "protocols/rpc", kind: "package")
+          ],
+          release_chain: %{"plane_core" => [], "plane_rpc" => ["plane_core"]}
+        )
+      ])
+
+    selected = Registry.restrict(registry, [Registry.project!(registry, "plane.core")])
+
+    assert ReleaseChain.packages(selected) == ["plane_core", "plane_rpc"]
+
+    assert {:error, {:unselected_release_package, "plane_rpc", ["plane.rpc"]}} =
+             ReleaseChain.derive(selected)
+  end
+
   test "a v1 document declares no release train", context do
     root = temporary_directory!(context)
 

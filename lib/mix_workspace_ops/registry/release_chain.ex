@@ -33,8 +33,9 @@ defmodule MixWorkspaceOps.Registry.ReleaseChain do
   Derives the full prerequisite map for the release train.
 
   Returns `{:ok, chain}` where `chain` maps each train package to its sorted
-  prerequisites, or an error when a package is provided by no project or the
-  edges form a cycle.
+  prerequisites, or an error when a package is provided by no project, when the
+  current selection excludes every provider of one, or when the edges form a
+  cycle.
   """
   @spec derive(Registry.t()) :: {:ok, chain()} | {:error, term()}
   def derive(%Registry{} = registry) do
@@ -72,13 +73,26 @@ defmodule MixWorkspaceOps.Registry.ReleaseChain do
     end)
   end
 
+  # A train package the current selection excludes is catalogued, so it is named
+  # as unselected rather than as an application nothing provides. The two are
+  # different facts and lead to different corrections: widen the view, or
+  # catalogue the package.
   defp providers(registry, train) do
     train
     |> Enum.sort()
     |> Enum.reduce_while({:ok, %{}}, fn package, {:ok, acc} ->
-      case Registry.provider_for(registry, package) do
-        {:ok, project} -> {:cont, {:ok, Map.put(acc, package, project)}}
-        {:error, reason} -> {:halt, {:error, {:release_package, package, reason}}}
+      case Registry.resolve_dependency(registry, package) do
+        {:ok, project} ->
+          {:cont, {:ok, Map.put(acc, package, project)}}
+
+        {:known_unselected, project_ids} ->
+          {:halt, {:error, {:unselected_release_package, package, project_ids}}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:release_package, package, reason}}}
+
+        :unknown ->
+          {:halt, {:error, {:release_package, package, {:unprovided_application, package}}}}
       end
     end)
   end
@@ -121,9 +135,19 @@ defmodule MixWorkspaceOps.Registry.ReleaseChain do
   # The declaration's own provider selection answers the question where several
   # projects provide the application; an unresolved provider is an error, never
   # a dropped edge.
+  #
+  # A prerequisite every provider of which lies outside the selection is
+  # catalogued, and its repository is unknown, so whether it is an edge cannot
+  # be answered. Answering `false` would publish a package ahead of something it
+  # requires, which is the failure a derived order exists to prevent, so it is
+  # an error. Nothing reaches that clause while `providers/2` resolves the whole
+  # train first, since every application arriving here is a train package that
+  # already resolved; `providers/2` states the same decision where it is
+  # reachable.
   defp visible?(registry, app, declaration, repository_id, true) do
     case Registry.resolve_dependency(registry, app, declaration.provider) do
       {:ok, provider} -> {:ok, provider.repository != repository_id}
+      {:known_unselected, project_ids} -> {:error, {:unselected_provider, app, project_ids}}
       {:error, reason} -> {:error, reason}
       :unknown -> {:error, {:unprovided_application, app}}
     end
