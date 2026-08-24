@@ -310,11 +310,45 @@ defmodule MixWorkspaceOps.BootstrapTest do
       [only: [:dev, :test], optional: true, override: true, runtime: false, targets: [:host]]
     ]
 
+    # A table of valid values proves the two decoders agree about what they
+    # accept and says nothing about what they refuse — which is where they
+    # actually drifted: the module's reader bounded the count and the length of
+    # an environment list and not its grammar, so `only=DEV` minted an atom from
+    # arbitrary bytes on one side and raised inside `mix.exs` on the other.
+    @refused [
+      "only=DEV",
+      "only=Dev",
+      "only=1dev",
+      "only=de-v",
+      "only=dev|",
+      "only=|dev",
+      "only=dev||test",
+      "only=",
+      "targets=Host",
+      "only=e1|e2|e3|e4|e5|e6|e7|e8|e9",
+      "only=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "override=yes",
+      "override=1",
+      "runtime=",
+      "unknown=true",
+      "override",
+      ""
+    ]
+
     test "every options encoding round-trips through both decoders" do
       for options <- @options do
         encoded = Overlay.encode_options(options)
         assert {:ok, ^options} = Overlay.decode_options(encoded)
         assert MixWorkspaceOpsBootstrap.decode_options(encoded) == options
+      end
+    end
+
+    test "both decoders refuse the same encodings" do
+      for encoded <- @refused do
+        assert {:error, _reason} = Overlay.decode_options(encoded),
+               "the module accepted #{inspect(encoded)}"
+
+        assert_raise RuntimeError, fn -> MixWorkspaceOpsBootstrap.decode_options(encoded) end
       end
     end
   end

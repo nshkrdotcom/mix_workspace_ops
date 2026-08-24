@@ -579,21 +579,25 @@ defmodule MixWorkspaceOps.Overlay do
   defp decode_boolean_option(option, value),
     do: {:error, {:invalid_overlay_option, option, value}}
 
+  # The count and the length are not the whole bound. A name that is not an
+  # identifier is not a Mix environment or target whatever its length, and
+  # accepting one here would mint an atom from arbitrary bytes in the reader the
+  # catalog's own validator and the seam both refuse it in.
   defp decode_list_option(option, value) do
     names = String.split(value, "|")
 
     cond do
-      names == [] or Enum.any?(names, &(&1 == "")) ->
-        {:error, {:invalid_overlay_option, option, value}}
-
       length(names) > Registry.Source.maximum_option_values() ->
         {:error, {:overlay_option_too_long, option}}
 
       Enum.any?(names, &(byte_size(&1) > Registry.Source.maximum_option_value_bytes())) ->
         {:error, {:overlay_option_value_too_long, option}}
 
+      not Enum.all?(names, &Registry.Source.identifier?/1) ->
+        {:error, {:invalid_overlay_option, option, value}}
+
       true ->
-        {:ok, {option, Enum.map(names, &String.to_atom/1)}}
+        {:ok, {option, Enum.map(names, &String.to_atom(&1))}}
     end
   end
 

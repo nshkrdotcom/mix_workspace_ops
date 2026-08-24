@@ -69,6 +69,21 @@ defmodule MixWorkspaceOps.Registry.Source do
   def maximum_option_value_bytes, do: @maximum_option_value_bytes
 
   @doc """
+  True when `value` is a lowercase Elixir identifier.
+
+  This is the grammar every application name, environment name and target name
+  in the catalog satisfies, and it is what keeps the conversion to atoms to a
+  countable set of names rather than to arbitrary bytes. Every reader that
+  converts one of those names has to apply it, or one reader accepts what
+  another refuses.
+  """
+  @spec identifier?(term()) :: boolean()
+  def identifier?(value) when is_binary(value),
+    do: Regex.match?(~r/^[a-z][a-z0-9_]*$/, value)
+
+  def identifier?(_value), do: false
+
+  @doc """
   Parses a map of application name to source declaration.
 
   Returns the declarations keyed by application name, or the first error.
@@ -307,11 +322,6 @@ defmodule MixWorkspaceOps.Registry.Source do
   end
 
   defp validate_application_name(app, scope), do: {:error, {:invalid_application, scope, app}}
-
-  defp identifier?(value) when is_binary(value),
-    do: Regex.match?(~r/^[a-z][a-z0-9_]*$/, value)
-
-  defp identifier?(_value), do: false
 
   defp optional(raw, key) do
     case Map.get(raw, key) do
