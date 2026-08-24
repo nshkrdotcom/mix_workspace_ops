@@ -388,17 +388,17 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   def explain({:unpublishable_local_override, app, requested}) do
-    "publish mode resolves Hex sources only; " <>
+    "publish mode follows the declared publish order; " <>
       "the local override for #{app} requests :#{requested}."
   end
 
   def explain({:unpublishable_source_override, app, requested}) do
-    "publish mode resolves Hex sources only; " <>
+    "publish mode follows the declared publish order; " <>
       "--source #{app}=#{requested} requests another source."
   end
 
   def explain({:unpublishable_run_mode, mode}) do
-    "publish mode resolves Hex sources only; #{run_mode(mode)} requests another source."
+    "publish mode follows the declared publish order; #{run_mode(mode)} requests another source."
   end
 
   def explain({:ambiguous_application, app, candidates}) do

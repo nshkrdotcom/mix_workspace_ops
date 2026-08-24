@@ -23,6 +23,8 @@
 - Detect publishing from the task the command names and resolve through the
   publish order, refusing an override that would put a non-Hex source into a
   published package.
+- Parse only task positions Mix actually recognizes, so commas and plus signs
+  in ordinary task arguments cannot be mistaken for a publishing command.
 - Add per-run `--mode`, per-dependency `--source APP=SOURCE`, and the operator's
   `.dependency_sources.local.exs`, which is parsed and never evaluated.
 - Give the seam a committed default, so a repository resolves without this tool

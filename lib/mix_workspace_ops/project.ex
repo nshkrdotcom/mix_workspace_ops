@@ -2,9 +2,11 @@ defmodule MixWorkspaceOps.Project do
   @moduledoc """
   Isolated discovery of authoritative Mix project metadata.
 
-  `metadata/2` evaluates a project's `mix.exs` in a scrubbed subprocess, which
-  is the only way to learn what Mix itself would compute. `declared_version/1`
-  answers the one question that does not need that, by parsing.
+  `metadata/2` evaluates a project's `mix.exs` in a separate, time-limited
+  subprocess, which is the only way to learn what Mix itself would compute.
+  Phase P3 owns scrubbing the rest of the inherited environment.
+  `declared_version/1` answers the one question that does not need evaluation,
+  by parsing.
   """
 
   alias MixWorkspaceOps.{Command, Registry}

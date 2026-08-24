@@ -17,8 +17,16 @@ defmodule MixWorkspaceOpsBootstrap do
   @absent "-"
 
   @publish_tasks ["hex.publish", "hex.build", "deps.publish_preflight"]
-  @quiet_tasks ["run", "eval", "cmd", "app.start", "app.config", "escript.build",
-                "deps.sources", "deps.publish_preflight"]
+  @quiet_tasks [
+    "run",
+    "eval",
+    "cmd",
+    "app.start",
+    "app.config",
+    "escript.build",
+    "deps.sources",
+    "deps.publish_preflight"
+  ]
 
   @option_keys %{
     "only" => :only,
@@ -193,12 +201,9 @@ defmodule MixWorkspaceOpsBootstrap do
     argv |> task_tokens() |> Enum.any?(&(&1 in @quiet_tasks))
   end
 
-  def task_tokens(argv) when is_list(argv) do
-    argv
-    |> Enum.flat_map(&split_separators/1)
-    |> collect_tasks([], true)
-    |> Enum.reverse()
-  end
+  def task_tokens(["do" | argv]), do: argv |> collect_tasks([], true) |> Enum.reverse()
+  def task_tokens([task | _arguments]) when task != "", do: [task]
+  def task_tokens(argv) when is_list(argv), do: []
 
   def decode_options(@absent), do: []
 
@@ -284,7 +289,9 @@ defmodule MixWorkspaceOpsBootstrap do
         message =
           "[mix_workspace_ops] local path source in use for: " <> Enum.join(applications, ", ")
 
-        if Code.ensure_loaded?(Mix), do: Mix.shell().info(message), else: IO.puts(:stderr, message)
+        if Code.ensure_loaded?(Mix),
+          do: Mix.shell().info(message),
+          else: IO.puts(:stderr, message)
     end
   end
 
@@ -354,14 +361,20 @@ defmodule MixWorkspaceOpsBootstrap do
 
   defp parse_overlay!(path) do
     case path |> File.read!() |> String.split("\n", trim: true) do
-      [@schema_header, "registry_digest\t" <> _registry_digest,
-       "selection_digest\t" <> _selection_digest,
-       "graph_digest\t" <> _graph_digest, "context_digest\t" <> _context_digest,
-       "target\t" <> _target, "mode\t" <> mode, "publish\t" <> publish,
-       "target_head\t" <> _target_head,
-       "target_source_digest\t" <> _target_source_digest,
-       "lock_digest\t" <> _lock_digest,
-       "toolchain\t" <> _toolchain | rows]
+      [
+        @schema_header,
+        "registry_digest\t" <> _registry_digest,
+        "selection_digest\t" <> _selection_digest,
+        "graph_digest\t" <> _graph_digest,
+        "context_digest\t" <> _context_digest,
+        "target\t" <> _target,
+        "mode\t" <> mode,
+        "publish\t" <> publish,
+        "target_head\t" <> _target_head,
+        "target_source_digest\t" <> _target_source_digest,
+        "lock_digest\t" <> _lock_digest,
+        "toolchain\t" <> _toolchain | rows
+      ]
       when mode in @modes and publish in ["true", "false"] ->
         %{mode: mode, publish: publish == "true", sources: parse_rows!(rows)}
 
@@ -462,22 +475,25 @@ defmodule MixWorkspaceOpsBootstrap do
     Enum.map(names, &String.to_atom/1)
   end
 
-  defp split_separators(argument) do
-    case String.split(argument, ",") do
-      [single] -> [single]
-      parts -> parts |> Enum.intersperse(",") |> Enum.reject(&(&1 == ""))
-    end
-  end
-
   defp collect_tasks([], acc, _task?), do: acc
 
   defp collect_tasks([token | rest], acc, _task?) when token in [",", "+"],
     do: collect_tasks(rest, acc, true)
 
-  defp collect_tasks(["do" | rest], acc, true), do: collect_tasks(rest, acc, true)
   defp collect_tasks(["" | rest], acc, true), do: collect_tasks(rest, acc, true)
-  defp collect_tasks([token | rest], acc, true), do: collect_tasks(rest, [token | acc], false)
-  defp collect_tasks([_token | rest], acc, false), do: collect_tasks(rest, acc, false)
+
+  defp collect_tasks([token | rest], acc, true) do
+    if String.ends_with?(token, ",") do
+      task = String.trim_trailing(token, ",")
+      collect_tasks(rest, if(task == "", do: acc, else: [task | acc]), true)
+    else
+      collect_tasks(rest, [token | acc], false)
+    end
+  end
+
+  defp collect_tasks([token | rest], acc, false) do
+    collect_tasks(rest, acc, String.ends_with?(token, ","))
+  end
 
   defp verify_content_address!(path) do
     bytes = File.read!(path)

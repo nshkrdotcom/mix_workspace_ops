@@ -892,12 +892,13 @@ defmodule MixWorkspaceOps.ResolutionTest do
         {{:unavailable_run_mode, "github", ["blitz", "weld"]},
          "--mode git cannot serve blitz, weld."},
         {{:unpublishable_local_override, "execution_plane", "path"},
-         "publish mode resolves Hex sources only; " <>
+         "publish mode follows the declared publish order; " <>
            "the local override for execution_plane requests :path."},
         {{:unpublishable_source_override, "weld", "local"},
-         "publish mode resolves Hex sources only; --source weld=local requests another source."},
+         "publish mode follows the declared publish order; " <>
+           "--source weld=local requests another source."},
         {{:unpublishable_run_mode, "local"},
-         "publish mode resolves Hex sources only; --mode local requests another source."},
+         "publish mode follows the declared publish order; --mode local requests another source."},
         {{:absent_required_checkout, "weld", "/checkouts/weld"},
          "the repository weld has no checkout at /checkouts/weld. Clone it there, " <>
            "or record where it is in a binding file."}

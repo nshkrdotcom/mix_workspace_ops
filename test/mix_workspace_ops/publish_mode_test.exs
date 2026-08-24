@@ -16,12 +16,16 @@ defmodule MixWorkspaceOps.PublishModeTest do
     {["hex.outdated"], false},
     {["run", "--arg", "hex.publish"], false},
     {["run", "-e", "IO.puts(\"hex.build\")"], false},
+    {["run", "--arg", "value,hex.publish"], false},
+    {["run", "--arg", "value", "+", "hex.publish"], false},
     {["do", "compile,", "hex.publish"], true},
     {["do", "compile", "+", "hex.publish"], true},
-    {["do", "compile,hex.publish"], true},
+    {["do", "compile,hex.publish"], false},
     {["do", "compile", ",", "hex.publish"], true},
     {["do", "run", "--arg", "x", "+", "hex.build"], true},
     {["do", "run", "--arg", "hex.publish"], false},
+    {["do", "run", "--arg", "value,hex.publish"], false},
+    {["do", "run", "--arg", "value,", "hex.publish"], true},
     {["deps.get"], false},
     {[], false}
   ]

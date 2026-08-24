@@ -18,9 +18,9 @@ defmodule MixWorkspaceOps.PublishMode do
 
   Detection reads task position only. `mix do compile, hex.publish` publishes;
   `mix run --arg hex.publish` does not, and a membership test over raw argv
-  cannot tell them apart. The parser splits `,` and `+` separators, skips the
-  `do` keyword, and takes the token after each separator as a task and every
-  token after that as its arguments.
+  cannot tell them apart. Outside `mix do`, only the first token is a task.
+  Inside it, a standalone `,` or `+`, or a comma at the end of the preceding
+  token, introduces the next task. Commas embedded in arguments remain data.
 
   `hex.info` and `hex.outdated` are deliberately absent from the publish tasks.
   They read the registry and must resolve exactly the way ordinary development
@@ -55,15 +55,12 @@ defmodule MixWorkspaceOps.PublishMode do
   Every token in task position, in order.
 
   Mix strips its own name before a task reads `System.argv/0`, so the first
-  token is a task.
+  token is a task. Only `mix do` introduces further task positions.
   """
   @spec task_tokens([String.t()]) :: [String.t()]
-  def task_tokens(argv) when is_list(argv) do
-    argv
-    |> Enum.flat_map(&split_separators/1)
-    |> collect([], true)
-    |> Enum.reverse()
-  end
+  def task_tokens(["do" | argv]), do: argv |> collect_do([], true) |> Enum.reverse()
+  def task_tokens([task | _arguments]) when task != "", do: [task]
+  def task_tokens(argv) when is_list(argv), do: []
 
   @doc """
   The task tokens of a command Mix Workspace Ops is about to launch.
@@ -94,20 +91,23 @@ defmodule MixWorkspaceOps.PublishMode do
     end
   end
 
-  defp split_separators(argument) do
-    case String.split(argument, ",") do
-      [single] -> [single]
-      parts -> parts |> Enum.intersperse(",") |> Enum.reject(&(&1 == ""))
+  defp collect_do([], acc, _task?), do: acc
+
+  defp collect_do([token | rest], acc, _task?) when token in [",", "+"],
+    do: collect_do(rest, acc, true)
+
+  defp collect_do(["" | rest], acc, true), do: collect_do(rest, acc, true)
+
+  defp collect_do([token | rest], acc, true) do
+    if String.ends_with?(token, ",") do
+      task = String.trim_trailing(token, ",")
+      collect_do(rest, if(task == "", do: acc, else: [task | acc]), true)
+    else
+      collect_do(rest, [token | acc], false)
     end
   end
 
-  defp collect([], acc, _task?), do: acc
-
-  defp collect([token | rest], acc, _task?) when token in [",", "+"],
-    do: collect(rest, acc, true)
-
-  defp collect(["do" | rest], acc, true), do: collect(rest, acc, true)
-  defp collect(["" | rest], acc, true), do: collect(rest, acc, true)
-  defp collect([token | rest], acc, true), do: collect(rest, [token | acc], false)
-  defp collect([_token | rest], acc, false), do: collect(rest, acc, false)
+  defp collect_do([token | rest], acc, false) do
+    collect_do(rest, acc, String.ends_with?(token, ","))
+  end
 end

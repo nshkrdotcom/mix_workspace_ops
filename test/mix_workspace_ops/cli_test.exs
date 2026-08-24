@@ -659,7 +659,6 @@ defmodule MixWorkspaceOps.CLITest do
       {["mix", "hex.publish"], "hex.publish"},
       {["mix", "do", "compile,", "hex.publish"], "hex.publish"},
       {["mix", "do", "compile", "+", "hex.publish"], "hex.publish"},
-      {["mix", "do", "compile,hex.publish"], "hex.publish"},
       {["elixir", "-S", "mix", "hex.publish"], "hex.publish"},
       {["/usr/bin/env", "mix", "hex.publish"], "hex.publish"},
       {["env", "MIX_ENV=prod", "mix", "hex.publish"], "hex.publish"},
@@ -674,7 +673,13 @@ defmodule MixWorkspaceOps.CLITest do
 
     # Reading the registry is not publishing, and a task name in an argument is
     # not a task.
-    for command <- [["mix", "hex.info"], ["mix", "run", "--arg", "hex.publish"]] do
+    for command <- [
+          ["mix", "hex.info"],
+          ["mix", "run", "--arg", "hex.publish"],
+          ["mix", "run", "--arg", "value,hex.publish"],
+          ["mix", "run", "--arg", "value", "+", "hex.publish"],
+          ["mix", "do", "compile,hex.publish"]
+        ] do
       refute match?({:usage_error, _reason}, run(root, catalog, command)),
              "#{Enum.join(command, " ")} was refused"
     end
