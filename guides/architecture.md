@@ -132,6 +132,19 @@ options, because they say whether the dependency exists at that call site.
 declaration whose publish order resolves to a local checkout has no committed
 default — a path cannot be published — and is refused by name.
 
+### `mix deps.sources`
+
+The bootstrap defines one Mix task, `mix deps.sources`, which prints where every
+managed dependency in the current project resolved from. It reports what the
+seam actually emitted rather than deriving it a second time, so the answer is
+what Mix was given.
+
+The task costs a repository nothing. The bootstrap is already loaded into the
+Mix process by path, so defining the task there installs no file, adds no
+`mix.exs` line, and adds no dependency. It exists inside a checkout, from inside
+Mix, which `mwo sources` cannot be: that needs the escript, a catalog, a checkout
+root and a binding.
+
 Publication is fail-closed at the seam. An overlay decided for ordinary
 development names a developer's checkouts, so a publishing task running under
 one is refused rather than allowed to put a local path into a released

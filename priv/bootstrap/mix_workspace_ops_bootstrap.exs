@@ -9,6 +9,7 @@ defmodule MixWorkspaceOpsBootstrap do
   # pair to one shared table so they cannot drift.
 
   @schema_header "mix_workspace_ops.overlay/v2"
+  @maximum_mix_bytes 1024 * 1024
   @overlay_env "MIX_WORKSPACE_OPS_OVERLAY"
   @lockfile_env "MIX_WORKSPACE_OPS_LOCKFILE"
   @maximum_overlay_bytes 16 * 1024 * 1024
@@ -46,11 +47,119 @@ defmodule MixWorkspaceOpsBootstrap do
     overlay = overlay()
     notify_local_paths(project_root, overlay)
 
-    case overlay_source(overlay, Atom.to_string(app)) do
-      nil -> committed_tuple(app, committed_default, extra_opts)
-      source -> overlay_tuple(app, source, extra_opts)
+    tuple =
+      case overlay_source(overlay, Atom.to_string(app)) do
+        nil -> committed_tuple(app, committed_default, extra_opts)
+        source -> overlay_tuple(app, source, extra_opts)
+      end
+
+    record_source(project_root, tuple)
+    tuple
+  end
+
+  @doc """
+  Every dependency this `mix.exs` resolved, in the order an operator reads.
+
+  `mix deps.sources` reports what the seam actually emitted rather than
+  re-deriving it, so what is printed is what Mix was given.
+  """
+  def recorded_sources(project_root) do
+    sources_key(project_root)
+    |> :persistent_term.get(%{})
+    |> Map.values()
+    |> Enum.sort_by(& &1.app)
+  end
+
+  def format_sources([]), do: "dependency sources: (no managed dependencies)"
+
+  def format_sources(entries) when is_list(entries) do
+    lines =
+      Enum.map(entries, fn entry ->
+        "  #{entry.app} -> #{entry.source} (#{entry.location}) -> #{entry.version || "unknown"}"
+      end)
+
+    Enum.join(["dependency sources:" | lines], "\n")
+  end
+
+  # The version a Mix project declares, read by parsing and never evaluating.
+  # This is the same rule and the same two shapes as
+  # `MixWorkspaceOps.Project.declared_version/1`, which a test holds it to; the
+  # duplication is deliberate, because this file runs with none of Mix Workspace
+  # Ops on the code path.
+  def declared_version(project_root) do
+    path = project_root |> Path.expand() |> Path.join("mix.exs")
+
+    with {:ok, %{type: :regular, size: size}} when size <= @maximum_mix_bytes <- File.stat(path),
+         {:ok, bytes} <- File.read(path),
+         {:ok, quoted} <- Code.string_to_quoted(bytes, file: path) do
+      version_literal(quoted)
+    else
+      _unreadable -> nil
     end
   end
+
+  defp sources_key(project_root), do: {__MODULE__, :sources, Path.expand(project_root)}
+
+  defp record_source(project_root, tuple) do
+    key = sources_key(project_root)
+    entry = source_entry(tuple)
+    :persistent_term.put(key, Map.put(:persistent_term.get(key, %{}), entry.app, entry))
+    :ok
+  end
+
+  defp source_entry({app, requirement}) when is_binary(requirement),
+    do: %{app: app, source: "hex", location: "hex", version: requirement}
+
+  defp source_entry({app, requirement, _opts}) when is_binary(requirement),
+    do: %{app: app, source: "hex", location: "hex", version: requirement}
+
+  defp source_entry({app, opts}) when is_list(opts) do
+    cond do
+      path = Keyword.get(opts, :path) ->
+        %{app: app, source: "local", location: path, version: declared_version(path)}
+
+      repo = Keyword.get(opts, :github) ->
+        %{app: app, source: "github", location: repo, version: revision_label(opts)}
+
+      true ->
+        %{app: app, source: "unknown", location: "?", version: nil}
+    end
+  end
+
+  defp revision_label(opts) do
+    Enum.find_value([:ref, :tag, :branch], fn key ->
+      case Keyword.get(opts, key) do
+        nil -> nil
+        value -> "#{key} #{value}"
+      end
+    end)
+  end
+
+  defp version_literal(quoted) do
+    {_quoted, attributes} =
+      Macro.prewalk(quoted, %{}, fn
+        {:@, _meta, [{name, _name_meta, [value]}]} = node, acc when is_atom(name) ->
+          if is_binary(value), do: {node, Map.put_new(acc, name, value)}, else: {node, acc}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    {_quoted, version} =
+      Macro.prewalk(quoted, nil, fn
+        {:version, value} = node, nil -> {node, version_value(value, attributes)}
+        node, acc -> {node, acc}
+      end)
+
+    version
+  end
+
+  defp version_value(value, _attributes) when is_binary(value), do: value
+
+  defp version_value({:@, _meta, [{name, _name_meta, nil}]}, attributes) when is_atom(name),
+    do: Map.get(attributes, name)
+
+  defp version_value(_value, _attributes), do: nil
 
   defp overlay_source(nil, _app), do: nil
   defp overlay_source(overlay, app), do: Map.get(overlay.sources, app)
@@ -140,8 +249,12 @@ defmodule MixWorkspaceOpsBootstrap do
     end
   end
 
-  # The GitHub option keys the emitted tuple carries, in the order a map of
-  # them yields, which is the order the tuples this seam replaces carried.
+  # The revision key, then the subdirectory. The order the tuples this seam
+  # replaces carried was whatever iterating a map of their keys produced, which
+  # is not specified: it depends on the key type and on the map's internal
+  # layout, so the same file yields one order for atom keys and another for
+  # string keys. Nothing here can match an unspecified order, and parity with
+  # those tuples is compared without regard to keyword order for that reason.
   defp revision_option(@absent, _value), do: []
   defp revision_option("branch", value), do: [branch: value]
   defp revision_option("ref", value), do: [ref: value]
@@ -375,6 +488,28 @@ defmodule MixWorkspaceOpsBootstrap do
       path
     else
       raise "Mix Workspace Ops overlay digest mismatch at #{path}"
+    end
+  end
+end
+
+# The Mix task the file this seam replaces defined, at zero cost in repository
+# files: this bootstrap is already loaded into the Mix process by path, so the
+# task is defined where the sources were recorded and nothing is installed into
+# a managed repository to make it available.
+if Code.ensure_loaded?(Mix.Task) and not Code.ensure_loaded?(Mix.Tasks.Deps.Sources) do
+  defmodule Mix.Tasks.Deps.Sources do
+    @moduledoc false
+    @shortdoc "Prints the resolved source of every managed dependency"
+
+    use Mix.Task
+
+    @impl Mix.Task
+    def run(_args) do
+      Mix.Project.project_file()
+      |> Path.dirname()
+      |> MixWorkspaceOpsBootstrap.recorded_sources()
+      |> MixWorkspaceOpsBootstrap.format_sources()
+      |> Mix.shell().info()
     end
   end
 end

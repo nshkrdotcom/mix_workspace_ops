@@ -3,7 +3,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
 
   import ExUnit.CaptureIO
 
-  alias MixWorkspaceOps.{Bootstrap, Overlay}
+  alias MixWorkspaceOps.{Bootstrap, Overlay, Project, Resolution}
 
   setup do
     previous = System.get_env("MIX_WORKSPACE_OPS_OVERLAY")
@@ -350,6 +350,103 @@ defmodule MixWorkspaceOps.BootstrapTest do
 
         assert_raise RuntimeError, fn -> MixWorkspaceOpsBootstrap.decode_options(encoded) end
       end
+    end
+  end
+
+  describe "mix deps.sources" do
+    # The file this seam replaces defined this Mix task inside the file a
+    # `mix.exs` loaded. This bootstrap is loaded into the same process by path,
+    # so it can define it too — at zero cost in repository files, which is what
+    # the constraint against installing code into a repository was protecting.
+    test "records what the seam emitted and prints it in the settled shape", context do
+      root = temporary_directory!(context)
+      sibling = Path.join(root, "sibling")
+      File.mkdir_p!(sibling)
+      File.write!(Path.join(sibling, "mix.exs"), "def project, do: [version: \"4.5.6\"]\n")
+
+      overlay =
+        write_overlay!(root, [
+          "example_core\tlocal\t#{sibling}\trevision\tdigest\t-",
+          "example_edge\tgithub\texample-org/example_edge\tbranch\tmain\t-\t-",
+          "example_shape\thex\t~> 2.0\toverride=true"
+        ])
+
+      System.put_env("MIX_WORKSPACE_OPS_OVERLAY", overlay)
+
+      for app <- [:example_core, :example_edge, :example_shape],
+          do: MixWorkspaceOpsBootstrap.dep(app, "~> 0.1.0", root)
+
+      MixWorkspaceOpsBootstrap.dep(:example_committed, "~> 9.9", root)
+
+      assert MixWorkspaceOpsBootstrap.recorded_sources(root) == [
+               %{
+                 app: :example_committed,
+                 source: "hex",
+                 location: "hex",
+                 version: "~> 9.9"
+               },
+               %{app: :example_core, source: "local", location: sibling, version: "4.5.6"},
+               %{
+                 app: :example_edge,
+                 source: "github",
+                 location: "example-org/example_edge",
+                 version: "branch main"
+               },
+               %{app: :example_shape, source: "hex", location: "hex", version: "~> 2.0"}
+             ]
+
+      report =
+        MixWorkspaceOpsBootstrap.format_sources(MixWorkspaceOpsBootstrap.recorded_sources(root))
+
+      assert String.split(report, "\n") == [
+               "dependency sources:",
+               "  example_committed -> hex (hex) -> ~> 9.9",
+               "  example_core -> local (#{sibling}) -> 4.5.6",
+               "  example_edge -> github (example-org/example_edge) -> branch main",
+               "  example_shape -> hex (hex) -> ~> 2.0"
+             ]
+
+      assert MixWorkspaceOpsBootstrap.format_sources([]) ==
+               "dependency sources: (no managed dependencies)"
+
+      # The same shape the escript's own report prints, from the same data.
+      assert Resolution.format_sources([
+               %{
+                 application: "example_core",
+                 source: "local",
+                 location: sibling,
+                 version: "4.5.6"
+               }
+             ]) == "dependency sources:\n  example_core -> local (#{sibling}) -> 4.5.6"
+    end
+
+    test "reads a sibling version the way the escript does", context do
+      root = temporary_directory!(context)
+
+      cases = [
+        {"literal", ~s|def project, do: [app: :a, version: "1.2.3"]|, "1.2.3"},
+        {"attribute", ~s|@version "3.2.1"\ndef project, do: [version: @version]|, "3.2.1"},
+        {"none", ~s|def project, do: [app: :a]|, nil},
+        {"unparsable", ~s|def project, do: [|, nil}
+      ]
+
+      for {name, body, expected} <- cases do
+        project = Path.join(root, name)
+        File.mkdir_p!(project)
+        File.write!(Path.join(project, "mix.exs"), body <> "\n")
+
+        assert MixWorkspaceOpsBootstrap.declared_version(project) == expected
+
+        escript =
+          case Project.declared_version(project) do
+            {:ok, version} -> version
+            {:error, _reason} -> nil
+          end
+
+        assert escript == expected
+      end
+
+      assert MixWorkspaceOpsBootstrap.declared_version(Path.join(root, "absent")) == nil
     end
   end
 

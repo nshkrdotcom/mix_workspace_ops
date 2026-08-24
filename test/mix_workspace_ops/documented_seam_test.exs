@@ -36,6 +36,57 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
   end
 
   test "the seam resolves through a real overlay and keeps its call-site options", context do
+    %{core: core, consumer: consumer, activation: activation} = activated(context)
+
+    # The overlay decides, and the options the call site gave survive it.
+    assert deps(consumer, activation.env) == [
+             {:example_core, [path: core]},
+             {:example_edge,
+              [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
+           ]
+
+    # With no bootstrap the committed default stands — and still carries the
+    # call-site options, which the printed fallback used to drop entirely.
+    assert deps(consumer, inactive()) == [
+             {:example_core, "~> 1.0"},
+             {:example_edge,
+              [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
+           ]
+  end
+
+  # The Mix task the file this seam replaces defined, restored where it always
+  # belonged: inside the process that loaded the seam, with nothing installed in
+  # the repository to make it available.
+  test "mix deps.sources reports what the seam emitted", context do
+    %{consumer: consumer, core: core, activation: activation} = activated(context)
+
+    assert {:ok, result} =
+             Command.run("mix", ["deps.sources"], cd: consumer, env: activation.env)
+
+    assert result.output =~ "dependency sources:"
+    assert result.output =~ "example_core -> local (#{core}) -> 0.1.0"
+    assert result.output =~ "example_edge -> github (example-org/example_edge) -> branch main"
+  end
+
+  defp deps(project_root, env) do
+    result = Command.run!("elixir", ["-e", @deps_expression], cd: project_root, env: env)
+
+    {value, _bindings} =
+      result.output
+      |> String.split("\n", trim: true)
+      |> List.last()
+      |> Code.eval_string()
+
+    value
+  end
+
+  defp inactive do
+    for variable <- ~w(MIX_WORKSPACE_OPS_BOOTSTRAP MIX_WORKSPACE_OPS_OVERLAY
+                       MIX_WORKSPACE_OPS_CONTEXT_DIGEST MIX_WORKSPACE_OPS_LOCKFILE),
+        do: {variable, nil}
+  end
+
+  defp activated(context) do
     root = temporary_directory!(context)
     core = initialize_repository!(Path.join(root, "example_core"))
     consumer = initialize_repository!(Path.join(root, "consumer"))
@@ -63,38 +114,7 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
     assert {:ok, activation} =
              Overlay.activate(registry, "consumer", state_root: Path.join(root, "state"))
 
-    # The overlay decides, and the options the call site gave survive it.
-    assert deps(consumer, activation.env) == [
-             {:example_core, [path: core]},
-             {:example_edge,
-              [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
-           ]
-
-    # With no bootstrap the committed default stands — and still carries the
-    # call-site options, which the printed fallback used to drop entirely.
-    assert deps(consumer, inactive()) == [
-             {:example_core, "~> 1.0"},
-             {:example_edge,
-              [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
-           ]
-  end
-
-  defp deps(project_root, env) do
-    result = Command.run!("elixir", ["-e", @deps_expression], cd: project_root, env: env)
-
-    {value, _bindings} =
-      result.output
-      |> String.split("\n", trim: true)
-      |> List.last()
-      |> Code.eval_string()
-
-    value
-  end
-
-  defp inactive do
-    for variable <- ~w(MIX_WORKSPACE_OPS_BOOTSTRAP MIX_WORKSPACE_OPS_OVERLAY
-                       MIX_WORKSPACE_OPS_CONTEXT_DIGEST MIX_WORKSPACE_OPS_LOCKFILE),
-        do: {variable, nil}
+    %{root: root, core: core, consumer: consumer, activation: activation}
   end
 
   # The block's first line is the prologue, which goes above the module; the
