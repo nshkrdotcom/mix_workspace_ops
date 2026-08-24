@@ -33,20 +33,42 @@ copied into the registry.
 The seam is one function call per cross-repository dependency:
 
 ```elixir
+if bootstrap = System.get_env("MIX_WORKSPACE_OPS_BOOTSTRAP"), do: Code.require_file(bootstrap)
+
+@compile {:no_warn_undefined, MixWorkspaceOpsBootstrap}
+
 defp deps do
   [
     workspace_dep(:example_core, "~> 1.0"),
-    workspace_dep(:example_edge, github: "example-org/example_edge", branch: "main")
+    workspace_dep(:example_edge, [github: "example-org/example_edge", branch: "main"],
+      only: [:dev, :test]
+    )
   ]
 end
 
 defp workspace_dep(app, committed_default, extra_opts \\ []) do
-  case Code.ensure_loaded(MixWorkspaceOpsBootstrap) do
-    {:module, module} -> apply(module, :dep, [app, committed_default, __DIR__, extra_opts])
-    _other -> {app, committed_default}
+  if Code.ensure_loaded?(MixWorkspaceOpsBootstrap) do
+    MixWorkspaceOpsBootstrap.dep(app, committed_default, __DIR__, extra_opts)
+  else
+    committed_dep(app, committed_default, extra_opts)
   end
 end
+
+defp committed_dep(app, requirement, []) when is_binary(requirement), do: {app, requirement}
+
+defp committed_dep(app, requirement, opts) when is_binary(requirement),
+  do: {app, requirement, opts}
+
+defp committed_dep(app, coordinates, opts) when is_list(coordinates),
+  do: {app, Keyword.merge(coordinates, opts)}
 ```
+
+The first line goes above the `MixProject` module and the rest goes inside it.
+That line is load-bearing: the bootstrap is an `.exs` file materialized in
+operator state and named by `MIX_WORKSPACE_OPS_BOOTSTRAP`, so nothing else puts
+`MixWorkspaceOpsBootstrap` on the code path. A `mix.exs` that only asks whether
+the module is loaded always gets `false`, resolves nothing, and looks wired
+while doing it.
 
 The second argument is the **committed default**: what this repository resolves
 to with nothing else active, and it is committed to the repository rather than
@@ -55,6 +77,12 @@ supplied by a tool. A binary is a Hex requirement. A keyword list carrying
 needs that form — otherwise a fresh clone, and any consumer of the published
 package, has nowhere to resolve it from. The seam has no catalog, so the
 committed default is how a repository states its own answer.
+
+The third argument carries the dependency's own Mix options, and both branches
+carry them. `only:`, `optional:`, `runtime:` and `targets:` decide whether a
+dependency exists at this call site at all, which is `mix.exs`'s to say, so they
+travel with the call and are not dropped when no overlay is active. `override:`
+is a resolution fact and comes from the catalog on the overlay path.
 
 With an overlay carrying the application, the overlay row decides instead, and
 the row states which of `local`, `github` or `hex` the operator's resolution

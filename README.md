@@ -57,25 +57,53 @@ declarative manifest rather than a copied helper subsystem.
 ## The Mix-load seam
 
 ```elixir
+if bootstrap = System.get_env("MIX_WORKSPACE_OPS_BOOTSTRAP"), do: Code.require_file(bootstrap)
+
+@compile {:no_warn_undefined, MixWorkspaceOpsBootstrap}
+
 defp deps do
   [
     workspace_dep(:example_core, "~> 1.0"),
-    workspace_dep(:example_edge, github: "example-org/example_edge", branch: "main")
+    workspace_dep(:example_edge, [github: "example-org/example_edge", branch: "main"],
+      only: [:dev, :test]
+    )
   ]
 end
 
 defp workspace_dep(app, committed_default, extra_opts \\ []) do
-  case Code.ensure_loaded(MixWorkspaceOpsBootstrap) do
-    {:module, module} -> apply(module, :dep, [app, committed_default, __DIR__, extra_opts])
-    _other -> {app, committed_default}
+  if Code.ensure_loaded?(MixWorkspaceOpsBootstrap) do
+    MixWorkspaceOpsBootstrap.dep(app, committed_default, __DIR__, extra_opts)
+  else
+    committed_dep(app, committed_default, extra_opts)
   end
 end
+
+defp committed_dep(app, requirement, []) when is_binary(requirement), do: {app, requirement}
+
+defp committed_dep(app, requirement, opts) when is_binary(requirement),
+  do: {app, requirement, opts}
+
+defp committed_dep(app, coordinates, opts) when is_list(coordinates),
+  do: {app, Keyword.merge(coordinates, opts)}
 ```
+
+The first line is what puts the bootstrap on the code path, and the rest goes
+inside the `MixProject` module. Without that line nothing loads
+`MixWorkspaceOpsBootstrap`: it is an `.exs` file in operator state whose path
+arrives in `MIX_WORKSPACE_OPS_BOOTSTRAP`, so a `mix.exs` that only asks whether
+the module is loaded gets `false` every time and resolves nothing, while looking
+wired.
 
 The second argument is the committed default — a Hex requirement, or committed
 git coordinates for a dependency that has no Hex release. It is what the
-repository resolves to on a fresh clone with no tool involved. Where an
-operator has activated an overlay, the row for that application decides
+repository resolves to on a fresh clone with no tool involved, and
+`mwo seam --project ID` prints it for a project rather than leaving it to be
+written by hand. Options given at the call site are carried whether or not an
+overlay is active, because `only:`, `optional:`, `runtime:` and `targets:` say
+whether a dependency exists here at all and dropping them changes what Mix
+resolves.
+
+Where an operator has activated an overlay, the row for that application decides
 instead, and the plan records which source it chose and why.
 
 ## Registry-driven usage
