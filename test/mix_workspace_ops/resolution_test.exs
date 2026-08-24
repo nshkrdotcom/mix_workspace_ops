@@ -520,6 +520,85 @@ defmodule MixWorkspaceOps.ResolutionTest do
     end
   end
 
+  describe "the sources report" do
+    test "says where each dependency comes from and what is there", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+
+      registry =
+        root
+        |> write_catalog!([
+          catalog_repository("core", projects: [catalog_project("core")]),
+          catalog_repository("consumer",
+            projects: [catalog_project("consumer")],
+            dependency_sources: %{
+              "core" => %{"hex" => "~> 1.0"},
+              "third_party" => %{
+                "github" => %{"repo" => "example-org/third-party", "branch" => "main"},
+                "order" => ["github"],
+                "publish_order" => ["github"]
+              }
+            }
+          )
+        ])
+        |> Registry.load!()
+        |> bind!(root)
+
+      assert {:ok, report} =
+               Resolution.resolve(registry, "consumer", dependency_reader: &reader/1)
+
+      assert [local, github] = Resolution.sources(report)
+
+      assert local == %{
+               application: "core",
+               source: "local",
+               reason: :order,
+               provider: "core",
+               location: Path.join(root, "core"),
+               version: "0.1.0",
+               opts: []
+             }
+
+      assert github.location == "example-org/third-party"
+      assert github.version == "branch main"
+
+      assert Resolution.format_sources([local, github]) ==
+               """
+               dependency sources:
+                 core -> local (#{Path.join(root, "core")}) -> 0.1.0
+                 third_party -> github (example-org/third-party) -> branch main\
+               """
+
+      assert Resolution.format_sources([]) == "dependency sources: (no managed dependencies)"
+    end
+
+    test "a hex source reports the requirement as its version", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+      declaration = %{"hex" => "~> 1.0", "order" => ["hex"]}
+
+      registry =
+        root
+        |> write_catalog!([
+          catalog_repository("core", projects: [catalog_project("core")]),
+          catalog_repository("consumer",
+            projects: [catalog_project("consumer")],
+            dependency_sources: %{"core" => declaration}
+          )
+        ])
+        |> Registry.load!()
+        |> bind!(root)
+
+      assert {:ok, report} =
+               Resolution.resolve(registry, "consumer", dependency_reader: &reader/1)
+
+      assert [entry] = Resolution.sources(report)
+      assert %{source: "hex", location: "hex", version: "~> 1.0"} = entry
+    end
+  end
+
   defp reader(%{id: "consumer"}), do: {:ok, ["core", "third_party"]}
   defp reader(_project), do: {:ok, []}
 

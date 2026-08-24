@@ -436,6 +436,43 @@ defmodule MixWorkspaceOps.Registry do
   def selected?(%__MODULE__{selection: selection}, project_id),
     do: to_string(project_id) in selection.project_ids
 
+  @doc """
+  The three sets an operator has to be able to tell apart.
+
+  What the catalog holds, what the selection permits, and what is materialized
+  on this disk are three different questions with three different answers. One
+  number for all three hides which of them is the reason a command found
+  nothing to do: a repository can be absent from the catalog, present in the
+  catalog and outside the view, or inside the view and not cloned, and the
+  remedy differs in each case.
+
+  `materialized` is scoped to the selection, because binding is: it says what
+  is on this disk out of what the selection permits.
+  """
+  @spec sets(t()) :: map()
+  def sets(%__MODULE__{} = registry) do
+    %{
+      catalogued: %{
+        digest: registry.digest,
+        repositories: map_size(registry.repositories),
+        projects: map_size(registry.projects),
+        applications: map_size(registry.applications)
+      },
+      selected: %{
+        digest: selection_digest(registry),
+        repositories: length(selected_repositories(registry)),
+        projects: length(selected_projects(registry)),
+        applications: map_size(selected_applications(registry)),
+        unselected_applications: unselected_application_ids(registry)
+      },
+      materialized: %{
+        repositories: map_size(registry.bindings),
+        absent: map_size(registry.absent_checkouts),
+        absent_repositories: absent_repository_ids(registry)
+      }
+    }
+  end
+
   @doc "Catalogued applications the selection leaves out, sorted."
   @spec unselected_application_ids(t()) :: [String.t()]
   def unselected_application_ids(%__MODULE__{selection: nil}), do: []
@@ -461,6 +498,9 @@ defmodule MixWorkspaceOps.Registry do
       :error -> :unknown
     end
   end
+
+  defp selection_digest(%__MODULE__{selection: nil}), do: nil
+  defp selection_digest(%__MODULE__{selection: selection}), do: selection.digest
 
   defp selection_digest(repository_ids, project_ids) do
     :json.encode(%{repositories: repository_ids, projects: project_ids})

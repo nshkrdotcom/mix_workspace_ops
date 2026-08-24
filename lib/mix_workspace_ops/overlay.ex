@@ -115,6 +115,7 @@ defmodule MixWorkspaceOps.Overlay do
            publish: decided.publish?,
            registry_digest: registry.digest,
            graph_digest: resolution.digest,
+           sets: Registry.sets(registry),
            overlay_digest: overlay_digest,
            context_digest: context_digest,
            overlay_path: path,

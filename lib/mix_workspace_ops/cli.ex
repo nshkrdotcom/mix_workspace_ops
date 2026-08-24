@@ -5,12 +5,12 @@ defmodule MixWorkspaceOps.CLI do
     Command,
     Discovery,
     Doctor,
-    Graph,
     Inventory,
     Overlay,
     PublishMode,
     Registry,
     Report,
+    Resolution,
     View
   }
 
@@ -29,7 +29,10 @@ defmodule MixWorkspaceOps.CLI do
     registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
     inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
     doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
-    plan --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
+    plan --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
+      [--mode auto|local|git|hex] [--source APP=SOURCE]
+    sources --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
+      [--mode auto|local|git|hex] [--source APP=SOURCE] [--publish true|false]
     run --project ID [--mode auto|local|git|hex] [--source APP=SOURCE] \
       --mix-state managed|delegated \
       --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
@@ -51,7 +54,17 @@ defmodule MixWorkspaceOps.CLI do
     ["registry", "discover"] => [:checkout_root, :github_owner, :output],
     ["inventory"] => [:registry, :checkout_root, :view, :binding, :output],
     ["doctor"] => [:registry, :checkout_root, :view, :binding],
-    ["plan"] => [:project, :registry, :checkout_root, :view, :binding],
+    ["plan"] => [:project, :registry, :checkout_root, :view, :binding, :mode, :source],
+    ["sources"] => [
+      :project,
+      :registry,
+      :checkout_root,
+      :view,
+      :binding,
+      :mode,
+      :source,
+      :publish
+    ],
     ["run"] => [
       :project,
       :mode,
@@ -216,20 +229,42 @@ defmodule MixWorkspaceOps.CLI do
 
   def dispatch(["plan" | args]) do
     with {:ok, options, []} <- options(["plan"], args),
-         :ok <- require_option(options, :project),
-         {:ok, registry} <- load_bound_registry(options),
-         :ok <- ensure_project_in_view(registry, options),
-         {:ok, resolution} <- Graph.resolve(registry, options.project) do
+         {:ok, registry, decided} <- resolve_target(options) do
+      resolution = decided.closure
+
       {:ok,
        %{
-         schema: "mix_workspace_ops.plan/v1",
+         schema: "mix_workspace_ops.plan/v2",
          target: options.project,
          registry_digest: registry.digest,
          graph_digest: resolution.digest,
+         sets: Registry.sets(registry),
+         mode: options.mode,
+         publish: decided.publish?,
          projects: Enum.map(resolution.projects, & &1.id),
          edges: resolution.edges,
          external_dependencies: resolution.external_dependencies,
-         known_unselected: known_unselected(resolution)
+         known_unselected: known_unselected(resolution),
+         sources: Resolution.sources(decided)
+       }}
+    end
+  end
+
+  def dispatch(["sources" | args]) do
+    with {:ok, options, []} <- options(["sources"], args),
+         {:ok, registry, decided} <- resolve_target(options) do
+      entries = Resolution.sources(decided)
+
+      {:ok,
+       %{
+         schema: "mix_workspace_ops.sources/v1",
+         target: options.project,
+         registry_digest: registry.digest,
+         sets: Registry.sets(registry),
+         mode: options.mode,
+         publish: decided.publish?,
+         sources: entries,
+         report: Resolution.format_sources(entries)
        }}
     end
   end
@@ -271,6 +306,33 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(args), do: {:usage_error, "unknown command: #{Enum.join(args, " ")} "}
+
+  # `plan` and `sources` differ in what they project, not in what they decide.
+  defp resolve_target(options) do
+    with :ok <- require_option(options, :project),
+         {:ok, registry} <- load_bound_registry(options),
+         :ok <- ensure_project_in_view(registry, options),
+         {:ok, mode} <- source_mode(options.mode),
+         {:ok, sources} <- source_overrides(options.source),
+         {:ok, publish?} <- publish_option(Map.get(options, :publish)),
+         {:ok, decided} <-
+           Resolution.resolve(registry, options.project,
+             mode: resolution_mode(mode),
+             sources: sources,
+             publish?: publish?
+           ) do
+      {:ok, registry, decided}
+    end
+  end
+
+  defp resolution_mode(:auto), do: nil
+  defp resolution_mode(:git), do: "github"
+  defp resolution_mode(mode), do: to_string(mode)
+
+  defp publish_option(nil), do: {:ok, false}
+  defp publish_option("true"), do: {:ok, true}
+  defp publish_option("false"), do: {:ok, false}
+  defp publish_option(value), do: {:usage_error, "--publish expects true or false, got #{value}"}
 
   defp load_bound_registry(options) do
     with :ok <- require_options(options, [:registry, :checkout_root]),

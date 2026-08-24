@@ -66,7 +66,8 @@ defmodule MixWorkspaceOps.CLITest do
              ["registry", "validate"],
              ["registry", "workspace"],
              ["release", "publish"],
-             ["run"]
+             ["run"],
+             ["sources"]
            ]
 
     assert {["registry", "chain"], "package"} in documented
@@ -317,10 +318,83 @@ defmodule MixWorkspaceOps.CLITest do
                root
              ])
 
-    assert report.schema == "mix_workspace_ops.plan/v1"
+    assert report.schema == "mix_workspace_ops.plan/v2"
     assert report.target == "alpha"
     assert report.projects == ["alpha"]
     assert report.known_unselected == []
+    assert report.mode == "auto"
+    refute report.publish
+
+    # The three sets, named apart. With no view the catalog and the selection
+    # agree, and what is materialized is a fact about this disk.
+    assert report.sets.catalogued.repositories == 2
+    assert report.sets.selected.repositories == 2
+    assert report.sets.selected.digest == nil
+    assert report.sets.materialized.repositories == 2
+    assert report.sets.materialized.absent_repositories == []
+  end
+
+  test "the three sets stay apart under a view", context do
+    %{root: root, catalog: catalog, view: view, binding: binding} = workspace!(context)
+
+    assert {:ok, report} =
+             CLI.dispatch([
+               "plan",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--view",
+               view,
+               "--binding",
+               binding
+             ])
+
+    assert report.sets.catalogued.repositories == 2
+    assert report.sets.selected.repositories == 1
+    assert is_binary(report.sets.selected.digest)
+    assert report.sets.materialized.repositories == 1
+    assert report.sets.materialized.absent == 0
+    assert report.sets.catalogued.digest == report.registry_digest
+    assert report.sets.selected.unselected_applications == ["plane", "plane_legacy"]
+  end
+
+  test "sources reports where every dependency resolves from", context do
+    %{root: root, catalog: catalog} = workspace!(context)
+
+    assert {:ok, report} =
+             CLI.dispatch([
+               "sources",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root
+             ])
+
+    assert report.schema == "mix_workspace_ops.sources/v1"
+    assert report.sources == []
+    assert report.report == "dependency sources: (no managed dependencies)"
+    assert report.sets.catalogued.repositories == 2
+  end
+
+  test "sources refuses a publish flag that is not a boolean", context do
+    %{root: root, catalog: catalog} = workspace!(context)
+
+    assert CLI.dispatch([
+             "sources",
+             "--project",
+             "alpha",
+             "--registry",
+             catalog,
+             "--checkout-root",
+             root,
+             "--publish",
+             "maybe"
+           ]) == {:usage_error, "--publish expects true or false, got maybe"}
   end
 
   test "plan refuses a project the view excludes", context do

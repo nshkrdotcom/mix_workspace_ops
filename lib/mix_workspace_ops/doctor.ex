@@ -6,6 +6,9 @@ defmodule MixWorkspaceOps.Doctor do
   one operator's disk, and a report that stops at the first repository someone
   has not cloned tells that operator nothing about the ones they have.
 
+  The report opens with the three sets — what the catalog holds, what the
+  selection permits, and what is materialized here — so an operator can tell at
+  a glance which of them is the reason a command found nothing to do.
   """
 
   alias MixWorkspaceOps.{Binding, Git, Project, Registry}
@@ -25,6 +28,7 @@ defmodule MixWorkspaceOps.Doctor do
       schema: "mix_workspace_ops.doctor/v1",
       registry: registry.path,
       registry_digest: registry.digest,
+      sets: Registry.sets(registry),
       healthy: Enum.all?(checks, & &1.pass),
       repositories: repositories
     }

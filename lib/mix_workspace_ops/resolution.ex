@@ -71,7 +71,7 @@ defmodule MixWorkspaceOps.Resolution do
   disagreement is visible rather than silently resolved.
   """
 
-  alias MixWorkspaceOps.{Graph, LocalOverrides, Registry}
+  alias MixWorkspaceOps.{Graph, LocalOverrides, Project, Registry}
   alias MixWorkspaceOps.Registry.Source
 
   @local "local"
@@ -106,6 +106,16 @@ defmodule MixWorkspaceOps.Resolution do
           overrides: %{String.t() => LocalOverrides.override()},
           publish?: boolean(),
           mode: String.t() | nil
+        }
+
+  @type source_entry :: %{
+          application: String.t(),
+          source: String.t(),
+          reason: atom(),
+          provider: String.t() | nil,
+          location: String.t(),
+          version: String.t() | nil,
+          opts: keyword()
         }
 
   @doc "The candidate sources a declaration may name."
@@ -238,6 +248,72 @@ defmodule MixWorkspaceOps.Resolution do
       nil -> nil
       index -> segments |> Enum.take(length(segments) - index) |> Path.join()
     end
+  end
+
+  @doc """
+  What each dependency resolved to, in the shape an operator reads.
+
+  `location` is where it comes from and `version` is what is there: the version
+  a local checkout declares, the revision a GitHub coordinate names, or the
+  requirement a Hex source carries. A local version that cannot be read is
+  `nil` rather than an error — the source resolved, and a report is not the
+  place to refuse over an unreadable `mix.exs`.
+  """
+  @spec sources(report()) :: [source_entry()]
+  def sources(report), do: Enum.map(report.decisions, &source_entry/1)
+
+  @doc "The one-screen form of `sources/1`."
+  @spec format_sources([source_entry()]) :: String.t()
+  def format_sources([]), do: "dependency sources: (no managed dependencies)"
+
+  def format_sources(entries) when is_list(entries) do
+    lines =
+      Enum.map(entries, fn entry ->
+        "  #{entry.application} -> #{entry.source} (#{entry.location}) -> " <>
+          "#{entry.version || "unknown"}"
+      end)
+
+    Enum.join(["dependency sources:" | lines], "\n")
+  end
+
+  defp source_entry(%{source: @local} = decision) do
+    entry(decision, decision.location, declared_version(decision.location))
+  end
+
+  defp source_entry(%{source: @github, location: coordinates} = decision) do
+    entry(decision, coordinates.repo, revision(coordinates))
+  end
+
+  defp source_entry(%{source: @hex} = decision) do
+    entry(decision, @hex, decision.location)
+  end
+
+  defp entry(decision, location, version) do
+    %{
+      application: decision.application,
+      source: decision.source,
+      reason: decision.reason,
+      provider: decision.provider_project_id,
+      location: location,
+      version: version,
+      opts: decision.opts
+    }
+  end
+
+  defp declared_version(path) do
+    case Project.declared_version(path) do
+      {:ok, version} -> version
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp revision(coordinates) do
+    Enum.find_value([:ref, :tag, :branch], fn key ->
+      case Map.get(coordinates, key) do
+        nil -> nil
+        value -> "#{key} #{value}"
+      end
+    end)
   end
 
   defp select(registry, app, declaration, opts) do
