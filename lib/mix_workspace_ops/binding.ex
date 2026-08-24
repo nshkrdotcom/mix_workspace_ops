@@ -1,7 +1,20 @@
 defmodule MixWorkspaceOps.Binding do
-  @moduledoc "Binds portable registry identities to verified operator-owned Git checkouts."
+  @moduledoc """
+  Binds portable registry identities to verified operator-owned Git checkouts.
+
+  A checkout is the repository the catalog names when **exactly one** of the
+  URLs its `origin` carries resolves to a catalogued identity, and that identity
+  is the repository being bound. A URL naming no catalogued repository is not
+  evidence of identity; two URLs naming different catalogued repositories are a
+  contradiction rather than a choice.
+  """
 
   alias MixWorkspaceOps.{Git, Registry, StrictJSON}
+
+  @remote_schemes ~w(git http https ssh)
+  @url_remote ~r{^(?<scheme>[A-Za-z][A-Za-z0-9+.\-]*)://(?<authority>[^/]*)/(?<path>.+)$}
+  @scp_remote ~r{^(?<authority>[^/:]+):(?<path>.+)$}
+  @segment ~r{^[A-Za-z0-9_.\-]+$}
 
   @spec resolve(Registry.t(), String.t(), keyword()) ::
           {:ok, %{String.t() => String.t()}} | {:error, term()}
@@ -15,35 +28,52 @@ defmodule MixWorkspaceOps.Binding do
     end
   end
 
+  @doc """
+  The `owner/repository` a remote URL names, or an error where it names none.
+
+  A remote URL addresses a host: `scheme://host/owner/repository` or the
+  scp-like `[user@]host:owner/repository`. A local filesystem path addresses no
+  host and therefore names no remote identity, however it is laid out on disk. A
+  bare mirror under `<anything>/<owner>/<repository>.git` is one machine's
+  arrangement of its own disk, and reading an `owner/repository` out of it would
+  manufacture a coordinate no other machine could resolve.
+  """
   @spec normalize_github(String.t()) :: {:ok, String.t()} | {:error, term()}
   def normalize_github(remote) do
-    candidate =
-      remote
-      |> String.trim()
-      |> String.replace_suffix(".git", "")
-      |> String.replace(~r/^ssh:\/\//, "")
-      |> String.replace(~r/^https?:\/\//, "")
-      |> String.split(["/", ":"], trim: true)
-      |> Enum.take(-2)
-      |> Enum.join("/")
+    trimmed = String.trim(remote)
 
-    if Regex.match?(~r/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, candidate),
-      do: {:ok, candidate},
-      else: {:error, {:unrecognized_git_remote, remote}}
+    with {:ok, path} <- remote_path(trimmed),
+         {:ok, identity} <- owner_repository(path) do
+      {:ok, identity}
+    else
+      :error -> {:error, {:unrecognized_git_remote, remote}}
+    end
   end
 
-  defp bind_all(registry, checkout_root, overrides) do
-    registry.repositories
-    |> Map.values()
-    |> Enum.sort_by(& &1.id)
-    |> Enum.reduce_while({:ok, %{}}, fn repository, {:ok, bindings} ->
-      path = Map.get(overrides, repository.id, conventional_path(checkout_root, repository))
+  @doc "Every catalogued remote coordinate, as a set."
+  @spec catalogued_identities(Registry.t()) :: MapSet.t()
+  def catalogued_identities(%Registry{repositories: repositories}) do
+    repositories |> Map.values() |> MapSet.new(& &1.github)
+  end
 
-      case verify(repository, path) do
-        {:ok, root} -> {:cont, {:ok, Map.put(bindings, repository.id, root)}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
+  @doc """
+  The catalogued identity a checkout resolves to.
+
+  `{:ok, identity}` where exactly one origin URL names a catalogued repository.
+  `{:unmatched, identities}` where none does, and `{:ambiguous, identities}`
+  where several do — which is a checkout that claims to be two catalogued
+  repositories at once, and is refused rather than resolved by preference.
+  """
+  @spec resolve_identity(String.t(), MapSet.t()) ::
+          {:ok, String.t()} | {:unmatched, [String.t()]} | {:ambiguous, [String.t()]}
+  def resolve_identity(path, catalogued) do
+    identities = github_identities(path)
+
+    case Enum.filter(identities, &MapSet.member?(catalogued, &1)) do
+      [identity] -> {:ok, identity}
+      [] -> {:unmatched, identities}
+      several -> {:ambiguous, several}
+    end
   end
 
   @doc """
@@ -52,7 +82,7 @@ defmodule MixWorkspaceOps.Binding do
   Fetch and push URLs are read together: a checkout that fetches from a local
   mirror and pushes to GitHub is still the GitHub repository, and which of the
   two an operator configured is a machine-local arrangement the catalog does not
-  record.
+  record. URLs that name no host contribute nothing.
   """
   @spec github_identities(String.t()) :: [String.t()]
   def github_identities(path) do
@@ -68,7 +98,23 @@ defmodule MixWorkspaceOps.Binding do
     |> Enum.sort()
   end
 
-  defp verify(repository, path) do
+  defp bind_all(registry, checkout_root, overrides) do
+    catalogued = catalogued_identities(registry)
+
+    registry.repositories
+    |> Map.values()
+    |> Enum.sort_by(& &1.id)
+    |> Enum.reduce_while({:ok, %{}}, fn repository, {:ok, bindings} ->
+      path = Map.get(overrides, repository.id, conventional_path(checkout_root, repository))
+
+      case verify(repository, path, catalogued) do
+        {:ok, root} -> {:cont, {:ok, Map.put(bindings, repository.id, root)}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp verify(repository, path, catalogued) do
     path = Path.expand(path)
 
     with true <- File.dir?(path) || {:error, {:missing_checkout, repository.id, path}},
@@ -78,13 +124,74 @@ defmodule MixWorkspaceOps.Binding do
          true <-
            common_dir == Path.join(path, ".git") ||
              {:error, {:noncanonical_git_common_dir, repository.id, common_dir}},
-         identities = github_identities(path),
-         true <-
-           repository.github in identities ||
-             {:error, {:wrong_origin, repository.id, repository.github, identities}} do
+         :ok <- verify_identity(repository, path, catalogued) do
       {:ok, root}
     else
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp verify_identity(repository, path, catalogued) do
+    case resolve_identity(path, catalogued) do
+      {:ok, identity} ->
+        if identity == repository.github,
+          do: :ok,
+          else: {:error, {:wrong_origin, repository.id, repository.github, [identity]}}
+
+      {:unmatched, identities} ->
+        {:error, {:wrong_origin, repository.id, repository.github, identities}}
+
+      {:ambiguous, identities} ->
+        {:error, {:ambiguous_origin, repository.id, path, identities}}
+    end
+  end
+
+  defp remote_path(remote) do
+    case url_path(remote) do
+      {:ok, path} -> {:ok, path}
+      :error -> scp_path(remote)
+    end
+  end
+
+  defp url_path(remote) do
+    case Regex.named_captures(@url_remote, remote) do
+      %{"scheme" => scheme, "authority" => authority, "path" => path} ->
+        if scheme in @remote_schemes and host(authority) != "", do: {:ok, path}, else: :error
+
+      nil ->
+        :error
+    end
+  end
+
+  defp scp_path(remote) do
+    case Regex.named_captures(@scp_remote, remote) do
+      %{"authority" => authority, "path" => path} ->
+        if host(authority) != "", do: {:ok, path}, else: :error
+
+      nil ->
+        :error
+    end
+  end
+
+  defp host(authority) do
+    authority |> String.split("@") |> List.last() |> String.split(":") |> List.first()
+  end
+
+  defp owner_repository(path) do
+    segments =
+      path
+      |> String.trim_leading("/")
+      |> String.replace_suffix(".git", "")
+      |> String.split("/", trim: true)
+
+    case segments do
+      [owner, repository] ->
+        if Regex.match?(@segment, owner) and Regex.match?(@segment, repository),
+          do: {:ok, owner <> "/" <> repository},
+          else: :error
+
+      _other ->
+        :error
     end
   end
 

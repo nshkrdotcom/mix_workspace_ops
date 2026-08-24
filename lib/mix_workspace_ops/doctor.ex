@@ -1,15 +1,17 @@
 defmodule MixWorkspaceOps.Doctor do
   @moduledoc "Read-only validation of bound repositories and Mix-project identities."
 
-  alias MixWorkspaceOps.{Git, Project, Registry}
+  alias MixWorkspaceOps.{Binding, Git, Project, Registry}
 
   @spec inspect(Registry.t()) :: map()
   def inspect(registry) do
+    catalogued = Binding.catalogued_identities(registry)
+
     repositories =
       registry.repositories
       |> Map.values()
       |> Enum.sort_by(& &1.id)
-      |> Enum.map(&inspect_repository(registry, &1))
+      |> Enum.map(&inspect_repository(registry, &1, catalogued))
 
     checks = Enum.flat_map(repositories, & &1.checks)
 
@@ -22,7 +24,7 @@ defmodule MixWorkspaceOps.Doctor do
     }
   end
 
-  defp inspect_repository(registry, repository) do
+  defp inspect_repository(registry, repository, catalogued) do
     root = Registry.repository_root(registry, repository)
     projects = Enum.map(repository.projects, &inspect_project(registry, &1))
 
@@ -30,7 +32,7 @@ defmodule MixWorkspaceOps.Doctor do
       [
         check(:directory, File.dir?(root), root),
         check(:git_root, git_root?(root), root),
-        check(:remote, remote_matches?(root, repository.github), repository.github),
+        check(:remote, remote_matches?(root, repository.github, catalogued), repository.github),
         check(:clean, Git.clean?(root), root),
         check(:branch, Git.branch!(root) == repository.default_branch, repository.default_branch)
       ] ++ Enum.flat_map(projects, & &1.checks)
@@ -74,8 +76,10 @@ defmodule MixWorkspaceOps.Doctor do
 
   defp git_root?(root), do: match?({:ok, ^root}, Git.root(root))
 
-  defp remote_matches?(root, github),
-    do: github in MixWorkspaceOps.Binding.github_identities(root)
+  # The same rule binding applies: exactly one origin URL resolves to a
+  # catalogued repository, and it is this one.
+  defp remote_matches?(root, github, catalogued),
+    do: match?({:ok, ^github}, Binding.resolve_identity(root, catalogued))
 
   defp check(name, pass?, detail), do: %{name: name, pass: pass?, detail: detail}
   defp all_pass?(checks), do: Enum.all?(checks, & &1.pass)

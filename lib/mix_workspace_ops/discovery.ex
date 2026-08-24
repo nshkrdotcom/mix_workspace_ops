@@ -50,6 +50,7 @@ defmodule MixWorkspaceOps.Discovery do
   defp discover_checkout(path, owner) do
     case canonical_identity(path, owner) do
       {:ok, identity} -> discover_repository(path, identity)
+      {:ambiguous_owner_identity, identities} -> {:unresolved, [ambiguity(path, identities)]}
       :skip -> :skip
     end
   rescue
@@ -79,15 +80,28 @@ defmodule MixWorkspaceOps.Discovery do
          true <- Path.basename(path) == repository_name do
       {:ok, %{github: github, repository_name: repository_name}}
     else
+      {:ambiguous, identities} -> {:ambiguous_owner_identity, identities}
       _reason -> :skip
     end
   end
 
+  # A checkout naming two of the owner's repositories on its origin states two
+  # identities. Taking the first would let the directory name decide which, so
+  # the checkout is reported unresolved and the operator settles it.
   defp owned_identity(path, owner) do
-    case Enum.find(Binding.github_identities(path), &String.starts_with?(&1, owner <> "/")) do
-      nil -> :skip
-      identity -> {:ok, identity}
+    case Enum.filter(Binding.github_identities(path), &String.starts_with?(&1, owner <> "/")) do
+      [identity] -> {:ok, identity}
+      [] -> :skip
+      several -> {:ambiguous, several}
     end
+  end
+
+  defp ambiguity(path, identities) do
+    %{
+      "repository" => Path.basename(path),
+      "path" => ".",
+      "reason" => "ambiguous_owner_identity:#{Enum.join(identities, ",")}"
+    }
   end
 
   defp discover_repository(path, identity) do

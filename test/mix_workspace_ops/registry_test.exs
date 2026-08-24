@@ -89,7 +89,12 @@ defmodule MixWorkspaceOps.RegistryTest do
              Registry.bind(registry, root)
   end
 
-  test "binding accepts a checkout that reaches its remote through a push URL", context do
+  # The safety property, stated as a test rather than as a claim: a checkout may
+  # reach its catalogued remote through any of origin's URLs, and a checkout that
+  # names a second catalogued repository is refused rather than bound to whichever
+  # one the directory happens to be named after.
+  test "binding accepts a checkout that reaches its catalogued remote through a push URL",
+       context do
     root = temporary_directory!(context)
     checkout = initialize_repository!(Path.join(root, "widget"), "[]", "other-org/widget")
     mirror = Path.join(root, "widget_mirror.git")
@@ -116,6 +121,54 @@ defmodule MixWorkspaceOps.RegistryTest do
 
     assert {:ok, bound} = Registry.bind(registry, root)
     assert bound.bindings == %{"widget" => checkout}
+  end
+
+  test "binding refuses a checkout whose origin names two catalogued repositories",
+       context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "alpha"), "[]", "example-org/alpha")
+    impostor = initialize_repository!(Path.join(root, "beta"), "[]", "example-org/alpha")
+
+    System.cmd(
+      "git",
+      [
+        "remote",
+        "set-url",
+        "--add",
+        "--push",
+        "origin",
+        "https://github.com/example-org/beta.git"
+      ],
+      cd: impostor
+    )
+
+    registry =
+      root
+      |> write_registry!([
+        repository("alpha", [project("alpha")]),
+        repository("beta", [project("beta")])
+      ])
+      |> Registry.load!()
+
+    assert {:error,
+            {:ambiguous_origin, "beta", ^impostor, ["example-org/alpha", "example-org/beta"]}} =
+             Registry.bind(registry, root)
+  end
+
+  test "a local mirror is not an identity, however its directories are laid out",
+       context do
+    root = temporary_directory!(context)
+    checkout = initialize_repository!(Path.join(root, "widget"))
+    mirror = Path.join(root, "mirrors/example-org/widget.git")
+    File.mkdir_p!(Path.dirname(mirror))
+    System.cmd("git", ["init", "--bare", "--quiet", mirror])
+    System.cmd("git", ["remote", "set-url", "origin", mirror], cd: checkout)
+
+    registry =
+      root |> write_registry!([repository("widget", [project("widget")])]) |> Registry.load!()
+
+    assert {:error, {:wrong_origin, "widget", "example-org/widget", []}} =
+             Registry.bind(registry, root)
   end
 
   test "rejects duplicate JSON keys instead of accepting hidden precedence", context do
