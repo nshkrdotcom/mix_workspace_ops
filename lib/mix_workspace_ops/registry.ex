@@ -225,30 +225,6 @@ defmodule MixWorkspaceOps.Registry do
   end
 
   @doc """
-  Finds the project providing `app`.
-
-  Returns `{:ambiguous, projects}` where more than one project provides it, so a
-  caller must either name a provider or report the candidates. It never picks the
-  first match.
-  """
-  @spec project_for_app(t(), String.t() | atom()) ::
-          {:ok, project()} | {:ambiguous, [project()]} | :error
-  def project_for_app(%__MODULE__{} = registry, app) do
-    case Map.get(selected_applications(registry), to_string(app), []) do
-      [project] -> {:ok, project}
-      [] -> :error
-      several -> {:ambiguous, several}
-    end
-  end
-
-  @doc "Resolves the provider of `app`, honouring an explicit provider project id."
-  @spec provider_for(t(), String.t() | atom(), String.t() | nil) ::
-          {:ok, project()} | {:error, term()}
-  def provider_for(%__MODULE__{} = registry, app, provider \\ nil) do
-    Contract.resolve_provider(selected_applications(registry), to_string(app), provider)
-  end
-
-  @doc """
   Resolves the project a dependency declaration names.
 
   `provider` is the declaration's explicit provider selection, or `nil`. The

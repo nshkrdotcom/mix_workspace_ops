@@ -84,7 +84,7 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
       ])
       |> Registry.load!()
 
-    assert {:ok, project} = Registry.project_for_app(registry, "alpha_legacy")
+    assert {:ok, project} = Registry.resolve_dependency(registry, "alpha_legacy")
     assert project.id == "alpha"
   end
 
@@ -279,7 +279,7 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
       |> Registry.load!()
 
     assert map_size(registry.applications) == 2
-    assert {:ok, %{id: "alpha"}} = Registry.project_for_app(registry, "alpha")
+    assert {:ok, %{id: "alpha"}} = Registry.resolve_dependency(registry, "alpha")
   end
 
   test "a v2 document accepts what v1 refused", context do

@@ -63,10 +63,6 @@ defmodule MixWorkspaceOps.Overlay do
   @spec context_environment_variable() :: String.t()
   def context_environment_variable, do: @context_env
 
-  @doc "The schema identifier this version writes."
-  @spec schema() :: String.t()
-  def schema, do: @header
-
   @spec activate(Registry.t(), String.t() | atom(), keyword()) ::
           {:ok, activation()} | {:error, term()}
   def activate(registry, target, opts \\ []) do
