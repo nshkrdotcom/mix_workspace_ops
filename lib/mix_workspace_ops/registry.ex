@@ -351,12 +351,18 @@ defmodule MixWorkspaceOps.Registry do
   @doc """
   Records which catalogued projects a selection reached.
 
-  The catalog is untouched. What comes back is the same registry carrying a
-  selection: the repository and project identities the view reached, the
-  application index those projects provide, and the catalogued applications the
-  selection leaves out, so a dependency on one of them can be reported as
-  catalogued-but-unselected instead of being indistinguishable from a Hex
-  package.
+  The catalog is untouched, and so is what binding found. What comes back is the
+  same registry carrying a selection: the repository and project identities the
+  view reached, the application index those projects provide, and the catalogued
+  applications the selection leaves out, so a dependency on one of them can be
+  reported as catalogued-but-unselected instead of being indistinguishable from
+  a Hex package.
+
+  Selecting takes nothing away. A selection that pruned what binding found would
+  make the third set a subset of whichever selection happened to run first: bind
+  two repositories, select one, select both again, and the second repository is
+  still unbound though it is on disk and inside the selection. Scoping is a
+  question `sets/1` answers at read time, by intersection.
   """
   @spec select(t(), [project()]) :: t()
   def select(%__MODULE__{} = registry, selected_projects) when is_list(selected_projects) do
@@ -379,12 +385,7 @@ defmodule MixWorkspaceOps.Registry do
       unselected_applications: unselected(registry, applications)
     }
 
-    %{
-      registry
-      | selection: selection,
-        bindings: Map.take(registry.bindings, repository_ids),
-        absent_checkouts: Map.take(registry.absent_checkouts, repository_ids)
-    }
+    %{registry | selection: selection}
   end
 
   @doc "What the current selection permits, or `nil` where nothing narrowed the catalog."
@@ -466,12 +467,22 @@ defmodule MixWorkspaceOps.Registry do
         unselected_applications: unselected_application_ids(registry)
       },
       materialized: %{
-        repositories: map_size(registry.bindings),
-        absent: map_size(registry.absent_checkouts),
-        absent_repositories: absent_repository_ids(registry)
+        repositories: map_size(materialized(registry, registry.bindings)),
+        absent: map_size(materialized(registry, registry.absent_checkouts)),
+        absent_repositories:
+          registry |> materialized(registry.absent_checkouts) |> Map.keys() |> Enum.sort()
       }
     }
   end
+
+  # What is materialized is a fact about this disk, and the selection is a
+  # question asked of it. Intersecting at read time keeps both answerable: the
+  # binding is intact for the next, wider selection, and this selection still
+  # reports only what it permits.
+  defp materialized(%__MODULE__{selection: nil}, found), do: found
+
+  defp materialized(%__MODULE__{selection: selection}, found),
+    do: Map.take(found, selection.repository_ids)
 
   @doc "Catalogued applications the selection leaves out, sorted."
   @spec unselected_application_ids(t()) :: [String.t()]

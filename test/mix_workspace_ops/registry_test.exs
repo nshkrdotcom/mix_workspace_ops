@@ -254,6 +254,41 @@ defmodule MixWorkspaceOps.RegistryTest do
     assert Registry.selection(bound).digest != registry.digest
   end
 
+  # C9's third set is not distinct data if the second can destroy it. Selecting
+  # used to take `bindings` and `absent_checkouts` down to the selection, so a
+  # wider re-selection could not see a repository that was on disk the whole
+  # time — and `checkout/2` answered `:unknown`, documented as "an id the
+  # catalog does not carry", for a catalogued and cloned repository.
+  test "a selection scopes what is materialized without destroying it", context do
+    root = temporary_directory!(context)
+    alpha = initialize_repository!(Path.join(root, "alpha"))
+    beta = initialize_repository!(Path.join(root, "beta"))
+
+    registry =
+      root
+      |> write_registry!([
+        repository("alpha", [project("alpha")]),
+        repository("beta", [project("beta")])
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    assert Registry.sets(registry).materialized.repositories == 2
+
+    narrow = Registry.select(registry, [Registry.project!(registry, "alpha")])
+    assert Registry.sets(narrow).materialized.repositories == 1
+    assert Registry.checkout(narrow, "alpha") == {:bound, alpha}
+
+    wide =
+      Registry.select(narrow, [
+        Registry.project!(registry, "alpha"),
+        Registry.project!(registry, "beta")
+      ])
+
+    assert Registry.sets(wide).materialized.repositories == 2
+    assert Registry.checkout(wide, "beta") == {:bound, beta}
+  end
+
   # D1: one repository an operator has not cloned used to fail every operation,
   # including the read-only ones. Absence is a fact about a disk, not a
   # contradiction of the catalog, so it is recorded and binding continues.
