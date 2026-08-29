@@ -17,7 +17,13 @@ defmodule MixWorkspaceOps.Doctor do
   @spec inspect(Registry.t()) :: map()
   def inspect(registry) do
     catalogued = Binding.catalogued_identities(registry)
-    projects = registry |> Registry.selected_repositories() |> Enum.flat_map(& &1.projects)
+
+    projects =
+      registry
+      |> Registry.selected_repositories()
+      |> Enum.filter(&match?({:bound, _root}, Registry.checkout(registry, &1)))
+      |> Enum.flat_map(& &1.projects)
+
     metadata = registry |> Project.prewarm(projects, ProbeMemo.new()) |> Map.new()
 
     repositories =

@@ -296,6 +296,17 @@ defmodule MixWorkspaceOps.CLITest do
     assert report.healthy
   end
 
+  test "doctor does not pre-warm projects whose repository is absent", context do
+    %{root: root, catalog: catalog} = workspace!(context)
+    File.rm_rf!(Path.join(root, "plane"))
+
+    assert {:ok, report} =
+             CLI.dispatch(["doctor", "--registry", catalog, "--checkout-root", root])
+
+    assert %{status: "absent", projects: []} =
+             Enum.find(report.repositories, &(&1.id == "plane"))
+  end
+
   test "doctor accepts a view and a binding file", context do
     %{root: root, catalog: catalog, view: view, binding: binding} = workspace!(context)
 
