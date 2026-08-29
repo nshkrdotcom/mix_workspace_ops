@@ -7,6 +7,7 @@ defmodule MixWorkspaceOps.CLI do
     Doctor,
     Inventory,
     Overlay,
+    OperatorPaths,
     PublishMode,
     Registry,
     Report,
@@ -418,9 +419,18 @@ defmodule MixWorkspaceOps.CLI do
   defp options(command, args) do
     accepted = Map.fetch!(@accepted, command)
 
-    args
-    |> parse_options(command, MapSet.new(accepted), Map.new(accepted, &{&1, default(&1)}), [])
-    |> normalize_paths()
+    with {:ok, options, positional} <-
+           parse_options(
+             args,
+             command,
+             MapSet.new(accepted),
+             Map.new(accepted, &{&1, default(&1)}),
+             []
+           ),
+         {:ok, options} <- normalize_paths(options),
+         {:ok, options} <- OperatorPaths.resolve(options, accepted) do
+      {:ok, options, positional}
+    end
   end
 
   defp default(:mode), do: "auto"
@@ -455,7 +465,7 @@ defmodule MixWorkspaceOps.CLI do
 
   defp put_option(options, key, value), do: Map.put(options, key, value)
 
-  defp normalize_paths({:ok, options, rest}) do
+  defp normalize_paths(options) do
     path_keys = [
       :registry,
       :checkout_root,
@@ -475,10 +485,8 @@ defmodule MixWorkspaceOps.CLI do
         end)
       end)
 
-    {:ok, normalized, rest}
+    {:ok, normalized}
   end
-
-  defp normalize_paths(error), do: error
 
   defp split_command(args) do
     case Enum.split_while(args, &(&1 != "--")) do
