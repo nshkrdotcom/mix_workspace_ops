@@ -134,6 +134,7 @@ defmodule MixWorkspaceOps.Registry.Document do
          :ok <- member(raw["kind"], @project_kinds, :project_kind),
          {:ok, provides} <- provides(raw["provides"], app),
          {:ok, current} <- current(raw["current"], raw["id"]),
+         :ok <- current_provides_application(current, provides, raw["id"]),
          {:ok, lineage} <- lineage(raw["lineage"], raw["id"]),
          {:ok, sources} <- Source.parse_table(raw["dependency_sources"] || %{}, raw["id"]) do
       {:ok,
@@ -169,6 +170,11 @@ defmodule MixWorkspaceOps.Registry.Document do
   defp current(nil, _project_id), do: {:ok, false}
   defp current(value, _project_id) when is_boolean(value), do: {:ok, value}
   defp current(value, project_id), do: {:error, {:invalid_current_provider, project_id, value}}
+
+  defp current_provides_application(true, [], project_id),
+    do: {:error, {:current_without_application, project_id}}
+
+  defp current_provides_application(_current, _provides, _project_id), do: :ok
 
   defp lineage(nil, _project_id), do: {:ok, nil}
 

@@ -242,6 +242,19 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
              Registry.load(path)
   end
 
+  test "current must govern at least one provided application", context do
+    root = temporary_directory!(context)
+
+    path =
+      write_catalog!(root, [
+        catalog_repository("carrier",
+          projects: [catalog_project("carrier.workspace", app: nil, current: true)]
+        )
+      ])
+
+    assert {:error, {:current_without_application, "carrier.workspace"}} = Registry.load(path)
+  end
+
   test "lineage never selects a dependency provider", context do
     root = temporary_directory!(context)
 
