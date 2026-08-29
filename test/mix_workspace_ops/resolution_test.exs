@@ -234,6 +234,21 @@ defmodule MixWorkspaceOps.ResolutionTest do
   end
 
   describe "emitted options" do
+    test "a renamed Hex package emits Mix's hex option", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "consumer"))
+      registry = registry(root, %{"hex" => "~> 1.0"})
+
+      assert {:ok, decision} =
+               decide(registry, root, "third_party", %{
+                 "hex" => %{"requirement" => "~> 2.0", "package" => "third_party_fork"},
+                 "order" => ["hex"]
+               })
+
+      assert decision.location == "~> 2.0"
+      assert decision.opts == [hex: :third_party_fork]
+    end
+
     test "carries the declared options and re-atomizes environment names", context do
       root = temporary_directory!(context)
       initialize_repository!(Path.join(root, "core"))

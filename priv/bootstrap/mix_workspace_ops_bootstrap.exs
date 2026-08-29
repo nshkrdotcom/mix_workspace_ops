@@ -30,12 +30,14 @@ defmodule MixWorkspaceOpsBootstrap do
 
   @option_keys %{
     "only" => :only,
+    "hex" => :hex,
     "optional" => :optional,
     "override" => :override,
     "runtime" => :runtime,
     "targets" => :targets
   }
   @list_options ["only", "targets"]
+  @name_options ["hex"]
   @maximum_option_values 8
   @maximum_option_value_bytes 32
   @revision_keys ["branch", "ref", "tag"]
@@ -445,9 +447,16 @@ defmodule MixWorkspaceOpsBootstrap do
   defp decode_option!(key, value) do
     case Map.fetch(@option_keys, key) do
       {:ok, option} when key in @list_options -> {option, decode_names!(option, value)}
+      {:ok, option} when key in @name_options -> {option, decode_name!(option, value)}
       {:ok, option} -> {option, decode_boolean!(option, value)}
       :error -> raise "unknown Mix Workspace Ops dependency option: #{inspect(key)}"
     end
+  end
+
+  defp decode_name!(option, value) do
+    if Regex.match?(~r/^[a-z][a-z0-9_]*$/, value),
+      do: String.to_atom(value),
+      else: raise("invalid Mix Workspace Ops option #{option}: #{inspect(value)}")
   end
 
   defp decode_boolean!(_option, "true"), do: true

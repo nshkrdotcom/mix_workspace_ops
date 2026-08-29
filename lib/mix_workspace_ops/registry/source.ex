@@ -44,6 +44,7 @@ defmodule MixWorkspaceOps.Registry.Source do
   @type t :: %{
           github: github() | nil,
           hex: String.t() | nil,
+          hex_package: String.t() | nil,
           provider: String.t() | nil,
           order: [String.t()],
           publish_order: [String.t()],
@@ -110,7 +111,7 @@ defmodule MixWorkspaceOps.Registry.Source do
 
     with :ok <- reject_unknown_keys(raw, where),
          {:ok, github} <- parse_github(Map.get(raw, "github"), where),
-         {:ok, hex} <- parse_hex(Map.get(raw, "hex"), where),
+         {:ok, {hex, hex_package}} <- parse_hex(Map.get(raw, "hex"), where),
          {:ok, provider} <- parse_provider(Map.get(raw, "provider"), where),
          {:ok, order} <- parse_order(Map.get(raw, "order"), @default_order, where, :order),
          {:ok, publish_order} <-
@@ -124,6 +125,7 @@ defmodule MixWorkspaceOps.Registry.Source do
          declaration = %{
            github: github,
            hex: hex,
+           hex_package: hex_package,
            provider: provider,
            order: order,
            publish_order: publish_order,
@@ -214,12 +216,20 @@ defmodule MixWorkspaceOps.Registry.Source do
     end
   end
 
-  defp parse_hex(nil, _where), do: {:ok, nil}
+  defp parse_hex(nil, _where), do: {:ok, {nil, nil}}
 
   defp parse_hex(requirement, where) when is_binary(requirement) do
     case Version.parse_requirement(requirement) do
-      {:ok, _parsed} -> {:ok, requirement}
+      {:ok, _parsed} -> {:ok, {requirement, nil}}
       :error -> {:error, {:invalid_hex_requirement, where, requirement}}
+    end
+  end
+
+  defp parse_hex(%{"requirement" => requirement, "package" => package} = raw, where)
+       when map_size(raw) == 2 do
+    with true <- identifier?(package) || {:error, {:invalid_hex_package, where, package}},
+         {:ok, {parsed, nil}} <- parse_hex(requirement, where) do
+      {:ok, {parsed, package}}
     end
   end
 

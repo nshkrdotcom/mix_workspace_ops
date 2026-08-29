@@ -137,6 +137,28 @@ defmodule MixWorkspaceOps.CatalogSchemaTest do
       assert Source.default_publish_order() == ["hex"]
     end
 
+    test "a Hex declaration may name a differently published package", context do
+      root = temporary_directory!(context)
+
+      path =
+        write_catalog!(root, [
+          catalog_repository("alpha",
+            projects: [catalog_project("alpha")],
+            dependency_sources: %{
+              "beta" => %{
+                "hex" => %{"requirement" => "~> 1.0", "package" => "beta_fork"},
+                "order" => ["hex"]
+              }
+            }
+          )
+        ])
+
+      registry = Registry.load!(path)
+      declaration = Registry.dependency_sources(registry, "alpha")["beta"]
+      assert declaration.hex == "~> 1.0"
+      assert declaration.hex_package == "beta_fork"
+    end
+
     test "carries a declared order, publish order, and Mix options", context do
       root = temporary_directory!(context)
 

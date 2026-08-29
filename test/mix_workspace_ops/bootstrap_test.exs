@@ -151,7 +151,8 @@ defmodule MixWorkspaceOps.BootstrapTest do
       path =
         write_overlay!(root, [
           "example_core\thex\t~> 2.0\t-",
-          "example_edge\thex\t~> 0.8.2\tonly=dev|test,runtime=false"
+          "example_edge\thex\t~> 0.8.2\tonly=dev|test,runtime=false",
+          "example_shape\thex\t~> 3.0\thex=shape_fork"
         ])
 
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
@@ -161,6 +162,9 @@ defmodule MixWorkspaceOps.BootstrapTest do
 
       assert MixWorkspaceOpsBootstrap.dep(:example_edge, "~> 1.0", root) ==
                {:example_edge, "~> 0.8.2", [only: [:dev, :test], runtime: false]}
+
+      assert MixWorkspaceOpsBootstrap.dep(:example_shape, "~> 1.0", root) ==
+               {:example_shape, "~> 3.0", [hex: :shape_fork]}
     end
 
     test "call-site options win over the ones the overlay carries", context do

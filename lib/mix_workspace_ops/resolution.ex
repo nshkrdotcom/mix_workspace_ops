@@ -356,7 +356,8 @@ defmodule MixWorkspaceOps.Resolution do
     [github: coordinates.repo] ++ revision ++ subdir
   end
 
-  defp call_site_options(opts), do: Keyword.take(opts, [:only, :optional, :runtime, :targets])
+  defp call_site_options(opts),
+    do: Keyword.take(opts, [:hex, :only, :optional, :runtime, :targets])
 
   defp render_options(opts),
     do: Enum.map_join(opts, ", ", fn {key, value} -> "#{key}: #{inspect(value)}" end)
@@ -868,6 +869,8 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   defp decision(app, source, reason, considered, provider_id, location, declaration) do
+    opts = options(declaration) ++ hex_package_option(app, source, declaration)
+
     %{
       application: app,
       source: source,
@@ -875,10 +878,20 @@ defmodule MixWorkspaceOps.Resolution do
       considered: considered,
       provider_project_id: provider_id,
       location: location,
-      opts: options(declaration),
+      opts: opts,
       declared_by: []
     }
   end
+
+  defp hex_package_option(app, @hex, declaration) do
+    case Map.get(declaration, :hex_package) do
+      nil -> []
+      ^app -> []
+      package -> [hex: String.to_atom(package)]
+    end
+  end
+
+  defp hex_package_option(_app, _source, _declaration), do: []
 
   defp option_value(key, value) when key in @list_options,
     do: Enum.map(value, &String.to_atom/1)

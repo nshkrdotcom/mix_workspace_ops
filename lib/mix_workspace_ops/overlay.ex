@@ -42,12 +42,14 @@ defmodule MixWorkspaceOps.Overlay do
 
   @option_keys %{
     "only" => :only,
+    "hex" => :hex,
     "optional" => :optional,
     "override" => :override,
     "runtime" => :runtime,
     "targets" => :targets
   }
   @list_options ~w(only targets)
+  @name_options ~w(hex)
   @revision_keys ~w(branch ref tag)
 
   @type activation :: %{
@@ -552,6 +554,7 @@ defmodule MixWorkspaceOps.Overlay do
   defp absent(value), do: value
 
   defp encode_option_value(value) when is_boolean(value), do: to_string(value)
+  defp encode_option_value(value) when is_atom(value), do: Atom.to_string(value)
   defp encode_option_value(values) when is_list(values), do: Enum.join(values, "|")
 
   defp decode_option(pair) do
@@ -564,9 +567,16 @@ defmodule MixWorkspaceOps.Overlay do
   defp decode_option(key, value) do
     case Map.fetch(@option_keys, key) do
       {:ok, option} when key in @list_options -> decode_list_option(option, value)
+      {:ok, option} when key in @name_options -> decode_name_option(option, value)
       {:ok, option} -> decode_boolean_option(option, value)
       :error -> {:error, {:unknown_overlay_option, key}}
     end
+  end
+
+  defp decode_name_option(option, value) do
+    if Registry.Source.identifier?(value),
+      do: {:ok, {option, String.to_atom(value)}},
+      else: {:error, {:invalid_overlay_option, option, value}}
   end
 
   defp decode_boolean_option(option, "true"), do: {:ok, {option, true}}
