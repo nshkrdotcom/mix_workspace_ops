@@ -178,6 +178,7 @@ defmodule MixWorkspaceOps.Resolution do
          opts = MixInputs.put(opts, inputs),
          {:ok, closure} <- closure(registry, target, opts),
          :ok <- same_inputs(closure, inputs),
+         :ok <- one_identity_per_application(closure),
          {:ok, direct_dependencies} <- direct_dependencies(registry, target, opts),
          {:ok, consumer_root} <- consumer_root(registry, target, opts),
          {:ok, overrides} <- overrides(consumer_root, opts),
@@ -465,6 +466,17 @@ defmodule MixWorkspaceOps.Resolution do
     "local source was requested for #{app}, but its catalog identity " <>
       "(#{Enum.join(providers, ", ")}) is outside this selection. " <>
       "Choose a view that includes that provider and compute a new plan."
+  end
+
+  def explain({:conflicting_dependency_identities, app, uses}) do
+    rendered =
+      Enum.map_join(uses, ", ", fn use ->
+        provider = use.provider || "external"
+        "#{use.consumer}=#{provider} (#{use.classification})"
+      end)
+
+    "dependency #{app} has conflicting catalog identities in one graph: #{rendered}. " <>
+      "One Mix application can have only one source; align the provider declarations."
   end
 
   def explain(_other), do: nil
@@ -1097,6 +1109,32 @@ defmodule MixWorkspaceOps.Resolution do
     {:error,
      {:graph_input_mismatch, {closure.mix_env, closure.mix_target},
       {inputs.mix_env, inputs.mix_target}}}
+  end
+
+  defp one_identity_per_application(closure) do
+    conflict =
+      closure.dependency_applications
+      |> Enum.group_by(& &1.application)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.find(fn {_app, uses} ->
+        uses
+        |> Enum.map(&{&1.provider, &1.classification})
+        |> Enum.uniq()
+        |> length() > 1
+      end)
+
+    case conflict do
+      nil ->
+        :ok
+
+      {app, uses} ->
+        reported =
+          uses
+          |> Enum.map(&Map.take(&1, [:consumer, :provider, :classification]))
+          |> Enum.sort_by(&{&1.consumer, &1.provider || "", &1.classification})
+
+        {:error, {:conflicting_dependency_identities, app, reported}}
+    end
   end
 
   defp direct_dependencies(registry, target, opts) do

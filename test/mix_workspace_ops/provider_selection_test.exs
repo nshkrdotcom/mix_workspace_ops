@@ -355,6 +355,81 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
     assert Enum.map(report.decisions, & &1.application) == ["shared"]
   end
 
+  test "one application cannot carry conflicting provider identities in one graph", context do
+    root = temporary_directory!(context)
+
+    for repository <- ~w(z_target a_consumer selected_provider excluded_provider) do
+      initialize_repository!(Path.join(root, repository))
+    end
+
+    source = fn provider ->
+      %{"github" => %{}, "hex" => "~> 1.0", "provider" => provider}
+    end
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("z_target",
+          projects: [catalog_project("z_target")],
+          dependency_sources: %{
+            "a_consumer" => %{"github" => %{}, "hex" => "~> 1.0"},
+            "shared" => source.("selected_provider")
+          }
+        ),
+        catalog_repository("a_consumer",
+          projects: [catalog_project("a_consumer")],
+          dependency_sources: %{"shared" => source.("excluded_provider")}
+        ),
+        catalog_repository("selected_provider",
+          projects: [catalog_project("selected_provider", app: nil, provides: ["shared"])]
+        ),
+        catalog_repository("excluded_provider",
+          projects: [catalog_project("excluded_provider", app: nil, provides: ["shared"])]
+        )
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    selected =
+      Registry.select(registry, [
+        Registry.project!(registry, "z_target"),
+        Registry.project!(registry, "a_consumer"),
+        Registry.project!(registry, "selected_provider")
+      ])
+
+    reader = fn project ->
+      case project.id do
+        "z_target" -> {:ok, ["a_consumer", "shared"]}
+        "a_consumer" -> {:ok, ["shared"]}
+        _other -> {:ok, []}
+      end
+    end
+
+    assert {:ok, graph} = Graph.resolve(selected, "z_target", dependency_reader: reader)
+
+    assert {:error, {:conflicting_dependency_identities, "shared", uses}} =
+             Resolution.resolve(selected, "z_target",
+               closure: graph,
+               dependency_reader: reader
+             )
+
+    assert uses == [
+             %{
+               consumer: "a_consumer",
+               provider: "excluded_provider",
+               classification: :known_unselected
+             },
+             %{
+               consumer: "z_target",
+               provider: "selected_provider",
+               classification: :managed
+             }
+           ]
+
+    assert Resolution.explain({:conflicting_dependency_identities, "shared", uses}) =~
+             "a_consumer=excluded_provider (known_unselected)"
+  end
+
   # A pruned catalog could change which project an application resolved to,
   # because the current schema permits several projects to provide one and
   # pruning removes candidates from the index the resolver reads. Selection
