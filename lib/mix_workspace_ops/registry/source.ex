@@ -178,14 +178,11 @@ defmodule MixWorkspaceOps.Registry.Source do
 
   defp github_keys(raw, where) do
     keys = Map.keys(raw)
+    unknown = keys -- @github_optional
 
-    cond do
-      keys -- @github_optional != [] ->
-        {:error, {:unknown_github_source_keys, where, Enum.sort(keys -- @github_optional)}}
-
-      true ->
-        :ok
-    end
+    if unknown == [],
+      do: :ok,
+      else: {:error, {:unknown_github_source_keys, where, Enum.sort(unknown)}}
   end
 
   defp github_repo(repo, where) when is_binary(repo) do

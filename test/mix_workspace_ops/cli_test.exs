@@ -456,7 +456,7 @@ defmodule MixWorkspaceOps.CLITest do
 
     Code.compile_string(source)
 
-    assert apply(module, :deps, []) == [
+    assert module.deps() == [
              {:core, "~> 1.0", [only: [:dev, :test], runtime: false]},
              {:third_party, [github: "example-org/third-party", branch: "main", subdir: "core"]}
            ]

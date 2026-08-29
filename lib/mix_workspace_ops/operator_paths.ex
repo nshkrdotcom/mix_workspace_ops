@@ -25,7 +25,6 @@ defmodule MixWorkspaceOps.OperatorPaths do
       case value(field, acc, config) do
         {:ok, path} -> {:cont, {:ok, Map.put(acc, field, path)}}
         :missing -> {:cont, {:ok, acc}}
-        {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
   end
@@ -64,7 +63,7 @@ defmodule MixWorkspaceOps.OperatorPaths do
       Map.put(decoded, "__directory__", Path.dirname(path))
     else
       false -> %{}
-      {:error, reason} -> %{"__error__" => {:operator_config, path, reason}}
+      {:error, _reason} -> %{}
     end
   end
 

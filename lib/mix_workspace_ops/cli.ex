@@ -7,8 +7,8 @@ defmodule MixWorkspaceOps.CLI do
     Doctor,
     Inventory,
     LocalOverrides,
-    Overlay,
     OperatorPaths,
+    Overlay,
     PublishMode,
     Registry,
     Report,
@@ -16,9 +16,9 @@ defmodule MixWorkspaceOps.CLI do
     View
   }
 
+  alias MixWorkspaceOps.Project.ProbeMemo
   alias MixWorkspaceOps.Registry.{Examples, ReleaseChain}
   alias MixWorkspaceOps.Release.{Descriptor, LocalAdapter, Transaction}
-  alias MixWorkspaceOps.Project.ProbeMemo
 
   @usage """
   mix_workspace_ops <command>

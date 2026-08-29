@@ -936,10 +936,12 @@ defmodule MixWorkspaceOps.Resolution do
   defp maybe_pin(nil, _registry, _app, _declaration), do: nil
 
   defp maybe_pin(coordinates, registry, app, declaration) do
-    with {:ok, project} <- provider(registry, app, declaration) do
-      pin(coordinates, registry, Registry.repository!(registry, project.repository))
-    else
-      _unavailable -> coordinates
+    case provider(registry, app, declaration) do
+      {:ok, project} ->
+        pin(coordinates, registry, Registry.repository!(registry, project.repository))
+
+      _unavailable ->
+        coordinates
     end
   end
 
@@ -965,22 +967,25 @@ defmodule MixWorkspaceOps.Resolution do
   defp merge_github(base, %{github: override}), do: merge_github(base, override)
 
   defp merge_github(base, override) do
-    Enum.reduce(override, base, fn {key, value}, acc ->
-      case {key, value} do
-        {key, nil} when key in [:repo, :branch, :ref, :tag, :subdir] -> acc
-        {:repo, value} -> %{acc | repo: value}
-        {:branch, value} -> %{acc | branch: value, ref: nil, tag: nil}
-        {:ref, value} -> %{acc | ref: value, branch: nil, tag: nil}
-        {:tag, value} -> %{acc | tag: value, branch: nil, ref: nil}
-        {:subdir, value} -> %{acc | subdir: value}
-        {"repo", value} -> %{acc | repo: value}
-        {"branch", value} -> %{acc | branch: value, ref: nil, tag: nil}
-        {"ref", value} -> %{acc | ref: value, branch: nil, tag: nil}
-        {"tag", value} -> %{acc | tag: value, branch: nil, ref: nil}
-        {"subdir", value} -> %{acc | subdir: value}
-      end
-    end)
+    Enum.reduce(override, base, fn {key, value}, acc -> merge_coordinate(acc, key, value) end)
   end
+
+  defp merge_coordinate(coordinates, _key, nil), do: coordinates
+
+  defp merge_coordinate(coordinates, key, value) when key in [:repo, "repo"],
+    do: %{coordinates | repo: value}
+
+  defp merge_coordinate(coordinates, key, value) when key in [:branch, "branch"],
+    do: %{coordinates | branch: value, ref: nil, tag: nil}
+
+  defp merge_coordinate(coordinates, key, value) when key in [:ref, "ref"],
+    do: %{coordinates | ref: value, branch: nil, tag: nil}
+
+  defp merge_coordinate(coordinates, key, value) when key in [:tag, "tag"],
+    do: %{coordinates | tag: value, branch: nil, ref: nil}
+
+  defp merge_coordinate(coordinates, key, value) when key in [:subdir, "subdir"],
+    do: %{coordinates | subdir: value}
 
   defp decision(app, source, reason, considered, provider_id, location, declaration) do
     opts = options(declaration) ++ hex_package_option(app, source, declaration)

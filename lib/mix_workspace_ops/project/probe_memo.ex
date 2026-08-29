@@ -34,12 +34,14 @@ defmodule MixWorkspaceOps.Project.ProbeMemo do
       [] ->
         # Pre-warm workers can encounter the same project. The lock makes a
         # cache miss one subprocess question, not merely one stored answer.
-        :global.trans({{__MODULE__, table, key}, self()}, fn ->
-          case :ets.lookup(table, key) do
-            [{^key, value}] -> value
-            [] -> miss.() |> tap(&:ets.insert(table, {key, &1}))
-          end
-        end)
+        :global.trans({{__MODULE__, table, key}, self()}, fn -> locked_fetch(table, key, miss) end)
+    end
+  end
+
+  defp locked_fetch(table, key, miss) do
+    case :ets.lookup(table, key) do
+      [{^key, value}] -> value
+      [] -> miss.() |> tap(&:ets.insert(table, {key, &1}))
     end
   end
 end
