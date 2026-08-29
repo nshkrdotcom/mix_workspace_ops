@@ -9,7 +9,7 @@ defmodule MixWorkspaceOps.Project do
   by parsing.
   """
 
-  alias MixWorkspaceOps.{Command, Registry}
+  alias MixWorkspaceOps.{Command, MixInputs, Registry}
   alias MixWorkspaceOps.Project.ProbeMemo
 
   @marker "__MIX_WORKSPACE_OPS_METADATA__"
@@ -64,11 +64,10 @@ defmodule MixWorkspaceOps.Project do
   @spec metadata_at(String.t(), probe_options()) :: {:ok, map()} | {:error, term()}
   def metadata_at(project_root, opts \\ []) do
     project_root = Path.expand(project_root)
-    mix_env = Keyword.get(opts, :mix_env, "dev")
-    mix_target = Keyword.get_lazy(opts, :mix_target, fn -> System.get_env("MIX_TARGET") end)
 
-    with {:ok, key} <- probe_key(project_root, mix_env, mix_target, opts) do
-      question = fn -> evaluate_at(project_root, mix_env, mix_target) end
+    with {:ok, inputs} <- MixInputs.normalize(opts),
+         {:ok, key} <- probe_key(project_root, inputs.mix_env, inputs.mix_target, opts) do
+      question = fn -> evaluate_at(project_root, inputs.mix_env, inputs.mix_target) end
 
       case Keyword.get(opts, :probe_memo) do
         nil -> question.()

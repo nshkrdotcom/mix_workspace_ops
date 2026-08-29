@@ -10,7 +10,7 @@ defmodule MixWorkspaceOps.Graph do
   GitHub" into a refusal.
   """
 
-  alias MixWorkspaceOps.{Project, Registry}
+  alias MixWorkspaceOps.{MixInputs, Project, Registry}
 
   @type resolution :: %{
           projects: [Registry.project()],
@@ -18,6 +18,8 @@ defmodule MixWorkspaceOps.Graph do
           dependency_applications: [dependency_application()],
           external_dependencies: [{String.t(), String.t()}],
           known_unselected: [{String.t(), String.t(), [String.t()]}],
+          mix_env: String.t(),
+          mix_target: String.t(),
           digest: String.t()
         }
 
@@ -33,19 +35,12 @@ defmodule MixWorkspaceOps.Graph do
           {:ok, resolution()} | {:error, term()}
   def resolve(registry, target, opts \\ []) do
     target = to_string(target)
-    reader = Keyword.get(opts, :dependency_reader, &Project.dependencies(registry, &1, opts))
 
-    state = %{
-      visiting: MapSet.new(),
-      visited: MapSet.new(),
-      ordered: [],
-      edges: [],
-      dependency_applications: [],
-      external: [],
-      known_unselected: []
-    }
-
-    with {:ok, seeds} <- seed_projects(registry, target),
+    with {:ok, inputs} <- MixInputs.normalize(opts),
+         opts = MixInputs.put(opts, inputs),
+         reader = Keyword.get(opts, :dependency_reader, &Project.dependencies(registry, &1, opts)),
+         state = initial_state(),
+         {:ok, seeds} <- seed_projects(registry, target),
          :ok <- require_target_checkout(registry, seeds),
          {:ok, final} <- visit_seeds(registry, seeds, reader, state) do
       projects = Enum.reverse(final.ordered)
@@ -66,11 +61,33 @@ defmodule MixWorkspaceOps.Graph do
          dependency_applications: dependency_applications,
          external_dependencies: external,
          known_unselected: known_unselected,
-         digest: digest(projects, edges, dependency_applications, external, known_unselected)
+         mix_env: inputs.mix_env,
+         mix_target: inputs.mix_target,
+         digest:
+           digest(
+             projects,
+             edges,
+             dependency_applications,
+             external,
+             known_unselected,
+             inputs
+           )
        }}
     end
   rescue
     error in ArgumentError -> {:error, {:registry_target, Exception.message(error)}}
+  end
+
+  defp initial_state do
+    %{
+      visiting: MapSet.new(),
+      visited: MapSet.new(),
+      ordered: [],
+      edges: [],
+      dependency_applications: [],
+      external: [],
+      known_unselected: []
+    }
   end
 
   # Requirement is the operation's question, not the catalog's. The one
@@ -261,8 +278,10 @@ defmodule MixWorkspaceOps.Graph do
     }
   end
 
-  defp digest(projects, edges, dependency_applications, external, known_unselected) do
+  defp digest(projects, edges, dependency_applications, external, known_unselected, inputs) do
     :json.encode(%{
+      mix_env: inputs.mix_env,
+      mix_target: inputs.mix_target,
       projects: Enum.map(projects, & &1.id),
       edges: Enum.map(edges, &Tuple.to_list/1),
       dependency_applications:

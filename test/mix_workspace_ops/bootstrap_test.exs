@@ -475,10 +475,12 @@ defmodule MixWorkspaceOps.BootstrapTest do
     contents =
       Enum.join(
         [
-          "mix_workspace_ops.overlay/v2",
+          "mix_workspace_ops.overlay/v3",
           "registry_digest\tdigest",
           "selection_digest\t#{Keyword.get(opts, :selection_digest, "-")}",
           "graph_digest\tgraph",
+          "mix_env\t#{Keyword.get(opts, :mix_env, "dev")}",
+          "mix_target\t#{Keyword.get(opts, :mix_target, "host")}",
           "context_digest\tcontext",
           "target\texample_consumer",
           "mode\t#{Keyword.get(opts, :mode, "auto")}",

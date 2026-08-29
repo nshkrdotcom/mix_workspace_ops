@@ -8,7 +8,7 @@ defmodule MixWorkspaceOpsBootstrap do
   # `MixWorkspaceOps.PublishMode` and `MixWorkspaceOps.Overlay`. Tests hold each
   # pair to one shared table so they cannot drift.
 
-  @schema_header "mix_workspace_ops.overlay/v2"
+  @schema_header "mix_workspace_ops.overlay/v3"
   @maximum_mix_bytes 1024 * 1024
   @overlay_env "MIX_WORKSPACE_OPS_OVERLAY"
   @lockfile_env "MIX_WORKSPACE_OPS_LOCKFILE"
@@ -368,6 +368,8 @@ defmodule MixWorkspaceOpsBootstrap do
         "registry_digest\t" <> _registry_digest,
         "selection_digest\t" <> _selection_digest,
         "graph_digest\t" <> _graph_digest,
+        "mix_env\t" <> _mix_env,
+        "mix_target\t" <> _mix_target,
         "context_digest\t" <> _context_digest,
         "target\t" <> _target,
         "mode\t" <> mode,

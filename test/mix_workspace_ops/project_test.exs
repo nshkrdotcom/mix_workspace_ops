@@ -69,26 +69,34 @@ defmodule MixWorkspaceOps.ProjectTest do
     memo = ProbeMemo.new()
 
     assert {:ok, _base} =
-             Project.metadata_at(repository, probe_memo: memo, mix_env: "dev", mix_target: nil)
+             Project.metadata_at(repository, probe_memo: memo, mix_env: "dev", mix_target: "host")
 
     assert {:ok, _env} =
-             Project.metadata_at(repository, probe_memo: memo, mix_env: "test", mix_target: nil)
+             Project.metadata_at(repository,
+               probe_memo: memo,
+               mix_env: "test",
+               mix_target: "host"
+             )
 
     assert {:ok, _target} =
-             Project.metadata_at(repository, probe_memo: memo, mix_env: "dev", mix_target: "host")
+             Project.metadata_at(repository,
+               probe_memo: memo,
+               mix_env: "dev",
+               mix_target: "embedded"
+             )
 
     assert {:ok, _toolchain} =
              Project.metadata_at(repository,
                probe_memo: memo,
                mix_env: "dev",
-               mix_target: nil,
+               mix_target: "host",
                toolchain: {"future", "otp", "mix"}
              )
 
     assert File.read!(counter) == "xxxx"
 
     assert {:ok, _base_again} =
-             Project.metadata_at(repository, probe_memo: memo, mix_env: "dev", mix_target: nil)
+             Project.metadata_at(repository, probe_memo: memo, mix_env: "dev", mix_target: "host")
 
     assert File.read!(counter) == "xxxx"
   end

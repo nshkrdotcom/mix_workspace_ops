@@ -88,7 +88,7 @@ defmodule MixWorkspaceOps.Resolution do
   disagreement is visible rather than silently resolved.
   """
 
-  alias MixWorkspaceOps.{Git, Graph, LocalOverrides, Project, Registry}
+  alias MixWorkspaceOps.{Git, Graph, LocalOverrides, MixInputs, Project, Registry}
   alias MixWorkspaceOps.Registry.Source
 
   @local "local"
@@ -132,7 +132,9 @@ defmodule MixWorkspaceOps.Resolution do
           decisions: [decision()],
           overrides: %{String.t() => LocalOverrides.override()},
           publish?: boolean(),
-          mode: String.t() | nil
+          mode: String.t() | nil,
+          mix_env: String.t(),
+          mix_target: String.t()
         }
 
   @type source_entry :: %{
@@ -172,7 +174,10 @@ defmodule MixWorkspaceOps.Resolution do
   def resolve(registry, target, opts \\ []) do
     target = to_string(target)
 
-    with {:ok, closure} <- closure(registry, target, opts),
+    with {:ok, inputs} <- MixInputs.normalize(opts),
+         opts = MixInputs.put(opts, inputs),
+         {:ok, closure} <- closure(registry, target, opts),
+         :ok <- same_inputs(closure, inputs),
          {:ok, direct_dependencies} <- direct_dependencies(registry, target, opts),
          {:ok, consumer_root} <- consumer_root(registry, target, opts),
          {:ok, overrides} <- overrides(consumer_root, opts),
@@ -190,7 +195,9 @@ defmodule MixWorkspaceOps.Resolution do
          decisions: decisions,
          overrides: overrides,
          publish?: Keyword.get(opts, :publish?, false),
-         mode: Keyword.get(opts, :mode)
+         mode: Keyword.get(opts, :mode),
+         mix_env: inputs.mix_env,
+         mix_target: inputs.mix_target
        }}
     end
   end
@@ -1078,6 +1085,18 @@ defmodule MixWorkspaceOps.Resolution do
       nil -> Graph.resolve(registry, target, opts)
       closure -> {:ok, closure}
     end
+  end
+
+  defp same_inputs(%{mix_env: mix_env, mix_target: mix_target}, %{
+         mix_env: mix_env,
+         mix_target: mix_target
+       }),
+       do: :ok
+
+  defp same_inputs(closure, inputs) do
+    {:error,
+     {:graph_input_mismatch, {closure.mix_env, closure.mix_target},
+      {inputs.mix_env, inputs.mix_target}}}
   end
 
   defp direct_dependencies(registry, target, opts) do

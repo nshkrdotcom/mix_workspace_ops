@@ -5,7 +5,7 @@ defmodule MixWorkspaceOps.Overlay do
 
   An overlay carries one row per application, and each row states the source
   that application resolved to and everything the seam needs to emit its Mix
-  dependency tuple. `mix_workspace_ops.overlay/v2` replaces the whole-run
+  dependency tuple. `mix_workspace_ops.overlay/v3` replaces the whole-run
   `local | git` mode of v1: resolution is per dependency, so one mode for the
   whole run could not describe it. The header keeps a `mode` line for the run
   mode the operator *requested* — `auto` where they requested nothing — and
@@ -30,12 +30,12 @@ defmodule MixWorkspaceOps.Overlay do
   reads one.
   """
 
-  alias MixWorkspaceOps.{Bootstrap, Git, Graph, Registry, Resolution, Runtime}
+  alias MixWorkspaceOps.{Bootstrap, Git, Graph, MixInputs, Registry, Resolution, Runtime}
 
   @env "MIX_WORKSPACE_OPS_OVERLAY"
   @context_env "MIX_WORKSPACE_OPS_CONTEXT_DIGEST"
-  @header "mix_workspace_ops.overlay/v2"
-  @context_header "mix_workspace_ops.context/v2"
+  @header "mix_workspace_ops.overlay/v3"
+  @context_header "mix_workspace_ops.context/v3"
   @maximum_bytes 16 * 1024 * 1024
   @modes ~w(auto local git hex)
   @absent "-"
@@ -72,7 +72,9 @@ defmodule MixWorkspaceOps.Overlay do
     mix_state = Keyword.get(opts, :mix_state, :managed)
     state_root = Keyword.get_lazy(opts, :state_root, &default_state_root/0)
 
-    with :ok <- known_mode(mode),
+    with {:ok, inputs} <- MixInputs.normalize(opts),
+         opts = MixInputs.put(opts, inputs),
+         :ok <- known_mode(mode),
          {:ok, resolution} <- Graph.resolve(registry, target, opts),
          {:ok, decided} <- decide(registry, target, resolution, mode, opts),
          {:ok, attributed} <- source_rows(decided),
@@ -103,7 +105,9 @@ defmodule MixWorkspaceOps.Overlay do
         [
           {Bootstrap.environment_variable(), bootstrap_path},
           {@env, path},
-          {@context_env, context_digest}
+          {@context_env, context_digest},
+          {"MIX_ENV", inputs.mix_env},
+          {"MIX_TARGET", inputs.mix_target}
           | runtime.env
         ]
 
@@ -130,6 +134,8 @@ defmodule MixWorkspaceOps.Overlay do
            dependency_applications: resolution.dependency_applications,
            external_dependencies: resolution.external_dependencies,
            known_unselected: resolution.known_unselected,
+           mix_env: inputs.mix_env,
+           mix_target: inputs.mix_target,
            decisions: Enum.map(decided.decisions, &reported_decision/1),
            rows: rows
          }
@@ -204,12 +210,14 @@ defmodule MixWorkspaceOps.Overlay do
   defp known_mode(mode), do: {:error, {:unsupported_source_mode, mode}}
 
   defp decide(registry, target, resolution, mode, opts) do
-    Resolution.resolve(registry, target,
-      closure: resolution,
-      mode: resolution_mode(mode),
-      sources: Keyword.get(opts, :sources, %{}),
-      publish?: Keyword.get(opts, :publish?, false)
-    )
+    opts =
+      opts
+      |> Keyword.put(:closure, resolution)
+      |> Keyword.put(:mode, resolution_mode(mode))
+      |> Keyword.put(:sources, Keyword.get(opts, :sources, %{}))
+      |> Keyword.put(:publish?, Keyword.get(opts, :publish?, false))
+
+    Resolution.resolve(registry, target, opts)
   end
 
   # `git` is what the command line calls the source the catalog calls `github`.
@@ -308,6 +316,8 @@ defmodule MixWorkspaceOps.Overlay do
       "registry_digest\t#{registry.digest}",
       "selection_digest\t#{selection_digest(registry)}",
       "graph_digest\t#{resolution.digest}",
+      "mix_env\t#{resolution.mix_env}",
+      "mix_target\t#{resolution.mix_target}",
       "context_digest\t#{context_digest}",
       "target\t#{decided.target}",
       "mode\t#{mode}",
@@ -330,6 +340,8 @@ defmodule MixWorkspaceOps.Overlay do
       @context_header,
       "selection_digest\t#{selection_digest(registry)}",
       "graph_digest\t#{decided.closure.digest}",
+      "mix_env\t#{decided.mix_env}",
+      "mix_target\t#{decided.mix_target}",
       "target\t#{decided.target}",
       "publish\t#{decided.publish?}",
       "target_repository\t#{target_repository.github}",
@@ -458,6 +470,8 @@ defmodule MixWorkspaceOps.Overlay do
         "registry_digest\t" <> registry_digest,
         "selection_digest\t" <> selection_digest,
         "graph_digest\t" <> graph_digest,
+        "mix_env\t" <> mix_env,
+        "mix_target\t" <> mix_target,
         "context_digest\t" <> context_digest,
         "target\t" <> target,
         "mode\t" <> mode,
@@ -475,6 +489,8 @@ defmodule MixWorkspaceOps.Overlay do
              registry_digest: registry_digest,
              selection_digest: absent(selection_digest),
              graph_digest: graph_digest,
+             mix_env: mix_env,
+             mix_target: mix_target,
              context_digest: context_digest,
              target: target,
              mode: mode,

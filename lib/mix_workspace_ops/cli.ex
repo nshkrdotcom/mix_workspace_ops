@@ -33,17 +33,20 @@ defmodule MixWorkspaceOps.CLI do
     inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
     doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
     plan --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
+      [--mix-env ENV] [--mix-target TARGET] \
       [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false]
     sources --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
+      [--mix-env ENV] [--mix-target TARGET] \
       [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false]
     why APP [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
     use APP SOURCE [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
     use --clear [APP] [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
-    seam --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
+    seam --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
+      [--mix-env ENV] [--mix-target TARGET]
     run --project ID [--mode auto|local|git|hex] [--source APP=SOURCE] \
       --mix-state managed|delegated \
       --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
-      [--state-root PATH] -- COMMAND [ARG ...]
+      [--mix-env ENV] [--mix-target TARGET] [--state-root PATH] -- COMMAND [ARG ...]
     release publish --descriptor PATH [--state-root PATH]
     help
   """
@@ -67,6 +70,8 @@ defmodule MixWorkspaceOps.CLI do
       :checkout_root,
       :view,
       :binding,
+      :mix_env,
+      :mix_target,
       :mode,
       :source,
       :as_publish
@@ -77,13 +82,23 @@ defmodule MixWorkspaceOps.CLI do
       :checkout_root,
       :view,
       :binding,
+      :mix_env,
+      :mix_target,
       :mode,
       :source,
       :as_publish
     ],
     ["why"] => [:project, :registry, :checkout_root, :view, :binding],
     ["use"] => [:clear, :project, :registry, :checkout_root, :view, :binding],
-    ["seam"] => [:project, :registry, :checkout_root, :view, :binding],
+    ["seam"] => [
+      :project,
+      :registry,
+      :checkout_root,
+      :view,
+      :binding,
+      :mix_env,
+      :mix_target
+    ],
     ["run"] => [
       :project,
       :mode,
@@ -93,6 +108,8 @@ defmodule MixWorkspaceOps.CLI do
       :checkout_root,
       :view,
       :binding,
+      :mix_env,
+      :mix_target,
       :state_root
     ],
     ["release", "publish"] => [:descriptor, :state_root]
@@ -269,6 +286,8 @@ defmodule MixWorkspaceOps.CLI do
          registry_digest: registry.digest,
          selection_digest: Registry.selection_digest(registry),
          graph_digest: resolution.digest,
+         mix_env: resolution.mix_env,
+         mix_target: resolution.mix_target,
          sets: Registry.sets(registry),
          mode: options.mode,
          publish: decided.publish?,
@@ -296,6 +315,8 @@ defmodule MixWorkspaceOps.CLI do
          sets: Registry.sets(registry),
          mode: options.mode,
          publish: decided.publish?,
+         mix_env: decided.mix_env,
+         mix_target: decided.mix_target,
          sources: entries,
          report: Resolution.format_sources(entries)
        }}
@@ -337,6 +358,8 @@ defmodule MixWorkspaceOps.CLI do
          {:ok, decided} <-
            Resolution.resolve(registry, options.project,
              publish?: true,
+             mix_env: options.mix_env,
+             mix_target: options.mix_target,
              probe_memo: ProbeMemo.new()
            ),
          {:ok, lines} <- Resolution.seam_lines(decided) do
@@ -346,6 +369,8 @@ defmodule MixWorkspaceOps.CLI do
          target: options.project,
          registry_digest: registry.digest,
          selection_digest: Registry.selection_digest(registry),
+         mix_env: decided.mix_env,
+         mix_target: decided.mix_target,
          lines: lines,
          report: Resolution.format_seam(lines)
        }}
@@ -372,6 +397,8 @@ defmodule MixWorkspaceOps.CLI do
           mode: mode,
           sources: sources,
           publish?: PublishMode.publish?(PublishMode.task_argv(command)),
+          mix_env: options.mix_env,
+          mix_target: options.mix_target,
           mix_state: mix_state,
           probe_memo: ProbeMemo.new(),
           state_root: options.state_root
@@ -405,6 +432,8 @@ defmodule MixWorkspaceOps.CLI do
              mode: resolution_mode(mode),
              sources: sources,
              publish?: publish?,
+             mix_env: options.mix_env,
+             mix_target: options.mix_target,
              probe_memo: memo
            ) do
       {:ok, registry, decided}
@@ -492,6 +521,8 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   defp default(:mode), do: "auto"
+  defp default(:mix_env), do: "dev"
+  defp default(:mix_target), do: "host"
   defp default(:source), do: []
   defp default(:mix_state), do: "managed"
   defp default(:state_root), do: default_state_root()

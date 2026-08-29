@@ -27,7 +27,7 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert String.starts_with?(activation.report.runtime.root, state_root)
     assert File.read!(activation.report.runtime.lockfile) == "%{}\n"
     assert {:ok, overlay} = Overlay.read(activation.path)
-    assert overlay.schema == "mix_workspace_ops.overlay/v2"
+    assert overlay.schema == "mix_workspace_ops.overlay/v3"
     assert overlay.mode == "auto"
     refute overlay.publish
     assert overlay.context_digest == activation.report.context_digest
