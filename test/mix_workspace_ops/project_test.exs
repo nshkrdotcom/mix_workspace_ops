@@ -62,16 +62,35 @@ defmodule MixWorkspaceOps.ProjectTest do
 
   test "environment, target, and toolchain are part of the probe key", context do
     root = temporary_directory!(context)
-    repository = initialize_repository!(Path.join(root, "alpha"))
+    repository = Path.join(root, "alpha")
+    counter = Path.join(root, "probes")
+    File.mkdir_p!(repository)
+    File.write!(Path.join(repository, "mix.exs"), instrumented_mix(counter, "0.1.0"))
+    memo = ProbeMemo.new()
 
-    {:ok, base} = Project.probe_key(repository, mix_env: "dev", mix_target: nil)
-    {:ok, env} = Project.probe_key(repository, mix_env: "test", mix_target: nil)
-    {:ok, target} = Project.probe_key(repository, mix_env: "dev", mix_target: "host")
-    {:ok, toolchain} = Project.probe_key(repository, toolchain: {"future", "otp", "mix"})
+    assert {:ok, _base} =
+             Project.metadata_at(repository, probe_memo: memo, mix_env: "dev", mix_target: nil)
 
-    refute base == env
-    refute base == target
-    refute base == toolchain
+    assert {:ok, _env} =
+             Project.metadata_at(repository, probe_memo: memo, mix_env: "test", mix_target: nil)
+
+    assert {:ok, _target} =
+             Project.metadata_at(repository, probe_memo: memo, mix_env: "dev", mix_target: "host")
+
+    assert {:ok, _toolchain} =
+             Project.metadata_at(repository,
+               probe_memo: memo,
+               mix_env: "dev",
+               mix_target: nil,
+               toolchain: {"future", "otp", "mix"}
+             )
+
+    assert File.read!(counter) == "xxxx"
+
+    assert {:ok, _base_again} =
+             Project.metadata_at(repository, probe_memo: memo, mix_env: "dev", mix_target: nil)
+
+    assert File.read!(counter) == "xxxx"
   end
 
   test "a later invocation owns no answers from the earlier one", context do

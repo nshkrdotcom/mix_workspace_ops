@@ -77,15 +77,6 @@ defmodule MixWorkspaceOps.Project do
     end
   end
 
-  @doc "Returns the complete identity of one metadata-probe question."
-  @spec probe_key(String.t(), probe_options()) :: {:ok, term()} | {:error, term()}
-  def probe_key(project_root, opts \\ []) do
-    project_root = Path.expand(project_root)
-    mix_env = Keyword.get(opts, :mix_env, "dev")
-    mix_target = Keyword.get_lazy(opts, :mix_target, fn -> System.get_env("MIX_TARGET") end)
-    probe_key(project_root, mix_env, mix_target, opts)
-  end
-
   @doc "Warms one invocation memo concurrently for a known project list."
   @spec prewarm(Registry.t(), [Registry.project()], ProbeMemo.t(), keyword()) ::
           [{String.t(), {:ok, map()} | {:error, term()}}]
