@@ -124,7 +124,7 @@ defmodule MixWorkspaceOps.Project do
            [
              "--kill-after=2",
              "15",
-             "elixir",
+             elixir_executable(),
              "-e",
              @expression
            ],
@@ -140,6 +140,27 @@ defmodule MixWorkspaceOps.Project do
          ) do
       {:ok, result} -> parse(result.output)
       {:error, result} -> {:error, {:command_failed, result.exit_code, result.output}}
+    end
+  end
+
+  # Use the executable of the running toolchain rather than a version-manager
+  # shim that re-resolves from the probed project's working directory. A
+  # project's partial `.tool-versions` must not silently change which Elixir
+  # the memo key says evaluated it.
+  defp elixir_executable do
+    candidate =
+      :elixir
+      |> :code.lib_dir()
+      |> Path.join("../../bin/elixir")
+      |> Path.expand()
+
+    if File.regular?(candidate), do: candidate, else: version_manager_elixir()
+  end
+
+  defp version_manager_elixir do
+    case Command.run("asdf", ["which", "elixir"], cd: System.tmp_dir!()) do
+      {:ok, result} -> String.trim(result.output)
+      {:error, _result} -> System.find_executable("elixir") || "elixir"
     end
   end
 

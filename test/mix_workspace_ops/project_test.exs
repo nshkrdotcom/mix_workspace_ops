@@ -34,6 +34,14 @@ defmodule MixWorkspaceOps.ProjectTest do
     assert metadata.dependencies == ["jason"]
   end
 
+  test "uses the running toolchain when a project has a partial version file", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "alpha"))
+    File.write!(Path.join(repository, ".tool-versions"), "erlang 29.0.5\n")
+
+    assert {:ok, %{app: "alpha"}} = Project.metadata_at(repository)
+  end
+
   test "one invocation evaluates an unchanged metadata question once", context do
     root = temporary_directory!(context)
     repository = Path.join(root, "alpha")
