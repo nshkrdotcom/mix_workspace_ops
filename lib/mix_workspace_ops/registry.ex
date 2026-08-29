@@ -51,6 +51,7 @@ defmodule MixWorkspaceOps.Registry do
           kind: String.t(),
           provides: [String.t()],
           current: boolean(),
+          lineage: String.t() | nil,
           dependency_sources: %{String.t() => Source.t()},
           repository: String.t()
         }

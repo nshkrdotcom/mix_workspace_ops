@@ -159,6 +159,21 @@ defmodule MixWorkspaceOps.CatalogSchemaTest do
       assert declaration.hex_package == "beta_fork"
     end
 
+    test "lineage is parsed as documentation on a project", context do
+      root = temporary_directory!(context)
+
+      registry =
+        root
+        |> write_catalog!([
+          catalog_repository("alpha",
+            projects: [catalog_project("alpha", lineage: "predecessor.alpha")]
+          )
+        ])
+        |> Registry.load!()
+
+      assert Registry.project!(registry, "alpha").lineage == "predecessor.alpha"
+    end
+
     test "carries a declared order, publish order, and Mix options", context do
       root = temporary_directory!(context)
 

@@ -195,6 +195,29 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
              Registry.load(path)
   end
 
+  test "lineage never selects a dependency provider", context do
+    root = temporary_directory!(context)
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("upstream",
+          projects: [catalog_project("upstream.shared", app: "shared")]
+        ),
+        catalog_repository("successor",
+          projects: [
+            catalog_project("successor.shared", app: "shared", lineage: "upstream.shared")
+          ]
+        )
+      ])
+      |> Registry.load!()
+
+    assert {:error, {:ambiguous_application, "shared", candidates}} =
+             Registry.resolve_dependency(registry, "shared")
+
+    assert Enum.map(candidates, & &1.project) == ["successor.shared", "upstream.shared"]
+  end
+
   test "a catalogued provider outside the selection is not an external package", context do
     root = temporary_directory!(context)
 

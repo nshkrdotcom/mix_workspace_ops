@@ -17,7 +17,7 @@ defmodule MixWorkspaceOps.Registry.Document do
                           roles groups agent_scope)
   @repository_optional ~w(mix dependency_sources release_chain)
   @project_required ~w(id path kind)
-  @project_optional ~w(app provides dependency_sources current)
+  @project_optional ~w(app provides dependency_sources current lineage)
 
   @project_kinds ~w(standalone workspace_root package tooling generated)
   @lifecycles ~w(active maintenance dormant archived)
@@ -134,6 +134,7 @@ defmodule MixWorkspaceOps.Registry.Document do
          :ok <- member(raw["kind"], @project_kinds, :project_kind),
          {:ok, provides} <- provides(raw["provides"], app),
          {:ok, current} <- current(raw["current"], raw["id"]),
+         {:ok, lineage} <- lineage(raw["lineage"], raw["id"]),
          {:ok, sources} <- Source.parse_table(raw["dependency_sources"] || %{}, raw["id"]) do
       {:ok,
        %{
@@ -143,6 +144,7 @@ defmodule MixWorkspaceOps.Registry.Document do
          kind: raw["kind"],
          provides: provides,
          current: current,
+         lineage: lineage,
          dependency_sources: sources,
          repository: repository_id
        }}
@@ -167,6 +169,17 @@ defmodule MixWorkspaceOps.Registry.Document do
   defp current(nil, _project_id), do: {:ok, false}
   defp current(value, _project_id) when is_boolean(value), do: {:ok, value}
   defp current(value, project_id), do: {:error, {:invalid_current_provider, project_id, value}}
+
+  defp lineage(nil, _project_id), do: {:ok, nil}
+
+  defp lineage(value, _project_id) when is_binary(value) do
+    case stable_id(value) do
+      :ok -> {:ok, value}
+      {:error, _reason} -> {:error, {:invalid_lineage, value}}
+    end
+  end
+
+  defp lineage(value, project_id), do: {:error, {:invalid_lineage, project_id, value}}
 
   defp workspace(nil, _repository_id, _projects), do: {:ok, nil}
 
@@ -304,6 +317,7 @@ defmodule MixWorkspaceOps.Registry.Document do
          kind: raw["kind"],
          provides: if(is_nil(app), do: [], else: [app]),
          current: false,
+         lineage: nil,
          dependency_sources: %{},
          repository: repository_id,
          tags: tags
