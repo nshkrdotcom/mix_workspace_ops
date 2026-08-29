@@ -41,6 +41,7 @@ defmodule MixWorkspaceOpsBootstrap do
   @maximum_option_values 8
   @maximum_option_value_bytes 32
   @revision_keys ["branch", "ref", "tag"]
+  @state_table __MODULE__
 
   @doc """
   The dependency tuple for `app`.
@@ -74,9 +75,11 @@ defmodule MixWorkspaceOpsBootstrap do
   re-deriving it, so what is printed is what Mix was given.
   """
   def recorded_sources(project_root) do
-    sources_key(project_root)
-    |> :persistent_term.get(%{})
-    |> Map.values()
+    root = Path.expand(project_root)
+
+    state_table()
+    |> :ets.match_object({{:source, root, :_}, :_})
+    |> Enum.map(&elem(&1, 1))
     |> Enum.sort_by(& &1.app)
   end
 
@@ -108,12 +111,10 @@ defmodule MixWorkspaceOpsBootstrap do
     end
   end
 
-  defp sources_key(project_root), do: {__MODULE__, :sources, Path.expand(project_root)}
-
   defp record_source(project_root, tuple) do
-    key = sources_key(project_root)
     entry = source_entry(tuple)
-    :persistent_term.put(key, Map.put(:persistent_term.get(key, %{}), entry.app, entry))
+    key = {:source, Path.expand(project_root), entry.app}
+    :ets.insert(state_table(), {key, entry})
     :ok
   end
 
@@ -174,7 +175,7 @@ defmodule MixWorkspaceOpsBootstrap do
   defp overlay_source(nil, _app), do: nil
   defp overlay_source(overlay, app), do: Map.get(overlay.sources, app)
 
-  def active?(_project_root \\ nil), do: not is_nil(overlay_path())
+  def active?(_project_root \\ nil), do: not is_nil(overlay())
 
   def project_options(_project_root \\ nil) do
     case System.get_env(@lockfile_env) do
@@ -271,11 +272,10 @@ defmodule MixWorkspaceOpsBootstrap do
   defp subdir_option(subdir), do: [subdir: subdir]
 
   defp notify_local_paths(project_root, overlay) do
-    key = {__MODULE__, :local_path_notice, project_root}
+    key = {:local_path_notice, Path.expand(project_root)}
 
     if not is_nil(overlay) and not quiet_task?(System.argv()) and
-         :persistent_term.get(key, nil) == nil do
-      :persistent_term.put(key, true)
+         :ets.insert_new(state_table(), {key, true}) do
       emit_local_path_notice(overlay)
     end
 
@@ -307,7 +307,7 @@ defmodule MixWorkspaceOpsBootstrap do
   defp overlay do
     case overlay_path() do
       nil -> nil
-      path -> path |> parse_overlay!() |> refuse_development_overlay_while_publishing!()
+      path -> path |> cached_overlay!() |> refuse_development_overlay_while_publishing!()
     end
   end
 
@@ -315,15 +315,17 @@ defmodule MixWorkspaceOpsBootstrap do
     case System.get_env(@overlay_env) do
       nil -> nil
       "" -> nil
-      path -> validate_overlay_path!(path)
+      path -> absolute_overlay_path!(path)
     end
   end
 
-  defp validate_overlay_path!(path) do
-    unless Path.type(path) == :absolute do
-      raise "#{@overlay_env} must contain an absolute path"
-    end
+  defp absolute_overlay_path!(path) do
+    if Path.type(path) == :absolute,
+      do: path,
+      else: raise("#{@overlay_env} must contain an absolute path")
+  end
 
+  defp validate_overlay_path!(path) do
     unless File.regular?(path) do
       raise "#{@overlay_env} points to a missing overlay: #{path}"
     end
@@ -333,6 +335,46 @@ defmodule MixWorkspaceOpsBootstrap do
     end
 
     verify_content_address!(path)
+  end
+
+  defp cached_overlay!(path) do
+    table = state_table()
+    key = {:overlay, path}
+
+    case :ets.lookup(table, key) do
+      [{^key, overlay}] ->
+        overlay
+
+      [] ->
+        overlay = path |> validate_overlay_path!() |> parse_overlay!()
+
+        if :ets.insert_new(table, {key, overlay}) do
+          overlay
+        else
+          [{^key, winner}] = :ets.lookup(table, key)
+          winner
+        end
+    end
+  end
+
+  defp state_table do
+    case :ets.whereis(@state_table) do
+      :undefined ->
+        try do
+          :ets.new(@state_table, [
+            :named_table,
+            :public,
+            :set,
+            read_concurrency: true,
+            write_concurrency: true
+          ])
+        rescue
+          ArgumentError -> @state_table
+        end
+
+      table ->
+        table
+    end
   end
 
   # An overlay decided for ordinary development says where a developer's

@@ -264,6 +264,41 @@ defmodule MixWorkspaceOps.BootstrapTest do
   end
 
   describe "the overlay it will not read" do
+    test "memoizes one verified parse for the invocation and not across VMs", context do
+      root = temporary_directory!(context)
+      path = write_overlay!(root, ["example_core\thex\t~> 2.0\t-"])
+      System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
+
+      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+               {:example_core, "~> 2.0"}
+
+      File.rm!(path)
+
+      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+               {:example_core, "~> 2.0"}
+
+      assert {:ok, bootstrap} = Bootstrap.materialize(Path.join(root, "operator-state"))
+
+      expression = """
+      Code.require_file(#{inspect(bootstrap)})
+      MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", #{inspect(root)})
+      """
+
+      assert {output, exit_code} =
+               System.cmd(System.find_executable("elixir"), ["-e", expression],
+                 env: [{"MIX_WORKSPACE_OPS_OVERLAY", path}],
+                 stderr_to_stdout: true
+               )
+
+      refute exit_code == 0
+      assert output =~ "points to a missing overlay"
+    end
+
+    test "uses no persistent-term write in the dependency path" do
+      refute Bootstrap.contents() =~ ":persistent_term.put"
+      assert Bootstrap.contents() =~ ":ets.insert"
+    end
+
     test "rejects relative overlay paths", context do
       root = temporary_directory!(context)
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", "relative.tsv")
