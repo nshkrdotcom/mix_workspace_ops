@@ -92,6 +92,26 @@ defmodule MixWorkspaceOps.LocalOverridesTest do
              LocalOverrides.load(root)
   end
 
+  test "writes, amends, and clears overrides without requiring hand editing", context do
+    root = temporary_directory!(context)
+
+    assert {:ok, path} = LocalOverrides.put(root, "example_core", "github")
+    assert File.regular?(path)
+    assert {:ok, %{"example_core" => first}} = LocalOverrides.load(root)
+    assert first.source == "github"
+
+    assert {:ok, ^path} = LocalOverrides.put(root, "example_core", "hex")
+    assert {:ok, %{"example_core" => amended}} = LocalOverrides.load(root)
+    assert amended.source == "hex"
+
+    assert {:ok, ^path} = LocalOverrides.put(root, "example_edge", "local")
+    assert {:ok, ^path} = LocalOverrides.clear(root, "example_core")
+    assert {:ok, %{"example_edge" => _remaining}} = LocalOverrides.load(root)
+
+    assert {:ok, ^path} = LocalOverrides.clear(root)
+    assert {:ok, %{}} = LocalOverrides.load(root)
+  end
+
   defp write!(root, contents) do
     File.write!(Path.join(root, LocalOverrides.filename()), contents)
   end

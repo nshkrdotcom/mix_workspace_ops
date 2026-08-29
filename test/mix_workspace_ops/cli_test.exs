@@ -69,6 +69,7 @@ defmodule MixWorkspaceOps.CLITest do
              ["run"],
              ["seam"],
              ["sources"],
+             ["use"],
              ["why"]
            ]
 

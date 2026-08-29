@@ -6,6 +6,7 @@ defmodule MixWorkspaceOps.CLI do
     Discovery,
     Doctor,
     Inventory,
+    LocalOverrides,
     Overlay,
     OperatorPaths,
     PublishMode,
@@ -36,6 +37,8 @@ defmodule MixWorkspaceOps.CLI do
     sources --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
       [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false]
     why APP [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
+    use APP SOURCE [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
+    use --clear [APP] [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
     seam --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
     run --project ID [--mode auto|local|git|hex] [--source APP=SOURCE] \
       --mix-state managed|delegated \
@@ -79,6 +82,7 @@ defmodule MixWorkspaceOps.CLI do
       :as_publish
     ],
     ["why"] => [:project, :registry, :checkout_root, :view, :binding],
+    ["use"] => [:clear, :project, :registry, :checkout_root, :view, :binding],
     ["seam"] => [:project, :registry, :checkout_root, :view, :binding],
     ["run"] => [
       :project,
@@ -95,6 +99,7 @@ defmodule MixWorkspaceOps.CLI do
   }
 
   @vocabulary @accepted |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
+  @switch_options [:clear]
 
   # The two tasks that mutate a package registry. `hex.build` is a publish task
   # for resolution and is not refused here: it writes a tarball and nothing else,
@@ -313,6 +318,16 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
+  def dispatch(["use" | args]) do
+    with {:ok, options, positional} <- options(["use"], args),
+         {:ok, registry} <- load_bound_registry(options),
+         {:ok, project} <- project_here(registry, options.project),
+         project_root <- Registry.project_root(registry, project),
+         {:ok, path} <- use_override(project_root, options.clear, positional) do
+      {:ok, %{schema: "mix_workspace_ops.use/v1", project: project, path: path}}
+    end
+  end
+
   def dispatch(["seam" | args]) do
     with {:ok, options, []} <- options(["seam"], args),
          :ok <- require_option(options, :project),
@@ -479,10 +494,22 @@ defmodule MixWorkspaceOps.CLI do
   defp default(:source), do: []
   defp default(:mix_state), do: "managed"
   defp default(:state_root), do: default_state_root()
+  defp default(:clear), do: false
   defp default(_key), do: nil
 
   defp parse_options([], _command, _accepted, options, positional),
     do: {:ok, options, Enum.reverse(positional)}
+
+  defp parse_options(["--" <> option | rest], command, accepted, options, positional)
+       when option in ["clear"] do
+    with {:ok, key} <- option_key(command, accepted, option),
+         true <- key in @switch_options do
+      parse_options(rest, command, accepted, Map.put(options, key, true), positional)
+    else
+      false -> {:usage_error, "option --#{option} requires a value"}
+      {:error, reason} -> {:usage_error, reason}
+    end
+  end
 
   defp parse_options(["--" <> option, value | rest], command, accepted, options, positional) do
     with {:ok, key} <- option_key(command, accepted, option),
@@ -663,6 +690,21 @@ defmodule MixWorkspaceOps.CLI do
       :error -> {:usage_error, "invalid source #{inspect(source)}"}
     end
   end
+
+  defp use_override(project_root, false, [application, source]) do
+    case source_name(source) do
+      {:ok, normalized} -> LocalOverrides.put(project_root, application, normalized)
+      :error -> {:usage_error, "invalid source #{inspect(source)}"}
+    end
+  end
+
+  defp use_override(project_root, true, []), do: LocalOverrides.clear(project_root)
+
+  defp use_override(project_root, true, [application]),
+    do: LocalOverrides.clear(project_root, application)
+
+  defp use_override(_project_root, clear?, positional),
+    do: {:usage_error, "invalid use arguments with clear=#{clear?}: #{inspect(positional)}"}
 
   defp source_name("local"), do: {:ok, "local"}
   defp source_name("git"), do: {:ok, "github"}

@@ -101,6 +101,80 @@ defmodule MixWorkspaceOps.LocalOverrides do
     end
   end
 
+  @doc "Writes or amends one application's source override."
+  @spec put(String.t(), String.t(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def put(consumer_root, app, source) do
+    with true <- identifier?(app) || {:error, {:invalid_override_application, app}},
+         {:ok, normalized, requested} <- writable_source(source),
+         {:ok, overrides} <- load(consumer_root) do
+      existing = Map.get(overrides, app, empty())
+
+      updated =
+        Map.put(overrides, app, %{existing | source: normalized, requested_source: requested})
+
+      write(consumer_root, updated)
+    end
+  end
+
+  @doc "Removes one application's override, or every override when `app` is nil."
+  @spec clear(String.t(), String.t() | nil) :: {:ok, String.t()} | {:error, term()}
+  def clear(consumer_root, app \\ nil) do
+    with {:ok, overrides} <- load(consumer_root) do
+      write(consumer_root, if(is_nil(app), do: %{}, else: Map.delete(overrides, app)))
+    end
+  end
+
+  defp writable_source(source) do
+    case Map.fetch(@source_names, source) do
+      {:ok, normalized} -> {:ok, normalized, source}
+      :error -> {:error, {:unknown_override_source, source}}
+    end
+  end
+
+  defp write(consumer_root, overrides) do
+    path = consumer_root |> Path.expand() |> Path.join(@filename)
+    temporary = path <> ".tmp.#{System.unique_integer([:positive])}"
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- File.write(temporary, render(overrides), [:exclusive]),
+         :ok <- File.rename(temporary, path) do
+      {:ok, path}
+    else
+      {:error, reason} ->
+        File.rm(temporary)
+        {:error, {:write_override_file, path, reason}}
+    end
+  end
+
+  defp render(overrides) do
+    entries =
+      overrides
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map_join(",\n", fn {app, override} ->
+        "    #{inspect(app)} => #{render_override(override)}"
+      end)
+
+    "%{\n  \"deps\" => %{\n#{entries}\n  }\n}\n"
+  end
+
+  defp render_override(override) do
+    fields =
+      []
+      |> maybe_field("source", override.requested_source || override.source)
+      |> maybe_field("path", override.path)
+      |> maybe_field("hex", override.hex)
+      |> Kernel.++(Enum.sort(override.github))
+
+    "%{" <>
+      Enum.map_join(fields, ", ", fn {key, value} -> "#{inspect(key)} => #{inspect(value)}" end) <>
+      "}"
+  end
+
+  defp maybe_field(fields, _key, nil), do: fields
+  defp maybe_field(fields, key, value), do: fields ++ [{key, value}]
+
+  defp identifier?(value), do: is_binary(value) and Regex.match?(~r/^[a-z][a-z0-9_]*$/, value)
+
   defp within_size(path) do
     case File.stat(path) do
       {:ok, %{size: size}} when size <= @maximum_bytes -> :ok
