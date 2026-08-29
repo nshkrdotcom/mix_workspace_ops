@@ -735,6 +735,14 @@ defmodule MixWorkspaceOps.CLITest do
     assert {:ok, %{runs: []}} = CLI.dispatch(["state", "list", "--state-root", state_root])
   end
 
+  test "state commands reject positional arguments" do
+    assert CLI.dispatch(["state", "list", "extra"]) ==
+             {:usage_error, ~s|state list expects no arguments, got ["extra"]|}
+
+    assert CLI.dispatch(["state", "gc", "--older-than", "1h", "extra"]) ==
+             {:usage_error, ~s|state gc expects no arguments, got ["extra"]|}
+  end
+
   test "run requires an explicit flag before a child may mutate its copied lock", context do
     %{root: root, catalog: catalog, state_root: state_root} = workspace!(context)
     project_lock = Path.join(root, "alpha/mix.lock")

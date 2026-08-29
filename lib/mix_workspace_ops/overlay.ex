@@ -662,16 +662,14 @@ defmodule MixWorkspaceOps.Overlay do
     try do
       result = function.(activation.report, activation.env)
 
-      case Runtime.finish(activation.runtime_handle) do
+      case deactivate(activation) do
         {:ok, runtime_report} -> attach_runtime(result, runtime_report)
         {:error, reason} -> {:error, reason}
       end
     catch
       kind, reason ->
-        Runtime.finish(activation.runtime_handle)
+        deactivate(activation)
         :erlang.raise(kind, reason, __STACKTRACE__)
-    after
-      Runtime.release(activation.runtime_handle)
     end
   end
 

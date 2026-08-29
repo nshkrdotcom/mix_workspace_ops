@@ -387,6 +387,12 @@ defmodule MixWorkspaceOps.CLI do
   def dispatch(["state", "list" | args]) do
     with {:ok, options, []} <- options(["state", "list"], args) do
       Runtime.list(options.state_root)
+    else
+      {:ok, _options, positional} ->
+        {:usage_error, "state list expects no arguments, got #{inspect(positional)}"}
+
+      error ->
+        error
     end
   end
 
@@ -395,6 +401,12 @@ defmodule MixWorkspaceOps.CLI do
          :ok <- require_option(options, :older_than),
          {:ok, older_than} <- Runtime.parse_age(options.older_than) do
       Runtime.gc(options.state_root, older_than, dry_run: options.dry_run)
+    else
+      {:ok, _options, positional} ->
+        {:usage_error, "state gc expects no arguments, got #{inspect(positional)}"}
+
+      error ->
+        error
     end
   end
 

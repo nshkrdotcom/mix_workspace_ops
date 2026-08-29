@@ -99,7 +99,8 @@ defmodule MixWorkspaceOps.RuntimeTest do
 
   test "ordinary runtime state hides inherited publication capability", context do
     state_root = temporary_directory!(context)
-    previous = Map.new(~w(HEX_API_KEY GITHUB_TOKEN SSH_AUTH_SOCK), &{&1, System.get_env(&1)})
+    sensitive = ~w(HEX_API_KEY GITHUB_TOKEN SSH_AUTH_SOCK GIT_SSH_COMMAND GIT_CONFIG_COUNT)
+    previous = Map.new(sensitive, &{&1, System.get_env(&1)})
 
     on_exit(fn ->
       Enum.each(previous, fn
@@ -111,6 +112,8 @@ defmodule MixWorkspaceOps.RuntimeTest do
     System.put_env("HEX_API_KEY", "publish-secret")
     System.put_env("GITHUB_TOKEN", "tag-secret")
     System.put_env("SSH_AUTH_SOCK", "/operator/agent.sock")
+    System.put_env("GIT_SSH_COMMAND", "ssh -i /operator/publish-key")
+    System.put_env("GIT_CONFIG_COUNT", "1")
 
     assert {:ok, runtime} =
              Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts())
@@ -121,6 +124,10 @@ defmodule MixWorkspaceOps.RuntimeTest do
     assert env["HEX_API_KEY"] == nil
     assert env["GITHUB_TOKEN"] == nil
     assert env["SSH_AUTH_SOCK"] == nil
+    assert env["GIT_SSH_COMMAND"] == nil
+    assert env["GIT_CONFIG_COUNT"] == nil
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GCM_INTERACTIVE"] == "never"
     refute env["HOME"] == System.user_home!()
     refute env["HEX_HOME"] == System.get_env("HEX_HOME")
     assert File.ls!(env["HEX_HOME"]) == []

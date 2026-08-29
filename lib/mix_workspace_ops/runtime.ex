@@ -17,13 +17,22 @@ defmodule MixWorkspaceOps.Runtime do
   @attempts 10
   @publication_credentials ~w(
     GH_TOKEN
+    GH_ENTERPRISE_TOKEN
     GITHUB_TOKEN
+    GITHUB_ENTERPRISE_TOKEN
     GIT_ASKPASS
+    GIT_CONFIG_GLOBAL
+    GIT_CONFIG_SYSTEM
+    GIT_CREDENTIAL_HELPER
+    GIT_SSH
+    GIT_SSH_COMMAND
     HEX_API_KEY
     HEX_API_KEY_READ
     HEX_API_KEY_WRITE
     NETRC
     SSH_ASKPASS
+    SSH_ASKPASS_REQUIRE
+    SSH_AGENT_PID
     SSH_AUTH_SOCK
   )
 
@@ -312,15 +321,31 @@ defmodule MixWorkspaceOps.Runtime do
         {:error, {:state_root_marker_mismatch, path}}
 
       {:error, :enoent} ->
-        case write_private(path, @state_marker) do
-          :ok -> :ok
-          {:error, :eexist} -> write_marker(path)
-          error -> error
-        end
+        install_marker(path)
 
       {:error, reason} ->
         {:error, {:state_root_marker, reason}}
     end
+  end
+
+  # An exclusive write exposes the empty file between open and write, which a
+  # concurrent activation can misread as a corrupt marker. Link a fully written
+  # private temporary into place instead: the directory entry appears atomically
+  # and `File.ln/2` refuses to replace an existing marker.
+  defp install_marker(path) do
+    temporary = path <> ".tmp.#{:crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)}"
+
+    result =
+      with :ok <- write_private(temporary, @state_marker) do
+        case File.ln(temporary, path) do
+          :ok -> :ok
+          {:error, :eexist} -> write_marker(path)
+          {:error, reason} -> {:error, {:state_root_marker, reason}}
+        end
+      end
+
+    File.rm(temporary)
+    result
   end
 
   defp create_run_root(state_root, execution_identity) do
@@ -477,8 +502,9 @@ defmodule MixWorkspaceOps.Runtime do
       end
 
     removed = Enum.map(publication_credential_keys(), &{&1, nil})
+    non_interactive = [{"GCM_INTERACTIVE", "never"}, {"GIT_TERMINAL_PROMPT", "0"}]
 
-    (base ++ managed ++ removed)
+    (base ++ managed ++ removed ++ non_interactive)
     |> Map.new()
     |> Enum.sort_by(&elem(&1, 0))
   end
@@ -493,8 +519,9 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   defp publication_credential?(name) do
-    String.starts_with?(name, "HEX_") and
-      String.contains?(name, ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH"])
+    (String.starts_with?(name, "HEX_") and
+       String.contains?(name, ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH"])) or
+      Regex.match?(~r/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/, name)
   end
 
   defp initial_metadata(handle, inputs, paths) do
