@@ -68,7 +68,8 @@ defmodule MixWorkspaceOps.CLITest do
              ["release", "publish"],
              ["run"],
              ["seam"],
-             ["sources"]
+             ["sources"],
+             ["why"]
            ]
 
     assert {["registry", "chain"], "package"} in documented

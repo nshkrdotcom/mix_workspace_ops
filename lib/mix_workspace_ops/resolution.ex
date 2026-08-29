@@ -491,6 +491,75 @@ defmodule MixWorkspaceOps.Resolution do
     Enum.join(["dependency sources:" | lines], "\n")
   end
 
+  @doc "Explains one managed application in the context of a target project."
+  @spec why(Registry.t(), String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def why(registry, target, application, opts \\ []) do
+    application = to_string(application)
+
+    with {:ok, report} <- resolve(registry, target, opts),
+         {:ok, decision} <- fetch_decision(report, application) do
+      target_project = Registry.project!(registry, target)
+      candidates = Registry.providers(registry, application)
+      rule = identity_rule(registry, target_project, application, candidates)
+
+      {:ok,
+       %{
+         schema: "mix_workspace_ops.why/v1",
+         target: to_string(target),
+         application: application,
+         source: decision.source,
+         location: decision.location,
+         provider: decision.provider_project_id,
+         identity_rule: rule,
+         considered: decision.considered,
+         change: change_gesture(application, decision, rule),
+         report: format_why(application, decision, rule, candidates)
+       }}
+    end
+  end
+
+  defp fetch_decision(report, application) do
+    case Enum.find(report.decisions, &(&1.application == application)) do
+      nil -> {:error, {:unmanaged_application, application, report.target}}
+      decision -> {:ok, decision}
+    end
+  end
+
+  defp identity_rule(registry, target, application, candidates) do
+    declaration = Map.get(Registry.dependency_sources(registry, target), application)
+
+    cond do
+      declaration && declaration.provider -> :declared_provider
+      Enum.any?(candidates, &(&1.repository == target.repository)) -> :consumer_repository
+      Enum.any?(candidates, & &1.current) -> :current_provider
+      length(candidates) == 1 -> :only_provider
+      true -> :uncatalogued
+    end
+  end
+
+  defp change_gesture(application, decision, rule) do
+    identity =
+      if rule in [:current_provider, :only_provider],
+        do: "set `#{application}: %{provider: \"PROJECT_ID\"}` in the durable declaration",
+        else: "change the declaration's provider"
+
+    source = "run `mwo use #{application} local|git|hex` for a machine-local source override"
+    "To change identity, #{identity}; to change only #{decision.source}, #{source}."
+  end
+
+  defp format_why(application, decision, rule, candidates) do
+    considered = Enum.map_join(decision.considered, ", ", &rejection/1)
+
+    "#{application} -> #{decision.source} at #{format_location(decision.location)}\n" <>
+      "identity: #{rule} selected #{decision.provider_project_id || "no catalogued provider"}\n" <>
+      "candidates: #{format_candidates(Enum.map(candidates, &%{project: &1.id, repository: &1.repository}))}\n" <>
+      "sources considered: #{considered}\n" <>
+      change_gesture(application, decision, rule)
+  end
+
+  defp format_location(location) when is_binary(location), do: location
+  defp format_location(location), do: inspect(location)
+
   defp source_entry(%{source: @local} = decision) do
     entry(decision, decision.location, declared_version(decision.location))
   end

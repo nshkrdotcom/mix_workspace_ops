@@ -35,6 +35,7 @@ defmodule MixWorkspaceOps.CLI do
       [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false]
     sources --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
       [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false]
+    why APP [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
     seam --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
     run --project ID [--mode auto|local|git|hex] [--source APP=SOURCE] \
       --mix-state managed|delegated \
@@ -77,6 +78,7 @@ defmodule MixWorkspaceOps.CLI do
       :source,
       :as_publish
     ],
+    ["why"] => [:project, :registry, :checkout_root, :view, :binding],
     ["seam"] => [:project, :registry, :checkout_root, :view, :binding],
     ["run"] => [
       :project,
@@ -294,6 +296,23 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
+  def dispatch(["why" | args]) do
+    with {:ok, options, [application]} <- options(["why"], args),
+         {:ok, registry} <- load_bound_registry(options),
+         {:ok, project} <- project_here(registry, options.project),
+         :ok <- ensure_project_in_view(registry, %{options | project: project}),
+         {:ok, explanation} <-
+           Resolution.why(registry, project, application, probe_memo: ProbeMemo.new()) do
+      {:ok, explanation}
+    else
+      {:ok, _options, positional} ->
+        {:usage_error, "why expects exactly one application, got #{inspect(positional)}"}
+
+      error ->
+        error
+    end
+  end
+
   def dispatch(["seam" | args]) do
     with {:ok, options, []} <- options(["seam"], args),
          :ok <- require_option(options, :project),
@@ -414,6 +433,29 @@ defmodule MixWorkspaceOps.CLI do
     if Registry.selected?(registry, options.project),
       do: :ok,
       else: {:error, {:project_outside_view, options.project, options.view}}
+  end
+
+  defp project_here(_registry, project) when is_binary(project), do: {:ok, project}
+
+  defp project_here(registry, nil) do
+    cwd = File.cwd!()
+
+    registry
+    |> Registry.selected_projects()
+    |> Enum.flat_map(fn project ->
+      case Registry.checkout(registry, project.repository) do
+        {:bound, root} -> [{project, root |> Path.join(project.path) |> Path.expand()}]
+        _absent -> []
+      end
+    end)
+    |> Enum.filter(fn {_project, root} ->
+      cwd == root or String.starts_with?(cwd, root <> "/")
+    end)
+    |> Enum.max_by(fn {_project, root} -> byte_size(root) end, fn -> nil end)
+    |> case do
+      {project, _root} -> {:ok, project.id}
+      nil -> {:usage_error, "cannot infer the current project; pass --project ID"}
+    end
   end
 
   defp options(command, args) do

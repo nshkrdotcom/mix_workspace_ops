@@ -972,6 +972,27 @@ defmodule MixWorkspaceOps.ResolutionTest do
     end
   end
 
+  describe "why/4" do
+    test "names the identity rule, rejected sources, and both change gestures", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+      declaration = %{"github" => %{}, "hex" => "~> 1.0"}
+      registry = registry(root, declaration)
+      reader = fn project -> {:ok, if(project.id == "consumer", do: ["core"], else: [])} end
+
+      assert {:ok, explanation} =
+               Resolution.why(registry, "consumer", "core", dependency_reader: reader)
+
+      assert explanation.identity_rule == :only_provider
+      assert explanation.provider == "core"
+      assert explanation.source == "local"
+      assert explanation.report =~ "identity: only_provider selected core"
+      assert explanation.report =~ "mwo use core local|git|hex"
+      assert explanation.report =~ ~s(core: %{provider: "PROJECT_ID"})
+    end
+  end
+
   defp reader(%{id: "consumer"}), do: {:ok, ["core", "third_party"]}
   defp reader(_project), do: {:ok, []}
 
