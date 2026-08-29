@@ -1166,14 +1166,16 @@ defmodule MixWorkspaceOps.Resolution do
     registry
     |> Registry.dependency_sources(project)
     |> Enum.reduce(acc, fn {app, declaration}, inner ->
-      Map.update(inner, app, {declaration, [project.id], project.repository}, fn
-        {chosen, ids, consumer_repository} ->
-          if replace? do
-            {declaration, Enum.sort(Enum.uniq([project.id | ids])), project.repository}
-          else
-            {chosen, Enum.sort(Enum.uniq([project.id | ids])), consumer_repository}
-          end
-      end)
+      initial = {declaration, [project.id], project.repository}
+      Map.update(inner, app, initial, &merge_declaration(&1, declaration, project, replace?))
     end)
   end
+
+  defp merge_declaration({_chosen, ids, _repository}, declaration, project, true),
+    do: {declaration, declared_by(ids, project.id), project.repository}
+
+  defp merge_declaration({chosen, ids, repository}, _declaration, project, false),
+    do: {chosen, declared_by(ids, project.id), repository}
+
+  defp declared_by(ids, project_id), do: Enum.sort(Enum.uniq([project_id | ids]))
 end

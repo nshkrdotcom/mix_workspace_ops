@@ -18,14 +18,20 @@ defmodule MixWorkspaceOps.OperatorPaths do
   @spec resolve(map(), [atom()]) :: {:ok, map()} | {:error, term()}
   def resolve(options, fields) do
     with {:ok, config} <- config() do
-      fields
-      |> Enum.filter(&Map.has_key?(@fields, &1))
-      |> Enum.reduce_while({:ok, options}, fn field, {:ok, acc} ->
-        case value(field, acc, config) do
-          {:ok, path} -> {:cont, {:ok, Map.put(acc, field, path)}}
-          :missing -> {:cont, {:ok, acc}}
-        end
-      end)
+      resolve_fields(fields, options, config)
+    end
+  end
+
+  defp resolve_fields(fields, options, config) do
+    fields
+    |> Enum.filter(&Map.has_key?(@fields, &1))
+    |> Enum.reduce_while({:ok, options}, &resolve_field(&1, &2, config))
+  end
+
+  defp resolve_field(field, {:ok, options}, config) do
+    case value(field, options, config) do
+      {:ok, path} -> {:cont, {:ok, Map.put(options, field, path)}}
+      :missing -> {:cont, {:ok, options}}
     end
   end
 
