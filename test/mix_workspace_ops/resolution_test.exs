@@ -921,6 +921,47 @@ defmodule MixWorkspaceOps.ResolutionTest do
     end
   end
 
+  describe "the generated seam" do
+    test "contains exactly the target's direct managed dependencies", context do
+      root = temporary_directory!(context)
+      for id <- ~w(alpha beta gamma), do: initialize_repository!(Path.join(root, id))
+
+      source = fn requirement ->
+        %{"hex" => requirement, "order" => ["hex"], "publish_order" => ["hex"]}
+      end
+
+      registry =
+        root
+        |> write_catalog!([
+          catalog_repository("alpha",
+            dependency_sources: %{"beta" => source.("~> 1.0")},
+            projects: [catalog_project("alpha")]
+          ),
+          catalog_repository("beta",
+            dependency_sources: %{"gamma" => source.("~> 2.0")},
+            projects: [catalog_project("beta")]
+          ),
+          catalog_repository("gamma", projects: [catalog_project("gamma")])
+        ])
+        |> Registry.load!()
+        |> bind!(root)
+
+      reader = fn
+        %{id: "alpha"} -> {:ok, ["beta"]}
+        %{id: "beta"} -> {:ok, ["gamma"]}
+        _project -> {:ok, []}
+      end
+
+      assert {:ok, report} =
+               Resolution.resolve(registry, "alpha", publish?: true, dependency_reader: reader)
+
+      assert Enum.map(report.decisions, & &1.application) == ["beta", "gamma"]
+      assert {:ok, [line]} = Resolution.seam_lines(report)
+      assert line =~ "workspace_dep(:beta,"
+      refute line =~ ":gamma"
+    end
+  end
+
   describe "explaining a refusal" do
     # The message the file this replaces printed for a refused override was a
     # sentence; the tuple that replaced it names the same fact and says nothing

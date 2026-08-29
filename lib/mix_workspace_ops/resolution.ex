@@ -126,6 +126,7 @@ defmodule MixWorkspaceOps.Resolution do
   @type report :: %{
           target: String.t(),
           consumer_root: String.t(),
+          direct_dependencies: [String.t()],
           closure: Graph.resolution(),
           decisions: [decision()],
           overrides: %{String.t() => LocalOverrides.override()},
@@ -170,6 +171,7 @@ defmodule MixWorkspaceOps.Resolution do
     target = to_string(target)
 
     with {:ok, closure} <- closure(registry, target, opts),
+         {:ok, direct_dependencies} <- direct_dependencies(registry, target, opts),
          {:ok, consumer_root} <- consumer_root(registry, target, opts),
          {:ok, overrides} <- overrides(consumer_root, opts),
          opts =
@@ -181,6 +183,7 @@ defmodule MixWorkspaceOps.Resolution do
        %{
          target: target,
          consumer_root: consumer_root,
+         direct_dependencies: direct_dependencies,
          closure: closure,
          decisions: decisions,
          overrides: overrides,
@@ -308,7 +311,13 @@ defmodule MixWorkspaceOps.Resolution do
   """
   @spec seam_lines(report()) :: {:ok, [String.t()]} | {:error, term()}
   def seam_lines(report) do
-    Enum.reduce_while(report.decisions, {:ok, []}, fn decision, {:ok, acc} ->
+    direct = MapSet.new(report.direct_dependencies)
+
+    report.decisions
+    |> Enum.filter(fn decision ->
+      MapSet.member?(direct, decision.application) and report.target in decision.declared_by
+    end)
+    |> Enum.reduce_while({:ok, []}, fn decision, {:ok, acc} ->
       case committed_default(decision) do
         {:ok, default} -> {:cont, {:ok, [seam_line(decision, default) | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
@@ -1037,6 +1046,12 @@ defmodule MixWorkspaceOps.Resolution do
       nil -> Graph.resolve(registry, target, opts)
       closure -> {:ok, closure}
     end
+  end
+
+  defp direct_dependencies(registry, target, opts) do
+    project = Registry.project!(registry, target)
+    reader = Keyword.get(opts, :dependency_reader, &Project.dependencies(registry, &1, opts))
+    reader.(project)
   end
 
   defp consumer_root(registry, target, opts) do
