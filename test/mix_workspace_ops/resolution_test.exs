@@ -956,6 +956,18 @@ defmodule MixWorkspaceOps.ResolutionTest do
       assert Resolution.explain({:ambiguous_application, "shared", ["fork", "upstream"], "alpha"}) =~
                "fork and upstream both provide shared"
 
+      assert Resolution.explain({
+               :ambiguous_application,
+               "shared",
+               [
+                 %{project: "fork", repository: "fork_repo"},
+                 %{project: "upstream", repository: "upstream_repo"}
+               ]
+             }) ==
+               "fork (repository fork_repo) and upstream (repository upstream_repo) both provide shared. " <>
+                 "Set `shared: %{provider: \"PROJECT_ID\"}` in the consumer's dependency-source " <>
+                 "declaration, choosing one of those project ids."
+
       assert Resolution.explain({:command_failed, :anything}) == nil
     end
   end

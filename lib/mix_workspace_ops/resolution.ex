@@ -404,7 +404,8 @@ defmodule MixWorkspaceOps.Resolution do
 
   def explain({:ambiguous_application, app, candidates}) do
     "#{format_candidates(candidates)} #{provider_verb(candidates)} #{app}. " <>
-      "Name one of them as the \"provider\" of #{app} in the dependency-source declaration."
+      "Set `#{app}: %{provider: \"PROJECT_ID\"}` in the consumer's dependency-source " <>
+      "declaration, choosing one of those project ids."
   end
 
   def explain({:ambiguous_application, app, candidates, consumer}) do
