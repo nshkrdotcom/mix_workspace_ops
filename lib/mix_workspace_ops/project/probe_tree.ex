@@ -158,10 +158,9 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
   defp copy_entry(source, destination, relative, source_root, destination_root, digest_parts) do
     case File.lstat(source) do
       {:ok, %{type: :directory}} ->
-        with :ok <- File.mkdir(destination),
-             {:ok, parts} <-
-               copy_directory(source, destination, source_root, destination_root, digest_parts),
-             do: {:ok, parts}
+        with :ok <- File.mkdir(destination) do
+          copy_directory(source, destination, source_root, destination_root, digest_parts)
+        end
 
       {:ok, %{type: :regular, mode: mode}} ->
         with {:ok, bytes} <- File.read(source),
