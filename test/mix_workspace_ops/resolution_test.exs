@@ -36,13 +36,40 @@ defmodule MixWorkspaceOps.ResolutionTest do
                subdir: nil
              }
 
-      assert decision.provider_project_id == nil
+      assert decision.provider_project_id == "core"
 
       assert {:ok, decision} =
                decide(registry, root, "core", Map.delete(declaration, "github"))
 
       assert decision.source == "hex"
       assert decision.location == "~> 1.0"
+    end
+
+    test "an empty GitHub declaration opts into derived coordinates", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+      registry = registry(root, %{"github" => %{}})
+      File.rm_rf!(Path.join(root, "core"))
+
+      assert {:ok, derived} = decide(registry, root, "core", %{"github" => %{}})
+      assert derived.source == "github"
+      assert derived.location.repo == "example-org/core"
+      assert derived.location.branch == "main"
+
+      assert {:ok, declared} =
+               decide(registry, root, "core", %{
+                 "github" => %{"repo" => "other-org/fork", "ref" => "abc123"}
+               })
+
+      assert declared.location.repo == "other-org/fork"
+      assert declared.location.ref == "abc123"
+
+      assert {:ok, without_github} =
+               decide(registry, root, "core", %{"hex" => "~> 1.0"})
+
+      assert without_github.source == "hex"
+      assert %{source: "github", outcome: :no_github_coordinates} in without_github.considered
     end
 
     test "a derived path inside a Mix deps directory is not a sibling checkout", context do

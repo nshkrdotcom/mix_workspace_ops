@@ -17,8 +17,7 @@ defmodule MixWorkspaceOps.Registry.Source do
   @sources ~w(local github hex)
   @default_order ~w(local github hex)
   @default_publish_order ~w(hex)
-  @github_required ~w(repo)
-  @github_optional ~w(branch ref tag subdir)
+  @github_optional ~w(repo branch ref tag subdir)
   @github_revisions ~w(branch ref tag)
   @boolean_options ~w(override runtime optional)
   @list_options ~w(only targets)
@@ -36,7 +35,7 @@ defmodule MixWorkspaceOps.Registry.Source do
   @maximum_option_value_bytes 32
 
   @type github :: %{
-          repo: String.t(),
+          repo: String.t() | nil,
           branch: String.t() | nil,
           ref: String.t() | nil,
           tag: String.t() | nil,
@@ -155,6 +154,7 @@ defmodule MixWorkspaceOps.Registry.Source do
   end
 
   defp parse_github(nil, _where), do: {:ok, nil}
+  defp parse_github(true, _where), do: {:ok, empty_github()}
 
   defp parse_github(raw, where) when is_map(raw) do
     with :ok <- github_keys(raw, where),
@@ -163,7 +163,7 @@ defmodule MixWorkspaceOps.Registry.Source do
          :ok <- github_single_revision(raw, where) do
       {:ok,
        %{
-         repo: Map.fetch!(raw, "repo"),
+         repo: optional(raw, "repo"),
          branch: optional(raw, "branch"),
          ref: optional(raw, "ref"),
          tag: optional(raw, "tag"),
@@ -178,13 +178,8 @@ defmodule MixWorkspaceOps.Registry.Source do
     keys = Map.keys(raw)
 
     cond do
-      Enum.any?(@github_required, &(&1 not in keys)) ->
-        {:error, {:github_source_requires_repo, where}}
-
-      keys -- (@github_required ++ @github_optional) != [] ->
-        {:error,
-         {:unknown_github_source_keys, where,
-          Enum.sort(keys -- (@github_required ++ @github_optional))}}
+      keys -- @github_optional != [] ->
+        {:error, {:unknown_github_source_keys, where, Enum.sort(keys -- @github_optional)}}
 
       true ->
         :ok
@@ -197,6 +192,7 @@ defmodule MixWorkspaceOps.Registry.Source do
       else: {:error, {:invalid_github_identity, where, repo}}
   end
 
+  defp github_repo(nil, _where), do: :ok
   defp github_repo(repo, where), do: {:error, {:invalid_github_identity, where, repo}}
 
   defp github_strings(raw, where) do
@@ -329,4 +325,7 @@ defmodule MixWorkspaceOps.Registry.Source do
       value -> value
     end
   end
+
+  defp empty_github,
+    do: %{repo: nil, branch: nil, ref: nil, tag: nil, subdir: nil}
 end

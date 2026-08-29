@@ -731,7 +731,16 @@ defmodule MixWorkspaceOps.Resolution do
   defp build(registry, app, declaration, @github, reason, considered, opts) do
     case github(registry, app, declaration, reason, override(opts, app)) do
       %{repo: repo} = coordinates when is_binary(repo) ->
-        {:ok, decision(app, @github, reason, considered, nil, coordinates, declaration)}
+        {:ok,
+         decision(
+           app,
+           @github,
+           reason,
+           considered,
+           provider_id(registry, app, declaration),
+           coordinates,
+           declaration
+         )}
 
       _incomplete ->
         {:error, {:unavailable_source, app, @github, reason}}
@@ -764,31 +773,58 @@ defmodule MixWorkspaceOps.Resolution do
   defp github(registry, app, declaration, reason, override) do
     base =
       cond do
-        not is_nil(declaration.github) -> declaration.github
-        reason in @explicit_gestures -> catalogued_coordinates(registry, app, declaration)
-        true -> nil
+        not is_nil(declaration.github) ->
+          declared_coordinates(registry, app, declaration, reason)
+
+        reason in @explicit_gestures ->
+          catalogued_coordinates(registry, app, declaration)
+
+        true ->
+          nil
       end
 
-    merge_github(base || %{repo: nil, branch: nil, ref: nil, tag: nil, subdir: nil}, override)
+    base
+    |> merge_github(declaration.github || %{})
+    |> merge_github(override)
+  end
+
+  defp declared_coordinates(registry, app, declaration, reason) do
+    coordinates = catalogued_coordinates(registry, app, declaration, false)
+
+    if reason in @explicit_gestures,
+      do: maybe_pin(coordinates, registry, app, declaration),
+      else: coordinates
   end
 
   defp catalogued_coordinates(registry, app, declaration) do
+    catalogued_coordinates(registry, app, declaration, true)
+  end
+
+  defp catalogued_coordinates(registry, app, declaration, pin?) do
     with {:ok, project} <- provider(registry, app, declaration),
          repository = Registry.repository!(registry, project.repository),
          true <- is_binary(repository.github) do
-      pin(
-        %{
-          repo: repository.github,
-          branch: nil,
-          ref: nil,
-          tag: nil,
-          subdir: subdirectory(project.path)
-        },
-        registry,
-        repository
-      )
+      coordinates = %{
+        repo: repository.github,
+        branch: repository.default_branch,
+        ref: nil,
+        tag: nil,
+        subdir: subdirectory(project.path)
+      }
+
+      if pin?, do: pin(coordinates, registry, repository), else: coordinates
     else
       _uncatalogued -> nil
+    end
+  end
+
+  defp maybe_pin(nil, _registry, _app, _declaration), do: nil
+
+  defp maybe_pin(coordinates, registry, app, declaration) do
+    with {:ok, project} <- provider(registry, app, declaration) do
+      pin(coordinates, registry, Registry.repository!(registry, project.repository))
+    else
+      _unavailable -> coordinates
     end
   end
 
@@ -799,7 +835,7 @@ defmodule MixWorkspaceOps.Resolution do
   defp pin(coordinates, registry, repository) do
     with {:bound, root} <- Registry.checkout(registry, repository.id),
          {:ok, revision} <- Git.head(root) do
-      %{coordinates | ref: revision}
+      %{coordinates | ref: revision, branch: nil, tag: nil}
     else
       _unpinnable -> %{coordinates | branch: repository.default_branch}
     end
@@ -808,14 +844,25 @@ defmodule MixWorkspaceOps.Resolution do
   defp subdirectory("."), do: nil
   defp subdirectory(path), do: path
 
+  defp merge_github(nil, override),
+    do: merge_github(%{repo: nil, branch: nil, ref: nil, tag: nil, subdir: nil}, override)
+
+  defp merge_github(base, %{github: override}), do: merge_github(base, override)
+
   defp merge_github(base, override) do
-    Enum.reduce(override.github, base, fn {key, value}, acc ->
-      case key do
-        "repo" -> %{acc | repo: value}
-        "branch" -> %{acc | branch: value, ref: nil, tag: nil}
-        "ref" -> %{acc | ref: value, branch: nil, tag: nil}
-        "tag" -> %{acc | tag: value, branch: nil, ref: nil}
-        "subdir" -> %{acc | subdir: value}
+    Enum.reduce(override, base, fn {key, value}, acc ->
+      case {key, value} do
+        {key, nil} when key in [:repo, :branch, :ref, :tag, :subdir] -> acc
+        {:repo, value} -> %{acc | repo: value}
+        {:branch, value} -> %{acc | branch: value, ref: nil, tag: nil}
+        {:ref, value} -> %{acc | ref: value, branch: nil, tag: nil}
+        {:tag, value} -> %{acc | tag: value, branch: nil, ref: nil}
+        {:subdir, value} -> %{acc | subdir: value}
+        {"repo", value} -> %{acc | repo: value}
+        {"branch", value} -> %{acc | branch: value, ref: nil, tag: nil}
+        {"ref", value} -> %{acc | ref: value, branch: nil, tag: nil}
+        {"tag", value} -> %{acc | tag: value, branch: nil, ref: nil}
+        {"subdir", value} -> %{acc | subdir: value}
       end
     end)
   end
