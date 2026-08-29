@@ -36,3 +36,14 @@
   three sets — what the catalog holds, what the selection permits, what is
   materialized here — in `doctor`, `plan`, `sources`, `registry select` and every
   run.
+- Preserve the exact dependency application while classifying every edge as
+  managed, known-unselected, or external; keep known-unselected dependencies on
+  committed remote sources until a new selection permits local resolution.
+- Seed workspace roots from derived selected workspace membership rather than
+  every project a repository happens to catalog.
+- Carry explicit Mix environment and target through graph, resolution, overlay
+  v3, CLI reports, and graph/context identities instead of consulting ambient
+  shell values.
+- Evaluate `mix.exs` in a disposable full-worktree copy with a replacement
+  environment, temporary Home/Mix/Hex state, staged-source memo identity, the
+  existing subprocess boundary, and the existing hard timeout.

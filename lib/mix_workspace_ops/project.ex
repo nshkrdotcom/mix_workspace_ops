@@ -10,7 +10,7 @@ defmodule MixWorkspaceOps.Project do
   """
 
   alias MixWorkspaceOps.{Command, MixInputs, Registry}
-  alias MixWorkspaceOps.Project.ProbeMemo
+  alias MixWorkspaceOps.Project.{ProbeMemo, ProbeTree}
 
   @marker "__MIX_WORKSPACE_OPS_METADATA__"
   @maximum_mix_bytes 1024 * 1024
@@ -24,12 +24,29 @@ defmodule MixWorkspaceOps.Project do
       _other -> ""
     end
   version = config |> Keyword.get(:version, "") |> to_string()
+  mix_env = Mix.env()
+  mix_target = Mix.target()
+  active_for = fn opts, key, current ->
+    case Keyword.get(opts, key) do
+      nil -> true
+      value when is_atom(value) -> value == current
+      values when is_list(values) -> current in values
+      _other -> false
+    end
+  end
+  active = fn opts ->
+    active_for.(opts, :only, mix_env) and active_for.(opts, :targets, mix_target)
+  end
   dependencies =
     config
     |> Keyword.get(:deps, [])
     |> Enum.flat_map(fn
-      {dep, _value} when is_atom(dep) -> [Atom.to_string(dep)]
-      {dep, _requirement, _opts} when is_atom(dep) -> [Atom.to_string(dep)]
+      {dep, opts} when is_atom(dep) and is_list(opts) ->
+        if active.(opts), do: [Atom.to_string(dep)], else: []
+      {dep, _value} when is_atom(dep) ->
+        [Atom.to_string(dep)]
+      {dep, _requirement, opts} when is_atom(dep) and is_list(opts) ->
+        if active.(opts), do: [Atom.to_string(dep)], else: []
       _other -> []
     end)
     |> Enum.uniq()
@@ -66,12 +83,18 @@ defmodule MixWorkspaceOps.Project do
     project_root = Path.expand(project_root)
 
     with {:ok, inputs} <- MixInputs.normalize(opts),
-         {:ok, key} <- probe_key(project_root, inputs.mix_env, inputs.mix_target, opts) do
-      question = fn -> evaluate_at(project_root, inputs.mix_env, inputs.mix_target) end
+         {:ok, stage} <- ProbeTree.stage(project_root) do
+      try do
+        with {:ok, key} <- probe_key(stage, inputs, opts) do
+          question = fn -> evaluate_at(stage, inputs.mix_env, inputs.mix_target) end
 
-      case Keyword.get(opts, :probe_memo) do
-        nil -> question.()
-        memo -> ProbeMemo.fetch(memo, key, question)
+          case Keyword.get(opts, :probe_memo) do
+            nil -> question.()
+            memo -> ProbeMemo.fetch(memo, key, question)
+          end
+        end
+      after
+        ProbeTree.cleanup(stage)
       end
     end
   end
@@ -93,13 +116,13 @@ defmodule MixWorkspaceOps.Project do
     |> Enum.map(fn {:ok, result} -> result end)
   end
 
-  defp probe_key(project_root, mix_env, mix_target, opts) do
-    path = Path.join(project_root, "mix.exs")
+  defp probe_key(stage, inputs, opts) do
+    path = Path.join(stage.project_root, "mix.exs")
 
     with :ok <- readable(path), {:ok, bytes} <- File.read(path) do
       digest = :crypto.hash(:sha256, bytes)
       toolchain = Keyword.get_lazy(opts, :toolchain, &toolchain/0)
-      {:ok, {digest, mix_env, mix_target, toolchain}}
+      {:ok, {digest, stage.source_digest, inputs.mix_env, inputs.mix_target, toolchain}}
     end
   end
 
@@ -108,9 +131,20 @@ defmodule MixWorkspaceOps.Project do
     {System.version(), List.to_string(:erlang.system_info(:otp_release)), mix_version}
   end
 
-  defp evaluate_at(project_root, mix_env, mix_target) do
+  defp evaluate_at(stage, mix_env, mix_target) do
+    state = Path.join(stage.root, "state")
+    home = Path.join(state, "home")
+    mix_home = Path.join(state, "mix")
+    hex_home = Path.join(state, "hex")
+    temporary = Path.join(state, "tmp")
+
+    for directory <- [state, home, mix_home, hex_home, temporary] do
+      File.mkdir_p!(directory)
+      File.chmod!(directory, 0o700)
+    end
+
     case Command.run(
-           "timeout",
+           timeout_executable(),
            [
              "--kill-after=2",
              "15",
@@ -118,20 +152,34 @@ defmodule MixWorkspaceOps.Project do
              "-e",
              @expression
            ],
-           cd: project_root,
-           env: [
-             {"MIX_ENV", mix_env},
-             {"MIX_TARGET", mix_target},
-             {"MIX_WORKSPACE_OPS_BOOTSTRAP", nil},
-             {"MIX_WORKSPACE_OPS_CONTEXT_DIGEST", nil},
-             {"MIX_WORKSPACE_OPS_LOCKFILE", nil},
-             {"MIX_WORKSPACE_OPS_OVERLAY", nil}
-           ]
+           cd: stage.project_root,
+           replace_env: true,
+           env: probe_environment(mix_env, mix_target, home, mix_home, hex_home, temporary)
          ) do
       {:ok, result} -> parse(result.output)
       {:error, result} -> {:error, {:command_failed, result.exit_code, result.output}}
     end
   end
+
+  defp probe_environment(mix_env, mix_target, home, mix_home, hex_home, temporary) do
+    [
+      {"PATH", System.get_env("PATH") || "/usr/bin:/bin"},
+      {"LANG", System.get_env("LANG") || "C"},
+      {"HOME", home},
+      {"MIX_HOME", mix_home},
+      {"MIX_ARCHIVES", Path.join(mix_home, "archives")},
+      {"HEX_HOME", hex_home},
+      {"REBAR_CACHE_DIR", Path.join(state_parent(hex_home), "rebar")},
+      {"TMPDIR", temporary},
+      {"MIX_ENV", mix_env},
+      {"MIX_TARGET", mix_target},
+      {"MIX_WORKSPACE_OPS_PROBE", "1"}
+    ]
+  end
+
+  defp state_parent(path), do: Path.dirname(path)
+
+  defp timeout_executable, do: System.find_executable("timeout") || "timeout"
 
   # Use the executable of the running toolchain rather than a version-manager
   # shim that re-resolves from the probed project's working directory. A

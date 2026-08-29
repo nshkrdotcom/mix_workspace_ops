@@ -15,7 +15,7 @@ defmodule MixWorkspaceOps.Command do
   @spec run(String.t(), [String.t()], keyword()) :: {:ok, t()} | {:error, t()}
   def run(executable, args, opts \\ []) when is_binary(executable) and is_list(args) do
     cwd = opts |> Keyword.get(:cd, File.cwd!()) |> Path.expand()
-    env = Keyword.get(opts, :env, [])
+    env = environment(Keyword.get(opts, :env, []), Keyword.get(opts, :replace_env, false))
 
     {output, exit_code} = execute(executable, args, cwd, env)
 
@@ -28,6 +28,19 @@ defmodule MixWorkspaceOps.Command do
     }
 
     if exit_code == 0, do: {:ok, result}, else: {:error, result}
+  end
+
+  defp environment(env, false), do: env
+
+  defp environment(env, true) do
+    replacement = Map.new(env)
+
+    System.get_env()
+    |> Map.keys()
+    |> Enum.concat(Map.keys(replacement))
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.map(fn key -> {key, Map.get(replacement, key)} end)
   end
 
   defp execute(executable, args, cwd, env) do

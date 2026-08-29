@@ -28,6 +28,48 @@ A caller-supplied registry contains stable repository and project coordinates
 only. Dependency edges are derived from current Mix metadata; they are never
 copied into the registry.
 
+Every graph question carries `mix_env` and `mix_target` as explicit inputs. The
+CLI spells them `--mix-env` and `--mix-target`, with stable defaults `dev` and
+`host`; graph code never reads ambient `MIX_ENV` or `MIX_TARGET`. Both values
+are recorded in graph reports, overlay v3 documents, semantic context, and
+their digests. Two otherwise identical questions under different inputs are
+therefore different graph and execution contexts even when their dependency
+sets happen to be equal.
+
+### Contained `mix.exs` probing
+
+A `mix.exs` is arbitrary Elixir code, not a data file. MWO evaluates it in a
+separate, time-limited Elixir process whose working directory is a disposable
+copy. For a Git project the copy covers its whole worktree, so a subproject may
+still use `Code.require_file/2`, `Path.expand/2`, and other repository-relative
+source. Dirty and untracked source is included because it is part of the
+operator's current question.
+
+The staged tree excludes directories named `.git`, `_build`, `deps`,
+`.mix_workspace_ops`, `.hex`, `.mix`, `.ssh`, `.aws`, `.config`, or `.codex`;
+the local source override, `.env` variants, `credentials` variants, and `.key`
+or `.pem` files are also excluded. A symlink is copied only when its target
+remains inside that included source surface. The memo key covers the exact
+staged-source digest as well as the exact `mix.exs` digest, Mix environment,
+target, and Elixir/OTP/Mix toolchain, so changing a relative helper cannot reuse
+a stale answer. The copy and all temporary state are deleted after the
+question, including after a memo hit or timeout.
+
+The child receives a replacement environment, not the operator's inherited
+one. It contains only `PATH`, `LANG`, explicit `MIX_ENV`/`MIX_TARGET`, a probe
+marker, and paths into fresh temporary `HOME`, `MIX_HOME`, `MIX_ARCHIVES`,
+`HEX_HOME`, Rebar cache, and temporary-file state. Publication credentials,
+agent credentials, shell state, SSH agent variables, and operator Mix/Hex state
+do not cross the boundary. The existing 15-second timeout and separate process
+remain in force.
+
+This is process, environment, and working-tree isolation. It is **not** a
+kernel sandbox: the probe runs as the operator's user, may use the network, and
+arbitrary code can still read or write host paths that user can access when it
+names them explicitly. The boundary prevents ordinary relative writes and
+ambient credentials/state from touching the operator checkout; it does not
+claim to contain hostile code against the host.
+
 ## The Mix-load seam
 
 The seam is one function call per cross-repository dependency:

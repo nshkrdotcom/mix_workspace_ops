@@ -148,7 +148,8 @@ flags:
 ./mix_workspace_ops plan \
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \
-  --project example.consumer
+  --project example.consumer \
+  --mix-env dev --mix-target host
 ./mix_workspace_ops seam \
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \
@@ -160,8 +161,13 @@ flags:
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \
   --project example.consumer \
+  --mix-env test --mix-target host \
   --mode local --mix-state managed -- mix test
 ```
+
+`--mix-env` and `--mix-target` are graph inputs, not readings of ambient shell
+state. They default deterministically to `dev` and `host`, appear in plans and
+overlays, and contribute to graph and context digests.
 
 Local and Git overlays are stored beneath operator-owned XDG state and passed
 only to the child command through `MIX_WORKSPACE_OPS_OVERLAY`. No source-mode
@@ -196,6 +202,14 @@ identity, rejects worktrees and wrongly named clones, prunes generated and
 fixture trees, and records unloadable or duplicate Mix applications as
 unresolved evidence rather than guessing an identity. A real project is not
 discarded merely because it lives beneath `examples` or `support`.
+
+Dependency discovery evaluates arbitrary `mix.exs` code only in a disposable
+worktree copy, with temporary Home/Mix/Hex state, a replacement environment,
+and a hard timeout. Repository-relative source remains available, while Git
+metadata, dependencies, build output, common credential files, publication
+credentials, and agent credentials are excluded. This protects the checkout
+and ambient process state; it is not a kernel sandbox and does not prevent code
+running as the operator from explicitly accessing host paths or the network.
 
 Release publication is a separate, fail-closed transaction over an already
 committed and pushed revision:

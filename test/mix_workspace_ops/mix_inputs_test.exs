@@ -170,6 +170,49 @@ defmodule MixWorkspaceOps.MixInputsTest do
     assert Enum.map(plan.sources, & &1.application) == ["alpha"]
   end
 
+  test "only and targets are classified under the explicit inputs", context do
+    project = Path.join(context.root, "filtered")
+    initialize_repository!(project)
+
+    File.write!(Path.join(project, "mix.exs"), """
+    defmodule Filtered.MixProject do
+      use Mix.Project
+
+      def project do
+        [
+          app: :filtered,
+          version: "0.1.0",
+          deps: [
+            {:always, "~> 1.0"},
+            {:dev_only, "~> 1.0", only: :dev},
+            {:test_only, "~> 1.0", only: [:test]},
+            {:embedded_only, "~> 1.0", targets: :embedded}
+          ]
+        ]
+      end
+    end
+    """)
+
+    registry_path =
+      write_catalog!(
+        context.root,
+        [
+          catalog_repository("filtered", projects: [catalog_project("filtered")])
+        ], name: "filtered-registry.json")
+
+    registry = registry_path |> Registry.load!() |> bind!(context.root)
+
+    assert {:ok, dev_host} =
+             Graph.resolve(registry, "filtered", mix_env: "dev", mix_target: "host")
+
+    assert dependency_apps(dev_host) == ["always", "dev_only"]
+
+    assert {:ok, test_embedded} =
+             Graph.resolve(registry, "filtered", mix_env: "test", mix_target: "embedded")
+
+    assert dependency_apps(test_embedded) == ["always", "embedded_only", "test_only"]
+  end
+
   defp dependency_apps(graph),
     do: Enum.map(graph.dependency_applications, & &1.application)
 
