@@ -161,7 +161,12 @@ defmodule MixWorkspaceOps.ResolutionTest do
       # Without a provider the catalog cannot say which project this is, and
       # answering from Hex would answer a question nobody asked — and answer it
       # differently from the closure, which refuses the same input.
-      assert {:error, {:ambiguous_application, "shared", ["fork", "upstream"]}} =
+      assert {:error,
+              {:ambiguous_application, "shared",
+               [
+                 %{project: "fork", repository: "fork"},
+                 %{project: "upstream", repository: "upstream"}
+               ]}} =
                decide(registry, root, "shared", %{"hex" => "~> 1.0"})
     end
 

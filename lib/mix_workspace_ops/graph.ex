@@ -142,7 +142,7 @@ defmodule MixWorkspaceOps.Graph do
   defp reduce_dependency(registry, project, dependency_app, reader, current) do
     provider = Registry.declared_provider(registry, project, dependency_app)
 
-    case Registry.resolve_dependency(registry, dependency_app, provider) do
+    case Registry.resolve_dependency(registry, dependency_app, provider, project.repository) do
       {:ok, dependency} ->
         reduce_managed_dependency(registry, project, dependency, reader, current)
 

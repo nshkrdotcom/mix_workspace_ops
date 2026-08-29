@@ -50,6 +50,7 @@ defmodule MixWorkspaceOps.Registry do
           path: String.t(),
           kind: String.t(),
           provides: [String.t()],
+          current: boolean(),
           dependency_sources: %{String.t() => Source.t()},
           repository: String.t()
         }
@@ -240,13 +241,18 @@ defmodule MixWorkspaceOps.Registry do
   """
   @spec resolve_dependency(t(), String.t() | atom(), String.t() | nil) ::
           {:ok, project()} | {:known_unselected, [String.t()]} | {:error, term()} | :unknown
-  def resolve_dependency(%__MODULE__{} = registry, app, provider \\ nil) do
+  def resolve_dependency(
+        %__MODULE__{} = registry,
+        app,
+        provider \\ nil,
+        consumer_repository \\ nil
+      ) do
     app = to_string(app)
     applications = selected_applications(registry)
 
     case Map.get(applications, app, []) do
       [] -> unselected_providers(registry, app)
-      _candidates -> Contract.resolve_provider(applications, app, provider)
+      _candidates -> Contract.resolve_provider(applications, app, provider, consumer_repository)
     end
   end
 

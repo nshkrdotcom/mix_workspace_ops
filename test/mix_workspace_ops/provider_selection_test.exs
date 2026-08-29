@@ -43,7 +43,11 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
 
     assert {:error,
             {:dependency_source, "alpha",
-             {:ambiguous_application, "shared", ["upstream.shared", "vendored.shared"]}}} =
+             {:ambiguous_application, "shared",
+              [
+                %{project: "upstream.shared", repository: "upstream"},
+                %{project: "vendored.shared", repository: "vendored"}
+              ]}}} =
              Registry.load(two_providers(root))
   end
 
@@ -123,7 +127,47 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
     assert {:error, {:ambiguous_application, "shared", candidates, "alpha"}} =
              Graph.resolve(registry, "alpha", dependency_reader: shared_reader())
 
-    assert candidates == ["upstream.shared", "vendored.shared"]
+    assert candidates == [
+             %{project: "upstream.shared", repository: "upstream"},
+             %{project: "vendored.shared", repository: "vendored"}
+           ]
+  end
+
+  test "one current provider settles an otherwise ambiguous application", context do
+    root = temporary_directory!(context)
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("alpha", projects: [catalog_project("alpha")]),
+        catalog_repository("upstream",
+          projects: [catalog_project("upstream.shared", app: "shared", current: true)]
+        ),
+        catalog_repository("successor",
+          projects: [catalog_project("successor.shared", app: "shared")]
+        )
+      ])
+      |> Registry.load!()
+
+    assert {:ok, %{id: "upstream.shared"}} = Registry.resolve_dependency(registry, "shared")
+  end
+
+  test "two current providers are invalid rather than an order-dependent choice", context do
+    root = temporary_directory!(context)
+
+    path =
+      write_catalog!(root, [
+        catalog_repository("upstream",
+          projects: [catalog_project("upstream.shared", app: "shared", current: true)]
+        ),
+        catalog_repository("successor",
+          projects: [catalog_project("successor.shared", app: "shared", current: true)]
+        )
+      ])
+
+    assert {:error,
+            {:multiple_current_providers, "shared", ["successor.shared", "upstream.shared"]}} =
+             Registry.load(path)
   end
 
   test "a catalogued provider outside the selection is not an external package", context do

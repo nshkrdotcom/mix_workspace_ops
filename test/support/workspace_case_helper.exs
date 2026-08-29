@@ -126,6 +126,7 @@ defmodule MixWorkspaceOps.WorkspaceCase do
     }
     |> maybe_put("app", if(is_nil(app), do: :null, else: app))
     |> maybe_put("provides", Keyword.get(opts, :provides))
+    |> maybe_put("current", Keyword.get(opts, :current))
     |> maybe_put("dependency_sources", Keyword.get(opts, :dependency_sources))
   end
 

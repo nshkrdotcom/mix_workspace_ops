@@ -403,7 +403,7 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   def explain({:ambiguous_application, app, candidates}) do
-    "#{Enum.join(candidates, " and ")} both provide #{app}. " <>
+    "#{format_candidates(candidates)} #{provider_verb(candidates)} #{app}. " <>
       "Name one of them as the \"provider\" of #{app} in the dependency-source declaration."
   end
 
@@ -455,6 +455,16 @@ defmodule MixWorkspaceOps.Resolution do
   defp outcome_reason(:unknown_source), do: "the order names something that is not a source"
   defp outcome_reason(:not_reached), do: "not reached"
   defp outcome_reason(:chosen), do: "chosen"
+
+  defp format_candidates(candidates) do
+    Enum.map_join(candidates, " and ", fn
+      %{project: project, repository: repository} -> "#{project} (repository #{repository})"
+      project -> to_string(project)
+    end)
+  end
+
+  defp provider_verb([_, _]), do: "both provide"
+  defp provider_verb(_candidates), do: "provide"
 
   defp gesture(:run_mode), do: "--mode"
   defp gesture(:dependency_override), do: "--source"

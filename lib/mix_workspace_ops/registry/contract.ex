@@ -37,6 +37,7 @@ defmodule MixWorkspaceOps.Registry.Contract do
   @spec validate([map()], %{String.t() => [map()]}, String.t()) :: :ok | {:error, term()}
   def validate(repositories, applications, schema) do
     with :ok <- validate_unique_applications(applications, schema),
+         :ok <- validate_current_providers(applications),
          :ok <- validate_groups(repositories, schema),
          :ok <- validate_providers(repositories, applications) do
       validate_release_chain(repositories, applications)
@@ -69,24 +70,49 @@ defmodule MixWorkspaceOps.Registry.Contract do
   An explicit `provider` selects among candidates. Without one, a single
   candidate resolves and several are an error naming all of them.
   """
-  @spec resolve_provider(%{String.t() => [map()]}, String.t(), String.t() | nil) ::
+  @spec resolve_provider(%{String.t() => [map()]}, String.t(), String.t() | nil, String.t() | nil) ::
           {:ok, map()} | {:error, term()}
-  def resolve_provider(applications, app, provider \\ nil)
+  def resolve_provider(applications, app, provider \\ nil, consumer_repository \\ nil)
 
-  def resolve_provider(applications, app, nil) do
+  def resolve_provider(applications, app, nil, consumer_repository) do
     case Map.get(applications, app, []) do
       [project] -> {:ok, project}
       [] -> {:error, {:unprovided_application, app}}
-      several -> {:error, {:ambiguous_application, app, Enum.map(several, & &1.id)}}
+      several -> choose_implicit(app, several, consumer_repository)
     end
   end
 
-  def resolve_provider(applications, app, provider) do
+  def resolve_provider(applications, app, provider, _consumer_repository) do
     candidates = Map.get(applications, app, [])
 
     case Enum.find(candidates, &(&1.id == provider)) do
       nil -> {:error, {:unknown_provider, app, provider, Enum.map(candidates, & &1.id)}}
       project -> {:ok, project}
+    end
+  end
+
+  defp choose_implicit(app, candidates, consumer_repository) do
+    own = Enum.filter(candidates, &(&1.repository == consumer_repository))
+    current = Enum.filter(candidates, & &1.current)
+
+    cond do
+      length(own) == 1 -> {:ok, hd(own)}
+      length(current) == 1 -> {:ok, hd(current)}
+      true -> {:error, {:ambiguous_application, app, candidate_rows(candidates)}}
+    end
+  end
+
+  defp candidate_rows(candidates),
+    do: Enum.map(candidates, &%{project: &1.id, repository: &1.repository})
+
+  defp validate_current_providers(applications) do
+    case Enum.find(applications, fn {_app, projects} -> Enum.count(projects, & &1.current) > 1 end) do
+      nil ->
+        :ok
+
+      {app, projects} ->
+        current = projects |> Enum.filter(& &1.current) |> Enum.map(& &1.id)
+        {:error, {:multiple_current_providers, app, current}}
     end
   end
 
@@ -133,7 +159,7 @@ defmodule MixWorkspaceOps.Registry.Contract do
   defp validate_declaration(applications, scope, app, declaration) do
     if Source.reaches?(declaration, "local") or
          Source.reaches_while_publishing?(declaration, "local") do
-      case resolve_provider(applications, app, declaration.provider) do
+      case resolve_provider(applications, app, declaration.provider, nil) do
         {:ok, _project} -> :ok
         {:error, reason} -> {:error, {:dependency_source, scope, reason}}
       end
