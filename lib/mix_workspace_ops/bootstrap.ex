@@ -23,10 +23,17 @@ defmodule MixWorkspaceOps.Bootstrap do
       |> Path.join(digest(contents()) <> ".exs")
 
     case File.read(path) do
-      {:ok, bytes} when bytes == @contents -> {:ok, path}
-      {:ok, _bytes} -> {:error, {:bootstrap_digest_collision, path}}
-      {:error, :enoent} -> write(path, contents())
-      {:error, reason} -> {:error, {:bootstrap_read, path, reason}}
+      {:ok, bytes} when bytes == @contents ->
+        with :ok <- File.chmod(path, 0o400), do: {:ok, path}
+
+      {:ok, _bytes} ->
+        {:error, {:bootstrap_digest_collision, path}}
+
+      {:error, :enoent} ->
+        write(path, contents())
+
+      {:error, reason} ->
+        {:error, {:bootstrap_read, path, reason}}
     end
   end
 
@@ -37,7 +44,8 @@ defmodule MixWorkspaceOps.Bootstrap do
          :ok <- File.chmod(Path.dirname(path), 0o700),
          :ok <- File.write(temporary, bytes, [:sync]),
          :ok <- File.chmod(temporary, 0o600),
-         :ok <- File.rename(temporary, path) do
+         :ok <- File.rename(temporary, path),
+         :ok <- File.chmod(path, 0o400) do
       {:ok, path}
     end
   end

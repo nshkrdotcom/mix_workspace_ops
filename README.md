@@ -163,6 +163,8 @@ flags:
   --project example.consumer \
   --mix-env test --mix-target host \
   --mode local --mix-state managed -- mix test
+./mix_workspace_ops state list
+./mix_workspace_ops state gc --older-than 7d --dry-run
 ```
 
 `--mix-env` and `--mix-target` are graph inputs, not readings of ambient shell
@@ -185,17 +187,34 @@ MWO materializes its bootstrap in operator state and supplies its path through
 the repository. `MIX_WORKSPACE_OPS_CONTEXT_DIGEST` identifies the normalized,
 path-independent dependency-source selection for cache-aware callers.
 
-Managed Mix-state mode supplies content-addressed, operator-owned
-`MIX_DEPS_PATH`, `MIX_BUILD_ROOT`, `HEX_HOME`, and lockfile state for one Mix
-graph. Delegated mode supplies only the source/bootstrap context so a workspace
-runner can retain ownership of its child state:
+The path-independent context digest is a cache identity. The execution identity
+adds target HEAD/source state plus the explicit Mix environment and target. Each
+activation then adds a random invocation id and receives a private writable run
+root; identities may match, but writable directories never do.
+
+Managed Mix-state mode supplies invocation-unique, operator-owned Home, Mix,
+archives, `MIX_DEPS_PATH`, `MIX_BUILD_ROOT`, `HEX_HOME`, Rebar, temporary, and
+lockfile state. The source lock is copied and its initial and final digests are
+recorded. Mutation is rejected unless that particular run carries
+`--allow-lock-mutation`, and the checkout's lockfile is never changed. Delegated
+mode leaves deps/build/lock ownership with the workspace runner while retaining
+the unique Home/Mix/Hex credential shield and source/bootstrap context:
 
 ```bash
 ./mix_workspace_ops run ... --mix-state delegated -- runner command
 ```
 
-Publication is refused through `run`; it is available only through the release
-transaction below.
+Recognized publishing task names are refused through `run` as an operator error,
+but task recognition is not the security boundary. Every ordinary activation
+gets a fresh empty Home/Hex/Mix state and has inherited publication credentials
+removed, so an unrecognized publishing path still lacks publication capability.
+Capability is available only through the release transaction below.
+
+`state list` reports durable runs and live leases. `state gc --older-than
+N[s|m|h|d] --dry-run` previews exactly the old, unleased run identities a
+matching destructive invocation would remove from unchanged state; live leases
+are rechecked and retained. Shared overlays and bootstraps are immutable,
+content-addressed inputs and are not removed by runtime GC.
 
 Discovery is also generic. It accepts the owner explicitly, deduplicates by Git
 identity, rejects worktrees and wrongly named clones, prunes generated and

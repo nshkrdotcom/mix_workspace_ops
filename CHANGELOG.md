@@ -47,3 +47,14 @@
 - Evaluate `mix.exs` in a disposable full-worktree copy with a replacement
   environment, temporary Home/Mix/Hex state, staged-source memo identity, the
   existing subprocess boundary, and the existing hard timeout.
+- Separate semantic cache identity from execution identity and allocate a
+  private writable run root for every activation, including concurrent
+  activations with identical inputs.
+- Copy and audit lockfiles per run, require `--allow-lock-mutation` for a changed
+  copy, and keep the checkout lockfile unchanged.
+- Remove inherited publication credentials from ordinary managed and delegated
+  runs, with per-invocation Home, Mix, Hex, archive, Rebar, config, and temporary
+  state.
+- Add lease-aware `state list` and `state gc --older-than ... [--dry-run]`.
+- Parse each content-addressed overlay once per invocation and keep dependency
+  source/notice state in invocation-local ETS rather than persistent term.

@@ -13,6 +13,7 @@ defmodule MixWorkspaceOps.CLI do
     Registry,
     Report,
     Resolution,
+    Runtime,
     View
   }
 
@@ -43,10 +44,13 @@ defmodule MixWorkspaceOps.CLI do
     use --clear [APP] [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
     seam --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
       [--mix-env ENV] [--mix-target TARGET]
+    state list [--state-root PATH]
+    state gc --older-than N[s|m|h|d] [--dry-run] [--state-root PATH]
     run --project ID [--mode auto|local|git|hex] [--source APP=SOURCE] \
       --mix-state managed|delegated \
       --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
-      [--mix-env ENV] [--mix-target TARGET] [--state-root PATH] -- COMMAND [ARG ...]
+      [--mix-env ENV] [--mix-target TARGET] [--allow-lock-mutation] \
+      [--state-root PATH] -- COMMAND [ARG ...]
     release publish --descriptor PATH [--state-root PATH]
     help
   """
@@ -99,6 +103,8 @@ defmodule MixWorkspaceOps.CLI do
       :mix_env,
       :mix_target
     ],
+    ["state", "list"] => [:state_root],
+    ["state", "gc"] => [:state_root, :older_than, :dry_run],
     ["run"] => [
       :project,
       :mode,
@@ -110,13 +116,14 @@ defmodule MixWorkspaceOps.CLI do
       :binding,
       :mix_env,
       :mix_target,
+      :allow_lock_mutation,
       :state_root
     ],
     ["release", "publish"] => [:descriptor, :state_root]
   }
 
   @vocabulary @accepted |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
-  @switch_options [:clear]
+  @switch_options [:allow_lock_mutation, :clear, :dry_run]
 
   # The two tasks that mutate a package registry. `hex.build` is a publish task
   # for resolution and is not refused here: it writes a tarball and nothing else,
@@ -377,6 +384,20 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
+  def dispatch(["state", "list" | args]) do
+    with {:ok, options, []} <- options(["state", "list"], args) do
+      Runtime.list(options.state_root)
+    end
+  end
+
+  def dispatch(["state", "gc" | args]) do
+    with {:ok, options, []} <- options(["state", "gc"], args),
+         :ok <- require_option(options, :older_than),
+         {:ok, older_than} <- Runtime.parse_age(options.older_than) do
+      Runtime.gc(options.state_root, older_than, dry_run: options.dry_run)
+    end
+  end
+
   def dispatch(["run" | args]) do
     with {:ok, option_args, command} <- split_command(args),
          {:ok, options, []} <- options(["run"], option_args),
@@ -399,6 +420,7 @@ defmodule MixWorkspaceOps.CLI do
           publish?: PublishMode.publish?(PublishMode.task_argv(command)),
           mix_env: options.mix_env,
           mix_target: options.mix_target,
+          allow_lock_mutation: options.allow_lock_mutation,
           mix_state: mix_state,
           probe_memo: ProbeMemo.new(),
           state_root: options.state_root
@@ -526,14 +548,16 @@ defmodule MixWorkspaceOps.CLI do
   defp default(:source), do: []
   defp default(:mix_state), do: "managed"
   defp default(:state_root), do: default_state_root()
+  defp default(:allow_lock_mutation), do: false
   defp default(:clear), do: false
+  defp default(:dry_run), do: false
   defp default(_key), do: nil
 
   defp parse_options([], _command, _accepted, options, positional),
     do: {:ok, options, Enum.reverse(positional)}
 
   defp parse_options(["--" <> option | rest], command, accepted, options, positional)
-       when option in ["clear"] do
+       when option in ["allow-lock-mutation", "clear", "dry-run"] do
     with {:ok, key} <- option_key(command, accepted, option),
          true <- key in @switch_options do
       parse_options(rest, command, accepted, Map.put(options, key, true), positional)

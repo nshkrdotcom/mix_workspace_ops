@@ -216,10 +216,23 @@ same-repository source identities, external revisions/content, lock state, and
 the toolchain. A cache-aware delegated runner consumes that digest as one opaque
 cache component without parsing an overlay or the portfolio registry.
 
-Managed activation allocates content-addressed operator state for dependencies,
-builds, Hex data, and an overlay-specific lockfile. Delegated activation omits
-those variables because the launched workspace runner owns its independent
-child state. Both modes carry the same source/bootstrap contract.
+The context digest is a path-independent cache identity. Execution identity adds
+the target HEAD, target source digest, Mix environment and Mix target. Neither
+identity is a writable directory: each activation adds a random invocation id
+and allocates a private run root beneath operator state.
+
+Managed activation gives that invocation unique Home, Mix, copied archives,
+dependencies, build, Hex, Rebar, temporary, config, and lockfile paths.
+Delegated activation omits only dependency/build/lock ownership; it retains the
+unique Home/Mix/Hex credential shield while the launched runner owns its child
+build state. Both modes carry the same source/bootstrap contract. Installed Mix
+archives are copied per invocation, and unsafe archive symlinks are refused.
+
+The checkout lockfile is copied before execution. Finalization records both
+digests and rejects a mutation unless the invocation explicitly permits it.
+`state list` exposes durable run records and lease status; `state gc` considers
+only marked MWO state, rechecks live leases, and leaves immutable overlays and
+bootstraps alone.
 
 Non-application workspace roots, including ordinary umbrella roots, are valid
 registry targets. No fake app name is introduced for a tooling or umbrella root.

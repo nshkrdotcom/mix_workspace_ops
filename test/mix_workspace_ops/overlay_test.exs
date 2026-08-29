@@ -59,8 +59,10 @@ defmodule MixWorkspaceOps.OverlayTest do
 
     assert {"MIX_WORKSPACE_OPS_CONTEXT_DIGEST", activation.report.context_digest} in activation.env
 
+    assert {"HEX_HOME", activation.report.runtime.hex_home} in activation.env
+
     refute Enum.any?(activation.env, fn {key, _value} ->
-             key in ~w(MIX_DEPS_PATH MIX_BUILD_ROOT HEX_HOME MIX_WORKSPACE_OPS_LOCKFILE)
+             key in ~w(MIX_DEPS_PATH MIX_BUILD_ROOT MIX_WORKSPACE_OPS_LOCKFILE)
            end)
   end
 
@@ -133,6 +135,59 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {:ok, hex_overlay} = Overlay.read(hex.path)
     assert hex_overlay.mode == "hex"
     assert hex_overlay.sources["core"] == %{kind: :hex, requirement: "~> 1.0", opts: []}
+  end
+
+  test "target commits change execution identity but not semantic cache identity", context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    initialize_repository!(Path.join(root, "core"))
+    consumer = initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
+    registry = registry(root)
+
+    assert {:ok, first} = Overlay.activate(registry, "consumer", state_root: state_root)
+
+    File.write!(Path.join(consumer, "target.txt"), "second target revision\n")
+    {_, 0} = System.cmd("git", ["add", "target.txt"], cd: consumer)
+
+    {_, 0} =
+      System.cmd("git", ["commit", "--quiet", "-m", "second target revision"], cd: consumer)
+
+    assert {:ok, second} = Overlay.activate(registry, "consumer", state_root: state_root)
+
+    assert first.report.runtime.cache_identity == second.report.runtime.cache_identity
+    refute first.report.runtime.execution_identity == second.report.runtime.execution_identity
+    refute first.report.runtime.root == second.report.runtime.root
+    assert {:ok, _report} = Overlay.deactivate(first)
+    assert {:ok, _report} = Overlay.deactivate(second)
+  end
+
+  test "concurrent identical activations share no writable path", context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    initialize_repository!(Path.join(root, "core"))
+    initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
+    registry = registry(root)
+
+    tasks =
+      for _index <- 1..2 do
+        Task.async(fn -> Overlay.activate(registry, "consumer", state_root: state_root) end)
+      end
+
+    assert [{:ok, first}, {:ok, second}] = Enum.map(tasks, &Task.await(&1, 30_000))
+    first_runtime = first.report.runtime
+    second_runtime = second.report.runtime
+
+    assert first_runtime.cache_identity == second_runtime.cache_identity
+    assert first_runtime.execution_identity == second_runtime.execution_identity
+    refute first_runtime.invocation_id == second_runtime.invocation_id
+
+    assert MapSet.disjoint?(
+             MapSet.new(runtime_writable_paths(first_runtime)),
+             MapSet.new(runtime_writable_paths(second_runtime))
+           )
+
+    assert {:ok, _report} = Overlay.deactivate(first)
+    assert {:ok, _report} = Overlay.deactivate(second)
   end
 
   # The overlay is content-addressed, so what it attests to has to name the view
@@ -310,6 +365,7 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {:ok, activation} =
              Overlay.activate(registry(root), "consumer", state_root: state_root)
 
+    File.chmod!(activation.path, 0o600)
     File.write!(activation.path, File.read!(activation.path) <> "tampered\n")
 
     assert {:error, {:overlay_digest_mismatch, _expected, _actual}} =
@@ -400,5 +456,10 @@ defmodule MixWorkspaceOps.OverlayTest do
     )
     |> Registry.load!()
     |> bind!(root)
+  end
+
+  defp runtime_writable_paths(report) do
+    ~w(root home mix_home archives hex_home rebar_cache tmp config_home deps_path build_root lockfile)a
+    |> Enum.map(&Map.fetch!(report, &1))
   end
 end

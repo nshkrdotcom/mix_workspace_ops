@@ -69,6 +69,8 @@ defmodule MixWorkspaceOps.CLITest do
              ["run"],
              ["seam"],
              ["sources"],
+             ["state", "gc"],
+             ["state", "list"],
              ["use"],
              ["why"]
            ]
@@ -646,6 +648,128 @@ defmodule MixWorkspaceOps.CLITest do
 
     assert report.source.mode == :auto
     refute report.source.publish
+  end
+
+  test "ordinary run reaches an unnamed publish-shaped child without credentials", context do
+    %{root: root, catalog: catalog, state_root: state_root} = workspace!(context)
+
+    fixture = """
+    if System.get_env("HEX_API_KEY") do
+      IO.puts("unexpected publication capability")
+      System.halt(0)
+    else
+      IO.puts(:stderr, "publication credentials unavailable")
+      System.halt(77)
+    end
+    """
+
+    assert {:error, {:command_failed, result}} =
+             CLI.dispatch([
+               "run",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--state-root",
+               state_root,
+               "--",
+               System.find_executable("elixir"),
+               "-e",
+               fixture
+             ])
+
+    assert result.exit_code == 77
+    assert result.output =~ "publication credentials unavailable"
+    refute result.output =~ "unexpected publication capability"
+  end
+
+  test "state list and gc expose the same completed run", context do
+    %{root: root, catalog: catalog, state_root: state_root} = workspace!(context)
+
+    assert {:ok, _report} =
+             CLI.dispatch([
+               "run",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--state-root",
+               state_root,
+               "--",
+               "true"
+             ])
+
+    assert {:ok, %{runs: [run]}} =
+             CLI.dispatch(["state", "list", "--state-root", state_root])
+
+    refute run.leased
+    assert run.status == "complete"
+
+    assert {:ok, dry} =
+             CLI.dispatch([
+               "state",
+               "gc",
+               "--older-than",
+               "0s",
+               "--dry-run",
+               "--state-root",
+               state_root
+             ])
+
+    assert {:ok, removed} =
+             CLI.dispatch([
+               "state",
+               "gc",
+               "--older-than",
+               "0s",
+               "--state-root",
+               state_root
+             ])
+
+    assert Enum.map(dry.runs, & &1.run_id) == [run.run_id]
+    assert Enum.map(removed.runs, & &1.run_id) == [run.run_id]
+    assert {:ok, %{runs: []}} = CLI.dispatch(["state", "list", "--state-root", state_root])
+  end
+
+  test "run requires an explicit flag before a child may mutate its copied lock", context do
+    %{root: root, catalog: catalog, state_root: state_root} = workspace!(context)
+    project_lock = Path.join(root, "alpha/mix.lock")
+    File.write!(project_lock, "%{}\n")
+
+    command = [
+      "--",
+      System.find_executable("elixir"),
+      "-e",
+      ~s|File.write!(System.fetch_env!("MIX_WORKSPACE_OPS_LOCKFILE"), "changed\\n")|
+    ]
+
+    options = [
+      "run",
+      "--project",
+      "alpha",
+      "--registry",
+      catalog,
+      "--checkout-root",
+      root,
+      "--state-root",
+      state_root
+    ]
+
+    assert {:error, {:lock_mutation_not_allowed, _run_id, initial, final}} =
+             CLI.dispatch(options ++ command)
+
+    refute initial == final
+
+    assert {:ok, report} =
+             CLI.dispatch(options ++ ["--allow-lock-mutation"] ++ command)
+
+    assert report.source.runtime.lock_mutated
+    assert report.source.runtime.allow_lock_mutation
+    assert File.read!(project_lock) == "%{}\n"
   end
 
   test "run refuses a source override that does not name an application", context do

@@ -55,6 +55,7 @@ defmodule MixWorkspaceOps.Overlay do
   @type activation :: %{
           path: String.t() | nil,
           env: [{String.t(), String.t() | nil}],
+          runtime_handle: Runtime.t(),
           report: map()
         }
 
@@ -83,6 +84,8 @@ defmodule MixWorkspaceOps.Overlay do
          target_project <- Registry.project!(registry, target),
          target_root <- Registry.project_root(registry, target_project),
          {:ok, lock_bytes} <- source_lock(target_root),
+         target_head <- Git.head!(target_root),
+         target_source_digest <- Git.source_digest(target_root),
          context <-
            context_contents(registry, decided, target_project, attributed, lock_bytes),
          context_digest <- digest(context),
@@ -93,14 +96,22 @@ defmodule MixWorkspaceOps.Overlay do
              mode,
              resolution,
              rows,
-             target_root,
+             target_head,
+             target_source_digest,
              lock_bytes,
              context_digest
            ),
          overlay_digest <- digest(contents),
          {:ok, path} <- materialize(state_root, overlay_digest, contents),
          {:ok, bootstrap_path} <- Bootstrap.materialize(state_root),
-         {:ok, runtime} <- prepare_runtime(mix_state, state_root, context_digest, lock_bytes) do
+         {:ok, runtime} <-
+           prepare_runtime(mix_state, state_root, context_digest, lock_bytes,
+             target_head: target_head,
+             target_source_digest: target_source_digest,
+             mix_env: inputs.mix_env,
+             mix_target: inputs.mix_target,
+             allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false)
+           ) do
       env =
         [
           {Bootstrap.environment_variable(), bootstrap_path},
@@ -115,6 +126,7 @@ defmodule MixWorkspaceOps.Overlay do
        %{
          path: path,
          env: env,
+         runtime_handle: runtime.handle,
          report: %{
            schema: @header,
            target: to_string(target),
@@ -148,7 +160,18 @@ defmodule MixWorkspaceOps.Overlay do
         when result: term()
   def with_activation(registry, target, opts \\ [], function) when is_function(function, 2) do
     case activate(registry, target, opts) do
-      {:ok, activation} -> function.(activation.report, activation.env)
+      {:ok, activation} -> execute_activation(activation, function)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Finalizes and releases an activation created by `activate/3`."
+  @spec deactivate(map()) :: {:ok, map()} | {:error, term()}
+  def deactivate(%{runtime_handle: handle}) do
+    result = Runtime.finish(handle)
+
+    case Runtime.release(handle) do
+      :ok -> result
       {:error, reason} -> {:error, reason}
     end
   end
@@ -307,7 +330,8 @@ defmodule MixWorkspaceOps.Overlay do
          mode,
          resolution,
          rows,
-         target_root,
+         target_head,
+         target_source_digest,
          lock_bytes,
          context_digest
        ) do
@@ -322,8 +346,8 @@ defmodule MixWorkspaceOps.Overlay do
       "target\t#{decided.target}",
       "mode\t#{mode}",
       "publish\t#{decided.publish?}",
-      "target_head\t#{Git.head!(target_root)}",
-      "target_source_digest\t#{Git.source_digest(target_root)}",
+      "target_head\t#{target_head}",
+      "target_source_digest\t#{target_source_digest}",
       "lock_digest\t#{digest(lock_bytes)}",
       "toolchain\telixir-#{System.version()}-otp-#{:erlang.system_info(:otp_release)}"
     ]
@@ -443,7 +467,7 @@ defmodule MixWorkspaceOps.Overlay do
     with :ok <- File.mkdir_p(directory),
          :ok <- File.chmod(directory, 0o700),
          :ok <- write_if_absent(path, temporary, contents),
-         :ok <- File.chmod(path, 0o600) do
+         :ok <- File.chmod(path, 0o400) do
       {:ok, path}
     end
   end
@@ -630,14 +654,33 @@ defmodule MixWorkspaceOps.Overlay do
     Path.join(base, "mix_workspace_ops")
   end
 
-  defp prepare_runtime(:managed, state_root, digest, lock_bytes),
-    do: Runtime.prepare(state_root, digest, lock_bytes)
+  defp prepare_runtime(mode, state_root, digest, lock_bytes, opts) do
+    Runtime.prepare(state_root, digest, lock_bytes, Keyword.put(opts, :ownership, mode))
+  end
 
-  defp prepare_runtime(:delegated, _state_root, digest, _lock_bytes),
-    do: Runtime.delegated(digest)
+  defp execute_activation(activation, function) do
+    try do
+      result = function.(activation.report, activation.env)
 
-  defp prepare_runtime(mode, _state_root, _digest, _lock_bytes),
-    do: {:error, {:unsupported_mix_state, mode}}
+      case Runtime.finish(activation.runtime_handle) do
+        {:ok, runtime_report} -> attach_runtime(result, runtime_report)
+        {:error, reason} -> {:error, reason}
+      end
+    catch
+      kind, reason ->
+        Runtime.finish(activation.runtime_handle)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    after
+      Runtime.release(activation.runtime_handle)
+    end
+  end
+
+  defp attach_runtime({:ok, %{source: source} = result}, runtime_report)
+       when is_map(source) do
+    {:ok, %{result | source: Map.put(source, :runtime, runtime_report)}}
+  end
+
+  defp attach_runtime(result, _runtime_report), do: result
 
   defp source_lock(project_root) do
     case File.read(Path.join(project_root, "mix.lock")) do
