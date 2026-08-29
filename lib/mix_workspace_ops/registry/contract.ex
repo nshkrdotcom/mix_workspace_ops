@@ -92,13 +92,23 @@ defmodule MixWorkspaceOps.Registry.Contract do
   end
 
   defp choose_implicit(app, candidates, consumer_repository) do
-    own = Enum.filter(candidates, &(&1.repository == consumer_repository))
+    own = own_repository_provider(candidates, consumer_repository)
     current = Enum.filter(candidates, & &1.current)
 
     cond do
-      length(own) == 1 -> {:ok, hd(own)}
+      match?({:ok, _project}, own) -> own
       length(current) == 1 -> {:ok, hd(current)}
       true -> {:error, {:ambiguous_application, app, candidate_rows(candidates)}}
+    end
+  end
+
+  # A dependency edge from one project to another project in the same
+  # repository already identifies the intended copy. Requiring a declaration
+  # here would turn the common intra-repository path case into configuration.
+  defp own_repository_provider(candidates, consumer_repository) do
+    case Enum.filter(candidates, &(&1.repository == consumer_repository)) do
+      [project] -> {:ok, project}
+      _none_or_ambiguous -> :none
     end
   end
 

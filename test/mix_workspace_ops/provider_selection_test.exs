@@ -152,6 +152,31 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
     assert {:ok, %{id: "upstream.shared"}} = Registry.resolve_dependency(registry, "shared")
   end
 
+  test "the consumer repository's own provider wins before the global current one", context do
+    root = temporary_directory!(context)
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("upstream",
+          projects: [catalog_project("upstream.shared", app: "shared", current: true)]
+        ),
+        catalog_repository("vendored",
+          projects: [
+            catalog_project("vendored.consumer", app: "consumer"),
+            catalog_project("vendored.shared", app: "shared")
+          ]
+        )
+      ])
+      |> Registry.load!()
+
+    assert {:ok, %{id: "vendored.shared"}} =
+             Registry.resolve_dependency(registry, "shared", nil, "vendored")
+
+    assert {:ok, %{id: "upstream.shared"}} =
+             Registry.resolve_dependency(registry, "shared", nil, "external")
+  end
+
   test "two current providers are invalid rather than an order-dependent choice", context do
     root = temporary_directory!(context)
 
