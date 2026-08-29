@@ -41,7 +41,7 @@ defmodule MixWorkspaceOps.Graph do
          reader = Keyword.get(opts, :dependency_reader, &Project.dependencies(registry, &1, opts)),
          state = initial_state(),
          {:ok, seeds} <- seed_projects(registry, target),
-         :ok <- require_target_checkout(registry, seeds),
+         :ok <- require_target_checkout(registry, target),
          {:ok, final} <- visit_seeds(registry, seeds, reader, state) do
       projects = Enum.reverse(final.ordered)
       edges = final.edges |> Enum.uniq() |> Enum.sort()
@@ -94,11 +94,9 @@ defmodule MixWorkspaceOps.Graph do
   # repository this operation cannot proceed without is the target's own, and it
   # is refused through the mechanism that exists to refuse it, so an operator
   # sees the typed error naming the path rather than a rendered exception.
-  defp require_target_checkout(registry, seeds) do
-    seeds
-    |> Enum.map(& &1.repository)
-    |> Enum.uniq()
-    |> then(&Registry.require_bound(registry, &1))
+  defp require_target_checkout(registry, target) do
+    repository = Registry.project!(registry, target).repository
+    Registry.require_bound(registry, [repository])
   end
 
   defp seed_projects(registry, target) do

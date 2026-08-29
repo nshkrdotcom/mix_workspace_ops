@@ -233,8 +233,24 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert overlay.sources["core"].kind == :github
     assert activation.report.known_unselected == [{"consumer", "core", ["core"]}]
 
+    expression = """
+    Code.require_file(#{inspect(activation.report.bootstrap_path)})
+    IO.inspect(MixWorkspaceOpsBootstrap.dep(:core, "~> 1.0", #{inspect(Path.join(root, "consumer"))}, []))
+    """
+
+    assert {bootstrap_output, 0} =
+             System.cmd(System.find_executable("elixir"), ["-e", expression],
+               env: activation.env,
+               stderr_to_stdout: true
+             )
+
+    assert bootstrap_output =~ ~s|{:core, [github: "example-org/core", branch: "main"]}|
+
     assert {:error, {:known_unselected_local, "core", ["core"]}} =
              MixWorkspaceOps.Resolution.resolve(selected, "consumer", mode: "local")
+
+    assert {:error, {:known_unselected_local, "core", ["core"]}} =
+             Overlay.activate(selected, "consumer", mode: :local, state_root: state_root)
 
     permitted =
       Registry.select(registry, [

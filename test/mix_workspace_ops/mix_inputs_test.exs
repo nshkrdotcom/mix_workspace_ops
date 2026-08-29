@@ -198,7 +198,9 @@ defmodule MixWorkspaceOps.MixInputsTest do
         context.root,
         [
           catalog_repository("filtered", projects: [catalog_project("filtered")])
-        ], name: "filtered-registry.json")
+        ],
+        name: "filtered-registry.json"
+      )
 
     registry = registry_path |> Registry.load!() |> bind!(context.root)
 

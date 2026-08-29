@@ -54,9 +54,6 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
     :ok
   end
 
-  @spec excluded_directories() :: [String.t()]
-  def excluded_directories, do: @excluded_directories
-
   defp source_root(project_root) do
     case Git.root(project_root) do
       {:ok, root} -> root

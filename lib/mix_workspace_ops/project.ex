@@ -57,7 +57,7 @@ defmodule MixWorkspaceOps.Project do
   @type probe_options :: [
           probe_memo: ProbeMemo.t(),
           mix_env: String.t(),
-          mix_target: String.t() | nil,
+          mix_target: String.t(),
           toolchain: term()
         ]
 
