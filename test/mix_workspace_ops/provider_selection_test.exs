@@ -1,7 +1,7 @@
 defmodule MixWorkspaceOps.ProviderSelectionTest do
   use MixWorkspaceOps.WorkspaceCase, async: true
 
-  alias MixWorkspaceOps.{Graph, Registry, View}
+  alias MixWorkspaceOps.{Graph, Registry, Resolution, View}
 
   defp two_providers(root, opts \\ []) do
     declaration = Keyword.get(opts, :declaration, %{"hex" => "~> 0.1.0"})
@@ -177,6 +177,53 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
              Registry.resolve_dependency(registry, "shared", nil, "external")
   end
 
+  test "graph traversal and source coordinates use the same consumer repository", context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "upstream"))
+    initialize_repository!(Path.join(root, "vendored"))
+    File.mkdir_p!(Path.join(root, "vendored/consumer"))
+    File.mkdir_p!(Path.join(root, "vendored/shared"))
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("upstream",
+          projects: [catalog_project("upstream.shared", app: "shared", current: true)]
+        ),
+        catalog_repository("vendored",
+          dependency_sources: %{
+            "shared" => %{
+              "github" => %{},
+              "order" => ["github"],
+              "publish_order" => ["github"]
+            }
+          },
+          projects: [
+            catalog_project("vendored.consumer", app: "consumer", path: "consumer"),
+            catalog_project("vendored.shared", app: "shared", path: "shared", kind: "package")
+          ]
+        )
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    reader = fn
+      %{id: "vendored.consumer"} -> {:ok, ["shared"]}
+      _project -> {:ok, []}
+    end
+
+    assert {:ok, graph} =
+             Graph.resolve(registry, "vendored.consumer", dependency_reader: reader)
+
+    assert graph.edges == [{"vendored.consumer", "vendored.shared"}]
+
+    assert {:ok, report} =
+             Resolution.resolve(registry, "vendored.consumer", dependency_reader: reader)
+
+    assert [%{provider_project_id: "vendored.shared", location: coordinates}] = report.decisions
+    assert coordinates.repo == "example-org/vendored"
+  end
+
   test "two current providers are invalid rather than an order-dependent choice", context do
     root = temporary_directory!(context)
 
@@ -234,9 +281,7 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
 
     assert resolution.external_dependencies == []
 
-    assert resolution.known_unselected == [
-             {"alpha", "shared", ["upstream.shared", "vendored.shared"]}
-           ]
+    assert resolution.known_unselected == [{"alpha", "shared", ["vendored.shared"]}]
   end
 
   test "an uncatalogued dependency is still an external package", context do
@@ -301,29 +346,55 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
         Registry.project!(registry, "upstream.shared")
       ])
 
-    assert {:error, {:unknown_provider, "shared", "vendored.shared", ["upstream.shared"]}} =
+    assert {:known_unselected, ["vendored.shared"]} =
              Registry.resolve_dependency(without_vendored, "shared", "vendored.shared")
 
     without_either = Registry.select(registry, [Registry.project!(registry, "alpha")])
 
-    assert {:known_unselected, ["upstream.shared", "vendored.shared"]} =
+    assert {:known_unselected, ["vendored.shared"]} =
              Registry.resolve_dependency(without_either, "shared", "vendored.shared")
 
     assert Registry.unselected_application_ids(without_either) == ["shared"]
   end
 
+  test "selection cannot replace an excluded current provider", context do
+    root = temporary_directory!(context)
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("alpha", projects: [catalog_project("alpha")]),
+        catalog_repository("current",
+          projects: [catalog_project("current.shared", app: "shared", current: true)]
+        ),
+        catalog_repository("fork", projects: [catalog_project("fork.shared", app: "shared")])
+      ])
+      |> Registry.load!()
+
+    assert {:ok, %{id: "current.shared"}} = Registry.resolve_dependency(registry, "shared")
+
+    selected =
+      Registry.select(registry, [
+        Registry.project!(registry, "alpha"),
+        Registry.project!(registry, "fork.shared")
+      ])
+
+    assert {:known_unselected, ["current.shared"]} =
+             Registry.resolve_dependency(selected, "shared")
+  end
+
   # Where the catalog resolves an application to a project the selection keeps,
   # the selection must resolve it to the same project. Where the selection
   # removes that project, it must not resolve to a different one. A catalogued
-  # resolution that was already an error or an ambiguity is the one case a
-  # selection may legitimately change, by removing one of the candidates.
+  # resolution that was already an error or an ambiguity remains an error:
+  # selection does not get to answer catalog identity by removing candidates.
   defp preserved?({:ok, project}, chosen, subset) do
     if project.id in subset,
       do: chosen == {:ok, project},
-      else: chosen != {:ok, project}
+      else: chosen == {:known_unselected, [project.id]}
   end
 
-  defp preserved?(_catalogued, _chosen, _subset), do: true
+  defp preserved?(catalogued, chosen, _subset), do: chosen == catalogued
 
   defp subsets([]), do: [[]]
 

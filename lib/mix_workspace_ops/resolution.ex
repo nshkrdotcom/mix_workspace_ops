@@ -531,7 +531,8 @@ defmodule MixWorkspaceOps.Resolution do
     application = to_string(application)
     target = to_string(target)
 
-    with {:ok, declaration} <- fetch_declaration(registry, target, application),
+    with target_project <- Registry.project!(registry, target),
+         {:ok, declaration} <- fetch_declaration(registry, target, application),
          {:ok, root} <- target_root(registry, target),
          {:ok, overrides} <- overrides(root, opts),
          {:ok, decision} <-
@@ -539,9 +540,12 @@ defmodule MixWorkspaceOps.Resolution do
              registry,
              application,
              declaration,
-             Keyword.merge(opts, consumer_root: root, overrides: overrides)
+             Keyword.merge(opts,
+               consumer_root: root,
+               consumer_repository: target_project.repository,
+               overrides: overrides
+             )
            ) do
-      target_project = Registry.project!(registry, target)
       candidates = Registry.providers(registry, application)
       rule = identity_rule(registry, target_project, application, candidates)
 
@@ -759,7 +763,7 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   defp derived_local(registry, app, declaration, opts) do
-    case provider(registry, app, declaration) do
+    case provider(registry, app, declaration, opts) do
       {:ok, project} -> provider_path(registry, project, opts)
       outcome -> outcome
     end
@@ -809,13 +813,13 @@ defmodule MixWorkspaceOps.Resolution do
         |> Enum.find(&usable_sibling_path?(&1, consumer_root))
         |> case do
           nil -> :missing_path
-          absolute -> {:ok, absolute, provider_id(registry, app, declaration)}
+          absolute -> {:ok, absolute, provider_id(registry, app, declaration, opts)}
         end
     end
   end
 
-  defp provider_id(registry, app, declaration) do
-    case provider(registry, app, declaration) do
+  defp provider_id(registry, app, declaration, opts) do
+    case provider(registry, app, declaration, opts) do
       {:ok, project} -> project.id
       _unnamed -> nil
     end
@@ -830,8 +834,10 @@ defmodule MixWorkspaceOps.Resolution do
   # cannot answer, and falling through to GitHub answers a question nobody
   # asked — and answers it differently from `MixWorkspaceOps.Graph`, which
   # refuses the same input.
-  defp provider(registry, app, declaration) do
-    case Registry.resolve_dependency(registry, app, declaration.provider) do
+  defp provider(registry, app, declaration, opts) do
+    consumer_repository = Keyword.get(opts, :consumer_repository)
+
+    case Registry.resolve_dependency(registry, app, declaration.provider, consumer_repository) do
       {:ok, project} -> {:ok, project}
       {:known_unselected, _project_ids} -> :known_unselected
       :unknown -> :no_catalogued_provider
@@ -853,7 +859,7 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   defp build(registry, app, declaration, @github, reason, considered, opts) do
-    case github(registry, app, declaration, reason, override(opts, app)) do
+    case github(registry, app, declaration, reason, override(opts, app), opts) do
       %{repo: repo} = coordinates when is_binary(repo) ->
         {:ok,
          decision(
@@ -861,7 +867,7 @@ defmodule MixWorkspaceOps.Resolution do
            @github,
            reason,
            considered,
-           provider_id(registry, app, declaration),
+           provider_id(registry, app, declaration, opts),
            coordinates,
            declaration
          )}
@@ -894,14 +900,14 @@ defmodule MixWorkspaceOps.Resolution do
   # change how a declaration that names no GitHub coordinates resolves in
   # ordinary development. An explicit gesture is the operator overriding that
   # intent, which is a different thing.
-  defp github(registry, app, declaration, reason, override) do
+  defp github(registry, app, declaration, reason, override, opts) do
     base =
       cond do
         not is_nil(declaration.github) ->
-          declared_coordinates(registry, app, declaration, reason)
+          declared_coordinates(registry, app, declaration, reason, opts)
 
         reason in @explicit_gestures ->
-          catalogued_coordinates(registry, app, declaration)
+          catalogued_coordinates(registry, app, declaration, opts)
 
         true ->
           nil
@@ -912,20 +918,20 @@ defmodule MixWorkspaceOps.Resolution do
     |> merge_github(override)
   end
 
-  defp declared_coordinates(registry, app, declaration, reason) do
-    coordinates = catalogued_coordinates(registry, app, declaration, false)
+  defp declared_coordinates(registry, app, declaration, reason, opts) do
+    coordinates = catalogued_coordinates(registry, app, declaration, false, opts)
 
     if reason in @explicit_gestures,
-      do: maybe_pin(coordinates, registry, app, declaration),
+      do: maybe_pin(coordinates, registry, app, declaration, opts),
       else: coordinates
   end
 
-  defp catalogued_coordinates(registry, app, declaration) do
-    catalogued_coordinates(registry, app, declaration, true)
+  defp catalogued_coordinates(registry, app, declaration, opts) do
+    catalogued_coordinates(registry, app, declaration, true, opts)
   end
 
-  defp catalogued_coordinates(registry, app, declaration, pin?) do
-    with {:ok, project} <- provider(registry, app, declaration),
+  defp catalogued_coordinates(registry, app, declaration, pin?, opts) do
+    with {:ok, project} <- provider(registry, app, declaration, opts),
          repository = Registry.repository!(registry, project.repository),
          true <- is_binary(repository.github) do
       coordinates = %{
@@ -942,10 +948,10 @@ defmodule MixWorkspaceOps.Resolution do
     end
   end
 
-  defp maybe_pin(nil, _registry, _app, _declaration), do: nil
+  defp maybe_pin(nil, _registry, _app, _declaration, _opts), do: nil
 
-  defp maybe_pin(coordinates, registry, app, declaration) do
-    case provider(registry, app, declaration) do
+  defp maybe_pin(coordinates, registry, app, declaration, opts) do
+    case provider(registry, app, declaration, opts) do
       {:ok, project} ->
         pin(coordinates, registry, Registry.repository!(registry, project.repository))
 
@@ -1061,9 +1067,14 @@ defmodule MixWorkspaceOps.Resolution do
     declarations
     |> applications(closure)
     |> Enum.map(fn app ->
-      {declaration, declared_by} = Map.fetch!(declarations, app)
+      {declaration, declared_by, consumer_repository} = Map.fetch!(declarations, app)
 
-      case decide(registry, app, declaration, opts) do
+      case decide(
+             registry,
+             app,
+             declaration,
+             Keyword.put(opts, :consumer_repository, consumer_repository)
+           ) do
         {:ok, decision} -> {:ok, %{decision | declared_by: declared_by}}
         {:error, reason} -> {:error, reason}
       end
@@ -1140,8 +1151,13 @@ defmodule MixWorkspaceOps.Resolution do
     registry
     |> Registry.dependency_sources(project)
     |> Enum.reduce(acc, fn {app, declaration}, inner ->
-      Map.update(inner, app, {declaration, [project.id]}, fn {chosen, ids} ->
-        {if(replace?, do: declaration, else: chosen), Enum.sort(Enum.uniq([project.id | ids]))}
+      Map.update(inner, app, {declaration, [project.id], project.repository}, fn
+        {chosen, ids, consumer_repository} ->
+          if replace? do
+            {declaration, Enum.sort(Enum.uniq([project.id | ids])), project.repository}
+          else
+            {chosen, Enum.sort(Enum.uniq([project.id | ids])), consumer_repository}
+          end
       end)
     end)
   end

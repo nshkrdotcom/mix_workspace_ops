@@ -232,10 +232,12 @@ defmodule MixWorkspaceOps.Registry do
   `provider` is the declaration's explicit provider selection, or `nil`. The
   result distinguishes four outcomes a caller must not conflate:
 
-    * `{:ok, project}` — one selected project provides the application.
-    * `{:known_unselected, project_ids}` — the catalog provides the application
-      but the current selection excludes every provider. The dependency is
-      catalogued, so it is never an ordinary external package.
+    * `{:ok, project}` — catalog identity selects one project and the current
+      selection permits it.
+    * `{:known_unselected, project_ids}` — catalog identity selects the named
+      project, but the current selection excludes it. The dependency is
+      catalogued, so it is never an ordinary external package and selection
+      never substitutes another provider.
     * `{:error, reason}` — several providers and no usable selection, or a
       provider naming a project that does not provide the application.
     * `:unknown` — no catalogued project provides it, so it is external.
@@ -249,11 +251,18 @@ defmodule MixWorkspaceOps.Registry do
         consumer_repository \\ nil
       ) do
     app = to_string(app)
-    applications = selected_applications(registry)
 
-    case Map.get(applications, app, []) do
-      [] -> unselected_providers(registry, app)
-      _candidates -> Contract.resolve_provider(applications, app, provider, consumer_repository)
+    case Contract.resolve_provider(registry.applications, app, provider, consumer_repository) do
+      {:ok, project} ->
+        if selected?(registry, project.id),
+          do: {:ok, project},
+          else: {:known_unselected, [project.id]}
+
+      {:error, {:unprovided_application, ^app}} ->
+        :unknown
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -273,7 +282,7 @@ defmodule MixWorkspaceOps.Registry do
   @doc "Every project providing `app`, sorted by project id."
   @spec providers(t(), String.t() | atom()) :: [project()]
   def providers(%__MODULE__{} = registry, app) do
-    Map.get(selected_applications(registry), to_string(app), [])
+    Map.get(registry.applications, to_string(app), [])
   end
 
   @doc """
@@ -482,15 +491,6 @@ defmodule MixWorkspaceOps.Registry do
     registry.applications
     |> Enum.reject(fn {app, _projects} -> Map.has_key?(applications, app) end)
     |> Map.new(fn {app, projects} -> {app, Enum.map(projects, & &1.id)} end)
-  end
-
-  defp unselected_providers(%__MODULE__{selection: nil}, _app), do: :unknown
-
-  defp unselected_providers(%__MODULE__{selection: selection}, app) do
-    case Map.fetch(selection.unselected_applications, app) do
-      {:ok, project_ids} -> {:known_unselected, project_ids}
-      :error -> :unknown
-    end
   end
 
   @doc """
