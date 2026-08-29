@@ -933,11 +933,14 @@ defmodule MixWorkspaceOps.ResolutionTest do
             %{source: "hex", outcome: :no_hex_requirement}
           ]},
          "nothing can supply weld. Tried local (the provider's repository has no checkout), " <>
-           "hex (the declaration carries no hex requirement)."},
+           "hex (the declaration carries no hex requirement). " <>
+           "Add a valid `hex` requirement for weld, or remove hex from its order."},
         {{:unavailable_source, "weld", "github", :run_mode},
-         "--mode asked for github for weld, and there is nothing to build it from."},
+         "--mode asked for github for weld, and there is nothing to build it from. " <>
+           "Add `github: %{}` for weld, or choose a catalogued provider."},
         {{:unavailable_run_mode, "github", ["blitz", "weld"]},
-         "--mode git cannot serve blitz, weld."},
+         "--mode git cannot serve blitz, weld. Add that source to each named declaration, " <>
+           "or override only the applications that can use it."},
         {{:unpublishable_local_override, "execution_plane", "path"},
          "publish mode follows the declared publish order; " <>
            "the local override for execution_plane requests :path."},

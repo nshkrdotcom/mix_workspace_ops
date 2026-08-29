@@ -373,19 +373,24 @@ defmodule MixWorkspaceOps.Resolution do
   """
   @spec explain(term()) :: String.t() | nil
   def explain({:no_available_source, app, _order, considered}) do
-    "nothing can supply #{app}. Tried " <> Enum.map_join(considered, ", ", &rejection/1) <> "."
+    "nothing can supply #{app}. Tried " <>
+      Enum.map_join(considered, ", ", &rejection/1) <>
+      ". " <> remedy_for_considered(app, considered)
   end
 
   def explain({:unavailable_source, app, source, reason}) do
-    "#{gesture(reason)} asked for #{source} for #{app}, and there is nothing to build it from."
+    "#{gesture(reason)} asked for #{source} for #{app}, and there is nothing to build it from. " <>
+      source_remedy(app, source)
   end
 
   def explain({:unavailable_run_mode, mode, applications}) do
-    "#{run_mode(mode)} cannot serve #{Enum.join(applications, ", ")}."
+    "#{run_mode(mode)} cannot serve #{Enum.join(applications, ", ")}. " <>
+      "Add that source to each named declaration, or override only the applications that can use it."
   end
 
   def explain({:unknown_source, app, source, reason}) do
-    "#{gesture(reason)} asked for #{inspect(source)} for #{app}, which is not a source."
+    "#{gesture(reason)} asked for #{inspect(source)} for #{app}, which is not a source. " <>
+      "Choose local, git, or hex."
   end
 
   def explain({:unpublishable_local_override, app, requested}) do
@@ -414,7 +419,8 @@ defmodule MixWorkspaceOps.Resolution do
 
   def explain({:unknown_provider, app, provider, candidates}) do
     "the declaration for #{app} names #{provider} as its provider, and #{provider} " <>
-      "does not provide #{app}. #{Enum.join(candidates, ", ")} do."
+      "does not provide #{app}. #{Enum.join(candidates, ", ")} do. " <>
+      "Set `#{app}: %{provider: \"PROJECT_ID\"}` to one of those project ids."
   end
 
   def explain({:absent_required_checkout, repository, expected}) do
@@ -466,6 +472,34 @@ defmodule MixWorkspaceOps.Resolution do
 
   defp provider_verb([_, _]), do: "both provide"
   defp provider_verb(_candidates), do: "provide"
+
+  defp remedy_for_considered(app, considered) do
+    outcomes = MapSet.new(considered, & &1.outcome)
+
+    cond do
+      MapSet.member?(outcomes, :no_hex_requirement) ->
+        "Add a valid `hex` requirement for #{app}, or remove hex from its order."
+
+      MapSet.member?(outcomes, :no_github_coordinates) ->
+        "Add `github: %{}` for #{app} to opt into derived GitHub coordinates."
+
+      MapSet.member?(outcomes, :known_unselected) ->
+        "Choose a view that includes a provider of #{app}."
+
+      true ->
+        "Clone or bind a provider checkout, or choose another declared source."
+    end
+  end
+
+  defp source_remedy(app, @github),
+    do: "Add `github: %{}` for #{app}, or choose a catalogued provider."
+
+  defp source_remedy(app, @hex), do: "Add a valid `hex` requirement for #{app}."
+
+  defp source_remedy(_app, @local),
+    do: "Clone or bind the provider repository outside Mix's deps directory."
+
+  defp source_remedy(_app, _source), do: "Choose local, git, or hex."
 
   defp gesture(:run_mode), do: "--mode"
   defp gesture(:dependency_override), do: "--source"
