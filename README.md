@@ -123,6 +123,16 @@ still load.
 The operator supplies a checkout root at runtime; every checkout is then
 verified against its Git origin and Git common directory.
 
+Path flags are optional. Every command resolves them in the same order: flag,
+`MIX_WORKSPACE_OPS_REGISTRY` / `MIX_WORKSPACE_OPS_CHECKOUT_ROOT`,
+`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/config.json`, then discovery
+by walking upward. A configured checkout therefore needs no repeated path
+flags:
+
+```json
+{"registry": "/catalog/registry.json", "checkout_root": "/operator/checkouts"}
+```
+
 ```bash
 ./mix_workspace_ops registry validate --registry /path/to/registry.json
 ./mix_workspace_ops registry discover \
@@ -143,6 +153,9 @@ verified against its Git origin and Git common directory.
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \
   --project example.consumer
+./mix_workspace_ops why example_core --project example.consumer
+./mix_workspace_ops use example_core local --project example.consumer
+./mix_workspace_ops use --clear example_core --project example.consumer
 ./mix_workspace_ops run \
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \
@@ -154,6 +167,12 @@ Local and Git overlays are stored beneath operator-owned XDG state and passed
 only to the child command through `MIX_WORKSPACE_OPS_OVERLAY`. No source-mode
 state is written into managed repositories. A direct `mix` invocation with no
 overlay environment variable uses the ordinary dependency declarations.
+
+`mwo why APP` explains the provider identity rule, the source chosen, every
+candidate considered, and both the durable and machine-local gestures that
+would change it. `mwo use APP local|git|hex` and `mwo use --clear [APP]` amend
+the parsed, never evaluated `.dependency_sources.local.exs` file so an operator
+does not have to remember its syntax.
 
 MWO materializes its bootstrap in operator state and supplies its path through
 `MIX_WORKSPACE_OPS_BOOTSTRAP`; it does not install executable helper code into

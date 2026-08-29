@@ -237,8 +237,48 @@ declares what it `provides`. More than one project may provide one application â
 a fork, an example, a successor, a vendored copy â€” and that is legal identity,
 not a defect. It becomes an error only where a dependency declaration would have
 to choose between candidates without saying which, and the error names every
-candidate. A declaration resolves the choice with `provider`, naming one
-project. Nothing ever silently takes the first match.
+candidate. Identity is settled by a declared `provider`, then by a provider in
+the consumer's own repository, then by the one provider marked `current`.
+Anything still ambiguous is an error naming each project and repository and the
+declaration line that settles it. `current` is temporal: it moves when a
+successor takes over an application name. It is not `lifecycle: active`, which
+says that a repository is alive. Optional project `lineage` records ancestry
+for documentation; resolution never reads it.
+
+Each source derives coordinates from that one identity. Local uses the bound
+repository plus project path. An empty `github: %{}` opts into the provider
+repository's GitHub identity, default branch and project subdirectory; a
+populated block carries only deviations. Hex derives its package name from the
+application name, while its map form supports a fork published under another
+package name.
+
+## The three places an operator can write a source choice
+
+| Layer | Holds | Committed | Seen by |
+|---|---|---|---|
+| catalog, per scope | durable provider deviations and published requirement | yes | everyone, including CI |
+| `mix.exs` committed default | fresh-clone and package-consumer tuple | yes | everyone |
+| `.dependency_sources.local.exs` | one operator's persistent experiment | no | that operator |
+| `--mode` / `--source` | one command's experiment | no | that command |
+
+Durable, shared facts go in the catalog. Temporary machine-local choices go in
+the local file or a flag; experimenting never requires a catalog commit.
+`mwo use APP local|git|hex` writes the local file, and
+`mwo use --clear [APP]` removes entries. `mwo why APP` shows the identity rule,
+source candidates, rejections, and the exact gesture that changes the answer.
+
+Registry and checkout paths follow one order everywhere: explicit flags,
+`MIX_WORKSPACE_OPS_REGISTRY` / `MIX_WORKSPACE_OPS_CHECKOUT_ROOT`, then
+`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/config.json`, then upward
+discovery. The configuration file is a JSON object:
+
+```json
+{"registry": "/catalog/registry.json", "checkout_root": "/operator/checkouts"}
+```
+
+Inside a configured checkout, `mwo plan --project example.consumer`,
+`mwo seam --project example.consumer`, `mwo why example_core`, and the other
+catalog commands need no path flags.
 
 ### Workspace membership
 
