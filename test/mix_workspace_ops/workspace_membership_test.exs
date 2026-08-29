@@ -1,7 +1,7 @@
 defmodule MixWorkspaceOps.WorkspaceMembershipTest do
   use MixWorkspaceOps.WorkspaceCase, async: true
 
-  alias MixWorkspaceOps.Registry
+  alias MixWorkspaceOps.{Graph, Registry}
 
   defp workspace_catalog(root, workspace, projects) do
     write_catalog!(root, [
@@ -154,5 +154,59 @@ defmodule MixWorkspaceOps.WorkspaceMembershipTest do
     assert [{repository, members}] = Registry.workspaces(registry)
     assert repository.id == "plane"
     assert Enum.map(members, & &1.id) == ["plane.core"]
+  end
+
+  test "a workspace graph seeds exactly the derived selected members", context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "plane"))
+
+    projects = [
+      catalog_project("plane", app: nil, kind: "workspace_root"),
+      catalog_project("plane.alpha", app: "alpha", path: "apps/alpha", kind: "package"),
+      catalog_project("plane.beta", app: "beta", path: "apps/beta", kind: "package"),
+      catalog_project("plane.gamma", app: "gamma", path: "apps/gamma", kind: "package"),
+      catalog_project("plane.scratch", path: "scratch", kind: "tooling"),
+      catalog_project("plane.example", path: "examples/example", kind: "tooling"),
+      catalog_project("plane.generated", path: "generated", kind: "generated"),
+      catalog_project("plane.nested", app: nil, path: "nested", kind: "workspace_root"),
+      catalog_project("plane.other", app: nil, path: "other", kind: "workspace_root")
+    ]
+
+    registry =
+      root
+      |> workspace_catalog(
+        %{
+          "kind" => "umbrella",
+          "exclude_project_ids" => ["plane.example", "plane.scratch"]
+        },
+        projects
+      )
+      |> Registry.load!()
+      |> bind!(root)
+
+    reader = fn project ->
+      send(self(), {:seed, project.id})
+      {:ok, []}
+    end
+
+    assert {:ok, resolution} = Graph.resolve(registry, "plane", dependency_reader: reader)
+    assert Enum.map(resolution.projects, & &1.id) == ~w(plane.alpha plane.beta plane.gamma)
+
+    assert_received {:seed, "plane.alpha"}
+    assert_received {:seed, "plane.beta"}
+    assert_received {:seed, "plane.gamma"}
+    refute_received {:seed, _other}
+
+    selected =
+      Registry.select(registry, [
+        Registry.project!(registry, "plane"),
+        Registry.project!(registry, "plane.alpha"),
+        Registry.project!(registry, "plane.gamma")
+      ])
+
+    assert {:ok, selected_resolution} =
+             Graph.resolve(selected, "plane", dependency_reader: fn _project -> {:ok, []} end)
+
+    assert Enum.map(selected_resolution.projects, & &1.id) == ~w(plane.alpha plane.gamma)
   end
 end

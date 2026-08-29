@@ -34,7 +34,6 @@ defmodule MixWorkspaceOps.Graph do
   def resolve(registry, target, opts \\ []) do
     target = to_string(target)
     reader = Keyword.get(opts, :dependency_reader, &Project.dependencies(registry, &1, opts))
-    seeds = seed_projects(registry, target)
 
     state = %{
       visiting: MapSet.new(),
@@ -46,7 +45,8 @@ defmodule MixWorkspaceOps.Graph do
       known_unselected: []
     }
 
-    with :ok <- require_target_checkout(registry, seeds),
+    with {:ok, seeds} <- seed_projects(registry, target),
+         :ok <- require_target_checkout(registry, seeds),
          {:ok, final} <- visit_seeds(registry, seeds, reader, state) do
       projects = Enum.reverse(final.ordered)
       edges = final.edges |> Enum.uniq() |> Enum.sort()
@@ -88,13 +88,20 @@ defmodule MixWorkspaceOps.Graph do
     project = Registry.project!(registry, target)
 
     if project.kind == "workspace_root" do
-      registry
-      |> Registry.repository!(project.repository)
-      |> Map.fetch!(:projects)
-      |> Enum.filter(&Registry.selected?(registry, &1.id))
-      |> Enum.sort_by(& &1.id)
+      case Registry.workspace_members(registry, project.repository) do
+        {:ok, members} ->
+          {:ok, Enum.filter(members, &Registry.selected?(registry, &1.id))}
+
+        {:error, {:not_a_workspace, _repository}}
+        when registry.schema == "mix_workspace_ops.registry/v1" ->
+          members = Registry.repository!(registry, project.repository).projects
+          {:ok, Enum.filter(members, &Registry.selected?(registry, &1.id))}
+
+        error ->
+          error
+      end
     else
-      [project]
+      {:ok, [project]}
     end
   end
 
