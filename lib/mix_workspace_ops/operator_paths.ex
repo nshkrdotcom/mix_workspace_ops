@@ -17,16 +17,16 @@ defmodule MixWorkspaceOps.OperatorPaths do
 
   @spec resolve(map(), [atom()]) :: {:ok, map()} | {:error, term()}
   def resolve(options, fields) do
-    config = config()
-
-    fields
-    |> Enum.filter(&Map.has_key?(@fields, &1))
-    |> Enum.reduce_while({:ok, options}, fn field, {:ok, acc} ->
-      case value(field, acc, config) do
-        {:ok, path} -> {:cont, {:ok, Map.put(acc, field, path)}}
-        :missing -> {:cont, {:ok, acc}}
-      end
-    end)
+    with {:ok, config} <- config() do
+      fields
+      |> Enum.filter(&Map.has_key?(@fields, &1))
+      |> Enum.reduce_while({:ok, options}, fn field, {:ok, acc} ->
+        case value(field, acc, config) do
+          {:ok, path} -> {:cont, {:ok, Map.put(acc, field, path)}}
+          :missing -> {:cont, {:ok, acc}}
+        end
+      end)
+    end
   end
 
   @spec config_path() :: String.t()
@@ -46,7 +46,7 @@ defmodule MixWorkspaceOps.OperatorPaths do
         {:ok, Path.expand(System.fetch_env!(environment))}
 
       present?(Map.get(config, config_key)) ->
-        {:ok, expand_config(Map.fetch!(config, config_key))}
+        {:ok, expand_config(Map.fetch!(config, config_key), Map.fetch!(config, "__directory__"))}
 
       true ->
         discover(field)
@@ -56,26 +56,49 @@ defmodule MixWorkspaceOps.OperatorPaths do
   defp config do
     path = config_path()
 
-    with true <- File.regular?(path),
-         {:ok, bytes} <- File.read(path),
-         {:ok, decoded} <- StrictJSON.decode(bytes),
-         true <- valid_config?(decoded) do
-      Map.put(decoded, "__directory__", Path.dirname(path))
+    if File.regular?(path) do
+      with {:ok, bytes} <- read_config(path),
+           {:ok, decoded} <- decode_config(path, bytes),
+           :ok <- validate_config(path, decoded) do
+        {:ok, Map.put(decoded, "__directory__", Path.dirname(path))}
+      end
     else
-      false -> %{}
-      {:error, _reason} -> %{}
+      {:ok, %{}}
     end
   end
 
-  defp valid_config?(decoded) do
-    is_map(decoded) and Map.keys(decoded) -- ~w(registry checkout_root) == [] and
-      Enum.all?(decoded, fn {_key, value} -> is_binary(value) and value != "" end)
+  defp read_config(path) do
+    case File.read(path) do
+      {:ok, bytes} -> {:ok, bytes}
+      {:error, reason} -> {:error, {:operator_config, path, {:read, reason}}}
+    end
   end
 
-  defp expand_config(path) do
+  defp decode_config(path, bytes) do
+    case StrictJSON.decode(bytes) do
+      {:ok, decoded} -> {:ok, decoded}
+      {:error, reason} -> {:error, {:operator_config, path, {:invalid_json, reason}}}
+    end
+  end
+
+  defp validate_config(path, decoded) when is_map(decoded) do
+    unknown = Map.keys(decoded) -- ~w(registry checkout_root)
+    invalid = Enum.reject(decoded, fn {_key, value} -> is_binary(value) and value != "" end)
+
+    cond do
+      unknown != [] -> {:error, {:operator_config, path, {:unknown_keys, Enum.sort(unknown)}}}
+      invalid != [] -> {:error, {:operator_config, path, :paths_must_be_non_empty_strings}}
+      true -> :ok
+    end
+  end
+
+  defp validate_config(path, _decoded),
+    do: {:error, {:operator_config, path, :expected_object}}
+
+  defp expand_config(path, directory) do
     if Path.type(path) == :absolute,
       do: Path.expand(path),
-      else: config() |> Map.fetch!("__directory__") |> Path.join(path) |> Path.expand()
+      else: directory |> Path.join(path) |> Path.expand()
   end
 
   defp discover(:registry), do: walk_up(File.cwd!(), "registry.json")

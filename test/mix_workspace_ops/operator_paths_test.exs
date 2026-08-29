@@ -57,6 +57,64 @@ defmodule MixWorkspaceOps.OperatorPathsTest do
     assert discovered.checkout_root == root
   end
 
+  test "an empty config requests the ordinary discovery fallbacks", context do
+    root = temporary_directory!(context)
+    checkout = initialize_repository!(Path.join(root, "alpha"))
+    File.write!(Path.join(checkout, "registry.json"), "{}")
+    config_home = Path.join(root, "config")
+    config_dir = Path.join(config_home, "mix_workspace_ops")
+    File.mkdir_p!(config_dir)
+    File.write!(Path.join(config_dir, "config.json"), "{}")
+
+    System.put_env("XDG_CONFIG_HOME", config_home)
+    File.cd!(checkout)
+
+    assert {:ok, paths} = OperatorPaths.resolve(%{}, [:registry, :checkout_root])
+    assert paths.registry == Path.join(checkout, "registry.json")
+    assert paths.checkout_root == root
+  end
+
+  test "malformed config is an error rather than silent discovery", context do
+    root = temporary_directory!(context)
+    checkout = initialize_repository!(Path.join(root, "alpha"))
+    File.write!(Path.join(checkout, "registry.json"), "{}")
+    config_home = Path.join(root, "config")
+    config_dir = Path.join(config_home, "mix_workspace_ops")
+    config_path = Path.join(config_dir, "config.json")
+    File.mkdir_p!(config_dir)
+    System.put_env("XDG_CONFIG_HOME", config_home)
+    File.cd!(checkout)
+
+    File.write!(config_path, "not-json")
+
+    assert {:error, {:operator_config, ^config_path, {:invalid_json, _reason}}} =
+             OperatorPaths.resolve(%{}, [:registry])
+
+    File.write!(config_path, "[]")
+
+    assert {:error, {:operator_config, ^config_path, :expected_object}} =
+             OperatorPaths.resolve(%{}, [:registry])
+
+    File.write!(config_path, ~s({"registry":""}))
+
+    assert {:error, {:operator_config, ^config_path, :paths_must_be_non_empty_strings}} =
+             OperatorPaths.resolve(%{}, [:registry])
+  end
+
+  test "a configured nonexistent path remains explicit", context do
+    root = temporary_directory!(context)
+    config_home = Path.join(root, "config")
+    config_dir = Path.join(config_home, "mix_workspace_ops")
+    config_path = Path.join(config_dir, "config.json")
+    File.mkdir_p!(config_dir)
+    File.write!(config_path, ~s({"registry":"absent.json"}))
+    System.put_env("XDG_CONFIG_HOME", config_home)
+
+    assert {:ok, paths} = OperatorPaths.resolve(%{}, [:registry])
+    assert paths.registry == Path.join(config_dir, "absent.json")
+    refute File.exists?(paths.registry)
+  end
+
   defp restore(name, nil), do: System.delete_env(name)
   defp restore(name, value), do: System.put_env(name, value)
 end
