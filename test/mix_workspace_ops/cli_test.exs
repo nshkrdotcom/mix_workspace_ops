@@ -429,6 +429,39 @@ defmodule MixWorkspaceOps.CLITest do
            ]
   end
 
+  test "the printed seam executes as the tuples publish resolution implies", context do
+    %{root: root, catalog: catalog} = seam_workspace!(context)
+
+    assert {:ok, report} =
+             CLI.dispatch([
+               "seam",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root
+             ])
+
+    module = Module.concat(__MODULE__, "GeneratedSeam#{System.unique_integer([:positive])}")
+
+    source = """
+    defmodule #{inspect(module)} do
+      def workspace_dep(app, default), do: {app, default}
+      def workspace_dep(app, default, opts) when is_binary(default), do: {app, default, opts}
+      def workspace_dep(app, default, opts), do: {app, Keyword.merge(default, opts)}
+      #{String.replace(report.report, "defp deps", "def deps")}
+    end
+    """
+
+    Code.compile_string(source)
+
+    assert apply(module, :deps, []) == [
+             {:core, "~> 1.0", [only: [:dev, :test], runtime: false]},
+             {:third_party, [github: "example-org/third-party", branch: "main", subdir: "core"]}
+           ]
+  end
+
   test "a report projects publish resolution rather than asserting it", context do
     %{root: root, catalog: catalog} = seam_workspace!(context)
 
