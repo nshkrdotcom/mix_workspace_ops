@@ -115,6 +115,7 @@ defmodule MixWorkspaceOps.Resolution do
   @type candidate :: %{source: String.t(), outcome: atom()}
   @type decision :: %{
           application: String.t(),
+          classification: :managed | :known_unselected | :external,
           source: String.t(),
           reason: atom(),
           considered: [candidate()],
@@ -136,6 +137,7 @@ defmodule MixWorkspaceOps.Resolution do
 
   @type source_entry :: %{
           application: String.t(),
+          classification: :managed | :known_unselected | :external,
           source: String.t(),
           reason: atom(),
           considered: [candidate()],
@@ -452,6 +454,12 @@ defmodule MixWorkspaceOps.Resolution do
       "coordinates in its publish order."
   end
 
+  def explain({:known_unselected_local, app, providers}) do
+    "local source was requested for #{app}, but its catalog identity " <>
+      "(#{Enum.join(providers, ", ")}) is outside this selection. " <>
+      "Choose a view that includes that provider and compute a new plan."
+  end
+
   def explain(_other), do: nil
 
   defp rejection(%{source: source, outcome: outcome}),
@@ -631,6 +639,7 @@ defmodule MixWorkspaceOps.Resolution do
   defp entry(decision, location, version) do
     %{
       application: decision.application,
+      classification: decision.classification,
       source: decision.source,
       reason: decision.reason,
       considered: decision.considered,
@@ -751,6 +760,7 @@ defmodule MixWorkspaceOps.Resolution do
   defp availability(registry, app, declaration, @local, opts) do
     case local_source(registry, app, declaration, opts) do
       {:ok, _path, _provider} -> :available
+      {:known_unselected, _project} -> :known_unselected
       {:error, error} -> {:error, error}
       outcome -> outcome
     end
@@ -765,9 +775,15 @@ defmodule MixWorkspaceOps.Resolution do
   defp availability(_registry, _app, _declaration, _source, _opts), do: :unknown_source
 
   defp local_source(registry, app, declaration, opts) do
-    case override(opts, app).path do
-      nil -> derived_local(registry, app, declaration, opts)
-      candidates -> overridden_local(registry, app, declaration, candidates, opts)
+    case provider(registry, app, declaration, opts) do
+      {:known_unselected, project} ->
+        {:known_unselected, project}
+
+      _selected_or_external ->
+        case override(opts, app).path do
+          nil -> derived_local(registry, app, declaration, opts)
+          candidates -> overridden_local(registry, app, declaration, candidates, opts)
+        end
     end
   end
 
@@ -830,6 +846,7 @@ defmodule MixWorkspaceOps.Resolution do
   defp provider_id(registry, app, declaration, opts) do
     case provider(registry, app, declaration, opts) do
       {:ok, project} -> project.id
+      {:known_unselected, project} -> project.id
       _unnamed -> nil
     end
   end
@@ -847,10 +864,17 @@ defmodule MixWorkspaceOps.Resolution do
     consumer_repository = Keyword.get(opts, :consumer_repository)
 
     case Registry.resolve_dependency(registry, app, declaration.provider, consumer_repository) do
-      {:ok, project} -> {:ok, project}
-      {:known_unselected, _project_ids} -> :known_unselected
-      :unknown -> :no_catalogued_provider
-      {:error, reason} -> {:error, reason}
+      {:ok, project} ->
+        {:ok, project}
+
+      {:known_unselected, [project_id]} ->
+        {:known_unselected, Registry.project!(registry, project_id)}
+
+      :unknown ->
+        :no_catalogued_provider
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -861,6 +885,9 @@ defmodule MixWorkspaceOps.Resolution do
 
       {:error, error} ->
         {:error, error}
+
+      {:known_unselected, project} ->
+        {:error, {:known_unselected_local, app, [project.id]}}
 
       _unavailable ->
         {:error, {:unavailable_source, app, @local, reason}}
@@ -940,7 +967,7 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   defp catalogued_coordinates(registry, app, declaration, pin?, opts) do
-    with {:ok, project} <- provider(registry, app, declaration, opts),
+    with {:ok, project} <- provider_project(provider(registry, app, declaration, opts)),
          repository = Registry.repository!(registry, project.repository),
          true <- is_binary(repository.github) do
       coordinates = %{
@@ -956,6 +983,10 @@ defmodule MixWorkspaceOps.Resolution do
       _uncatalogued -> nil
     end
   end
+
+  defp provider_project({:ok, project}), do: {:ok, project}
+  defp provider_project({:known_unselected, project}), do: {:ok, project}
+  defp provider_project(_outcome), do: :unavailable
 
   defp maybe_pin(nil, _registry, _app, _declaration, _opts), do: nil
 
@@ -1016,6 +1047,7 @@ defmodule MixWorkspaceOps.Resolution do
 
     %{
       application: app,
+      classification: :managed,
       source: source,
       reason: reason,
       considered: considered,
@@ -1090,8 +1122,12 @@ defmodule MixWorkspaceOps.Resolution do
              declaration,
              Keyword.put(opts, :consumer_repository, consumer_repository)
            ) do
-        {:ok, decision} -> {:ok, %{decision | declared_by: declared_by}}
-        {:error, reason} -> {:error, reason}
+        {:ok, decision} ->
+          classification = dependency_classification(closure, app)
+          {:ok, %{decision | declared_by: declared_by, classification: classification}}
+
+        {:error, reason} ->
+          {:error, reason}
       end
     end)
     |> collect(Keyword.get(opts, :mode))
@@ -1130,23 +1166,17 @@ defmodule MixWorkspaceOps.Resolution do
   # that nothing would ever consume — and a publish order of `hex` with no
   # requirement, which can never complete.
   defp applications(declarations, closure) do
-    projects = Map.new(closure.projects, &{&1.id, &1})
-
-    depended =
-      closure.edges
-      |> Enum.flat_map(fn {_consumer, dependency_id} ->
-        case Map.fetch(projects, dependency_id) do
-          {:ok, project} -> project.provides
-          :error -> []
-        end
-      end)
-
-    external = Enum.map(closure.external_dependencies, &elem(&1, 1))
-
-    (depended ++ external)
+    closure.dependency_applications
+    |> Enum.map(& &1.application)
     |> Enum.filter(&Map.has_key?(declarations, &1))
     |> Enum.uniq()
     |> Enum.sort()
+  end
+
+  defp dependency_classification(closure, app) do
+    closure.dependency_applications
+    |> Enum.find(&(&1.application == app))
+    |> Map.fetch!(:classification)
   end
 
   defp declarations(registry, target, closure) do

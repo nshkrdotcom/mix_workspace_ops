@@ -274,6 +274,7 @@ defmodule MixWorkspaceOps.CLI do
          publish: decided.publish?,
          projects: Enum.map(resolution.projects, & &1.id),
          edges: resolution.edges,
+         dependency_applications: resolution.dependency_applications,
          external_dependencies: resolution.external_dependencies,
          known_unselected: known_unselected(resolution),
          sources: Resolution.sources(decided)

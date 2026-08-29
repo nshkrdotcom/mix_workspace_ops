@@ -869,6 +869,7 @@ defmodule MixWorkspaceOps.ResolutionTest do
 
       assert local == %{
                application: "core",
+               classification: :managed,
                source: "local",
                reason: :order,
                considered: [

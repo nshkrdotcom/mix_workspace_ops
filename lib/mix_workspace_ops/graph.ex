@@ -15,9 +15,18 @@ defmodule MixWorkspaceOps.Graph do
   @type resolution :: %{
           projects: [Registry.project()],
           edges: [{String.t(), String.t()}],
+          dependency_applications: [dependency_application()],
           external_dependencies: [{String.t(), String.t()}],
           known_unselected: [{String.t(), String.t(), [String.t()]}],
           digest: String.t()
+        }
+
+  @type dependency_application :: %{
+          consumer: String.t(),
+          application: String.t(),
+          classification: :managed | :known_unselected | :external,
+          provider: String.t() | nil,
+          candidates: [String.t()]
         }
 
   @spec resolve(Registry.t(), String.t() | atom(), keyword()) ::
@@ -32,6 +41,7 @@ defmodule MixWorkspaceOps.Graph do
       visited: MapSet.new(),
       ordered: [],
       edges: [],
+      dependency_applications: [],
       external: [],
       known_unselected: []
     }
@@ -40,6 +50,12 @@ defmodule MixWorkspaceOps.Graph do
          {:ok, final} <- visit_seeds(registry, seeds, reader, state) do
       projects = Enum.reverse(final.ordered)
       edges = final.edges |> Enum.uniq() |> Enum.sort()
+
+      dependency_applications =
+        final.dependency_applications
+        |> Enum.uniq()
+        |> Enum.sort_by(&{&1.consumer, &1.application})
+
       external = final.external |> Enum.uniq() |> Enum.sort()
       known_unselected = final.known_unselected |> Enum.uniq() |> Enum.sort()
 
@@ -47,9 +63,10 @@ defmodule MixWorkspaceOps.Graph do
        %{
          projects: projects,
          edges: edges,
+         dependency_applications: dependency_applications,
          external_dependencies: external,
          known_unselected: known_unselected,
-         digest: digest(projects, edges, external, known_unselected)
+         digest: digest(projects, edges, dependency_applications, external, known_unselected)
        }}
     end
   rescue
@@ -144,7 +161,14 @@ defmodule MixWorkspaceOps.Graph do
 
     case Registry.resolve_dependency(registry, dependency_app, provider, project.repository) do
       {:ok, dependency} ->
-        reduce_managed_dependency(registry, project, dependency, reader, current)
+        reduce_managed_dependency(
+          registry,
+          project,
+          dependency_app,
+          dependency,
+          reader,
+          current
+        )
 
       {:known_unselected, candidates} ->
         reduce_known_unselected(project, dependency_app, candidates, current)
@@ -160,8 +184,22 @@ defmodule MixWorkspaceOps.Graph do
     end
   end
 
-  defp reduce_managed_dependency(registry, project, dependency, reader, current) do
-    current = %{current | edges: [{project.id, dependency.id} | current.edges]}
+  defp reduce_managed_dependency(
+         registry,
+         project,
+         dependency_app,
+         dependency,
+         reader,
+         current
+       ) do
+    application =
+      dependency_application(project, dependency_app, :managed, dependency.id, [])
+
+    current = %{
+      current
+      | edges: [{project.id, dependency.id} | current.edges],
+        dependency_applications: [application | current.dependency_applications]
+    }
 
     case visit(registry, dependency.id, reader, current) do
       {:ok, next} -> {:cont, {:ok, next}}
@@ -170,7 +208,14 @@ defmodule MixWorkspaceOps.Graph do
   end
 
   defp reduce_external_dependency(project, dependency_app, current) do
-    next = %{current | external: [{project.id, dependency_app} | current.external]}
+    application = dependency_application(project, dependency_app, :external, nil, [])
+
+    next = %{
+      current
+      | external: [{project.id, dependency_app} | current.external],
+        dependency_applications: [application | current.dependency_applications]
+    }
+
     {:cont, {:ok, next}}
   end
 
@@ -180,13 +225,49 @@ defmodule MixWorkspaceOps.Graph do
   # Hex package.
   defp reduce_known_unselected(project, dependency_app, candidates, current) do
     entry = {project.id, dependency_app, candidates}
-    {:cont, {:ok, %{current | known_unselected: [entry | current.known_unselected]}}}
+
+    application =
+      dependency_application(
+        project,
+        dependency_app,
+        :known_unselected,
+        List.first(candidates),
+        candidates
+      )
+
+    next = %{
+      current
+      | known_unselected: [entry | current.known_unselected],
+        dependency_applications: [application | current.dependency_applications]
+    }
+
+    {:cont, {:ok, next}}
   end
 
-  defp digest(projects, edges, external, known_unselected) do
+  defp dependency_application(project, application, classification, provider, candidates) do
+    %{
+      consumer: project.id,
+      application: application,
+      classification: classification,
+      provider: provider,
+      candidates: candidates
+    }
+  end
+
+  defp digest(projects, edges, dependency_applications, external, known_unselected) do
     :json.encode(%{
       projects: Enum.map(projects, & &1.id),
       edges: Enum.map(edges, &Tuple.to_list/1),
+      dependency_applications:
+        Enum.map(dependency_applications, fn dependency ->
+          %{
+            consumer: dependency.consumer,
+            application: dependency.application,
+            classification: Atom.to_string(dependency.classification),
+            provider: dependency.provider,
+            candidates: dependency.candidates
+          }
+        end),
       external_dependencies: Enum.map(external, &Tuple.to_list/1),
       known_unselected:
         Enum.map(known_unselected, fn {consumer, app, candidates} ->

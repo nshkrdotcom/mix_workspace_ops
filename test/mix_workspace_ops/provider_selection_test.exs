@@ -310,6 +310,51 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
     assert resolution.known_unselected == []
   end
 
+  test "records the dependency application instead of inferring every application a project provides",
+       context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "consumer"))
+    initialize_repository!(Path.join(root, "provider"))
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("consumer",
+          projects: [catalog_project("consumer")],
+          dependency_sources: %{"shared" => %{"hex" => "~> 1.0"}}
+        ),
+        catalog_repository("provider",
+          projects: [
+            catalog_project("provider.bundle",
+              app: nil,
+              provides: ["compat", "shared"]
+            )
+          ]
+        )
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    reader = fn project -> {:ok, if(project.id == "consumer", do: ["shared"], else: [])} end
+
+    assert {:ok, graph} = Graph.resolve(registry, "consumer", dependency_reader: reader)
+
+    assert graph.dependency_applications == [
+             %{
+               consumer: "consumer",
+               application: "shared",
+               classification: :managed,
+               provider: "provider.bundle",
+               candidates: []
+             }
+           ]
+
+    assert {:ok, report} =
+             Resolution.resolve(registry, "consumer", dependency_reader: reader)
+
+    assert Enum.map(report.decisions, & &1.application) == ["shared"]
+  end
+
   # A pruned catalog could change which project an application resolved to,
   # because the current schema permits several projects to provide one and
   # pruning removes candidates from the index the resolver reads. Selection

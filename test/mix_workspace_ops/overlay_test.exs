@@ -205,6 +205,49 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert [%{reason: :dependency_override}] = activation.report.decisions
   end
 
+  test "known-unselected stays on a committed source until a new selection permits local",
+       context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    initialize_repository!(Path.join(root, "core"))
+    initialize_repository!(Path.join(root, "consumer"), ~s([{:core, path: "../core"}]))
+
+    registry = registry(root)
+
+    selected =
+      Registry.select(registry, [Registry.project!(registry, "consumer")])
+
+    assert {:ok, report} = MixWorkspaceOps.Resolution.resolve(selected, "consumer")
+
+    assert [decision] = report.decisions
+    assert decision.application == "core"
+    assert decision.classification == :known_unselected
+    assert decision.provider_project_id == "core"
+    assert decision.source == "github"
+    assert decision.location.repo == "example-org/core"
+
+    assert {:ok, activation} =
+             Overlay.activate(selected, "consumer", state_root: state_root)
+
+    assert {:ok, overlay} = Overlay.read(activation.path)
+    assert overlay.sources["core"].kind == :github
+    assert activation.report.known_unselected == [{"consumer", "core", ["core"]}]
+
+    assert {:error, {:known_unselected_local, "core", ["core"]}} =
+             MixWorkspaceOps.Resolution.resolve(selected, "consumer", mode: "local")
+
+    permitted =
+      Registry.select(registry, [
+        Registry.project!(registry, "consumer"),
+        Registry.project!(registry, "core")
+      ])
+
+    assert {:ok, permitted_report} =
+             MixWorkspaceOps.Resolution.resolve(permitted, "consumer")
+
+    assert [%{classification: :managed, source: "local"}] = permitted_report.decisions
+  end
+
   test "publish resolution is recorded in the overlay it produces", context do
     root = temporary_directory!(context)
     state_root = Path.join(root, "operator-state")

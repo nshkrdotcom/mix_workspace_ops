@@ -127,6 +127,7 @@ defmodule MixWorkspaceOps.Overlay do
            runtime: runtime.report,
            projects: Enum.map(resolution.projects, & &1.id),
            edges: resolution.edges,
+           dependency_applications: resolution.dependency_applications,
            external_dependencies: resolution.external_dependencies,
            known_unselected: resolution.known_unselected,
            decisions: Enum.map(decided.decisions, &reported_decision/1),
@@ -406,6 +407,7 @@ defmodule MixWorkspaceOps.Overlay do
   defp reported_decision(decision) do
     %{
       application: decision.application,
+      classification: decision.classification,
       source: decision.source,
       reason: decision.reason,
       considered: decision.considered,
