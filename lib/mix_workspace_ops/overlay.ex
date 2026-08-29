@@ -71,7 +71,7 @@ defmodule MixWorkspaceOps.Overlay do
     state_root = Keyword.get_lazy(opts, :state_root, &default_state_root/0)
 
     with :ok <- known_mode(mode),
-         {:ok, resolution} <- Graph.resolve(registry, target),
+         {:ok, resolution} <- Graph.resolve(registry, target, opts),
          {:ok, decided} <- decide(registry, target, resolution, mode, opts),
          {:ok, attributed} <- source_rows(decided),
          rows <- Enum.map(attributed, &elem(&1, 1)),

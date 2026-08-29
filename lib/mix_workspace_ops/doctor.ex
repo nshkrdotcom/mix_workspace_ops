@@ -12,15 +12,18 @@ defmodule MixWorkspaceOps.Doctor do
   """
 
   alias MixWorkspaceOps.{Binding, Git, Project, Registry}
+  alias MixWorkspaceOps.Project.ProbeMemo
 
   @spec inspect(Registry.t()) :: map()
   def inspect(registry) do
     catalogued = Binding.catalogued_identities(registry)
+    projects = registry |> Registry.selected_repositories() |> Enum.flat_map(& &1.projects)
+    metadata = registry |> Project.prewarm(projects, ProbeMemo.new()) |> Map.new()
 
     repositories =
       registry
       |> Registry.selected_repositories()
-      |> Enum.map(&inspect_repository(registry, &1, catalogued))
+      |> Enum.map(&inspect_repository(registry, &1, catalogued, metadata))
 
     checks = Enum.flat_map(repositories, & &1.checks)
 
@@ -34,9 +37,9 @@ defmodule MixWorkspaceOps.Doctor do
     }
   end
 
-  defp inspect_repository(registry, repository, catalogued) do
+  defp inspect_repository(registry, repository, catalogued, metadata) do
     case Registry.checkout(registry, repository) do
-      {:bound, root} -> inspect_bound_repository(registry, repository, root, catalogued)
+      {:bound, root} -> inspect_bound_repository(registry, repository, root, catalogued, metadata)
       {:absent, expected} -> absent_repository(repository, expected)
       :unknown -> absent_repository(repository, nil)
     end
@@ -58,8 +61,8 @@ defmodule MixWorkspaceOps.Doctor do
     }
   end
 
-  defp inspect_bound_repository(registry, repository, root, catalogued) do
-    projects = Enum.map(repository.projects, &inspect_project(registry, &1))
+  defp inspect_bound_repository(registry, repository, root, catalogued, metadata) do
+    projects = Enum.map(repository.projects, &inspect_project(registry, &1, metadata))
 
     checks =
       [
@@ -94,11 +97,11 @@ defmodule MixWorkspaceOps.Doctor do
       }
   end
 
-  defp inspect_project(registry, project) do
+  defp inspect_project(registry, project, metadata) do
     root = Registry.project_root(registry, project)
 
     metadata_check =
-      case Project.metadata(registry, project) do
+      case Map.fetch!(metadata, project.id) do
         {:ok, metadata} -> check(:mix_identity, metadata.app == project.app, metadata)
         {:error, reason} -> check(:mix_identity, false, reason)
       end

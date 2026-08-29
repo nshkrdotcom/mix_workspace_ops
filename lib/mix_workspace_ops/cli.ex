@@ -16,6 +16,7 @@ defmodule MixWorkspaceOps.CLI do
 
   alias MixWorkspaceOps.Registry.{Examples, ReleaseChain}
   alias MixWorkspaceOps.Release.{Descriptor, LocalAdapter, Transaction}
+  alias MixWorkspaceOps.Project.ProbeMemo
 
   @usage """
   mix_workspace_ops <command>
@@ -297,7 +298,11 @@ defmodule MixWorkspaceOps.CLI do
          :ok <- require_option(options, :project),
          {:ok, registry} <- load_bound_registry(options),
          :ok <- ensure_project_in_view(registry, options),
-         {:ok, decided} <- Resolution.resolve(registry, options.project, publish?: true),
+         {:ok, decided} <-
+           Resolution.resolve(registry, options.project,
+             publish?: true,
+             probe_memo: ProbeMemo.new()
+           ),
          {:ok, lines} <- Resolution.seam_lines(decided) do
       {:ok,
        %{
@@ -332,6 +337,7 @@ defmodule MixWorkspaceOps.CLI do
           sources: sources,
           publish?: PublishMode.publish?(PublishMode.task_argv(command)),
           mix_state: mix_state,
+          probe_memo: ProbeMemo.new(),
           state_root: options.state_root
         ],
         fn source_report, env -> run_command(command, project_root, source_report, env) end
@@ -357,11 +363,13 @@ defmodule MixWorkspaceOps.CLI do
          {:ok, mode} <- source_mode(options.mode),
          {:ok, sources} <- source_overrides(options.source),
          {:ok, publish?} <- publish_option(Map.get(options, :as_publish)),
+         memo <- ProbeMemo.new(),
          {:ok, decided} <-
            Resolution.resolve(registry, options.project,
              mode: resolution_mode(mode),
              sources: sources,
-             publish?: publish?
+             publish?: publish?,
+             probe_memo: memo
            ) do
       {:ok, registry, decided}
     end

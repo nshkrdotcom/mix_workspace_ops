@@ -10,6 +10,7 @@ defmodule MixWorkspaceOps.Project do
   """
 
   alias MixWorkspaceOps.{Command, Registry}
+  alias MixWorkspaceOps.Project.ProbeMemo
 
   @marker "__MIX_WORKSPACE_OPS_METADATA__"
   @maximum_mix_bytes 1024 * 1024
@@ -36,11 +37,19 @@ defmodule MixWorkspaceOps.Project do
   IO.puts("#{@marker}" <> app <> "\t" <> version <> "\t" <> Enum.join(dependencies, ","))
   """
 
-  @spec metadata(Registry.t(), Registry.project()) :: {:ok, map()} | {:error, term()}
-  def metadata(registry, project) do
+  @type probe_options :: [
+          probe_memo: ProbeMemo.t(),
+          mix_env: String.t(),
+          mix_target: String.t() | nil,
+          toolchain: term()
+        ]
+
+  @spec metadata(Registry.t(), Registry.project(), probe_options()) ::
+          {:ok, map()} | {:error, term()}
+  def metadata(registry, project, opts \\ []) do
     project_root = Registry.project_root(registry, project)
 
-    case metadata_at(project_root) do
+    case metadata_at(project_root, opts) do
       {:ok, %{app: app} = metadata} when app == project.app ->
         {:ok, metadata}
 
@@ -52,10 +61,64 @@ defmodule MixWorkspaceOps.Project do
     end
   end
 
-  @spec metadata_at(String.t()) :: {:ok, map()} | {:error, term()}
-  def metadata_at(project_root) do
+  @spec metadata_at(String.t(), probe_options()) :: {:ok, map()} | {:error, term()}
+  def metadata_at(project_root, opts \\ []) do
     project_root = Path.expand(project_root)
+    mix_env = Keyword.get(opts, :mix_env, "dev")
+    mix_target = Keyword.get_lazy(opts, :mix_target, fn -> System.get_env("MIX_TARGET") end)
 
+    with {:ok, key} <- probe_key(project_root, mix_env, mix_target, opts) do
+      question = fn -> evaluate_at(project_root, mix_env, mix_target) end
+
+      case Keyword.get(opts, :probe_memo) do
+        nil -> question.()
+        memo -> ProbeMemo.fetch(memo, key, question)
+      end
+    end
+  end
+
+  @doc "Returns the complete identity of one metadata-probe question."
+  @spec probe_key(String.t(), probe_options()) :: {:ok, term()} | {:error, term()}
+  def probe_key(project_root, opts \\ []) do
+    project_root = Path.expand(project_root)
+    mix_env = Keyword.get(opts, :mix_env, "dev")
+    mix_target = Keyword.get_lazy(opts, :mix_target, fn -> System.get_env("MIX_TARGET") end)
+    probe_key(project_root, mix_env, mix_target, opts)
+  end
+
+  @doc "Warms one invocation memo concurrently for a known project list."
+  @spec prewarm(Registry.t(), [Registry.project()], ProbeMemo.t(), keyword()) ::
+          [{String.t(), {:ok, map()} | {:error, term()}}]
+  def prewarm(registry, projects, memo, opts \\ []) do
+    max_concurrency = Keyword.get(opts, :max_concurrency, min(System.schedulers_online(), 8))
+    probe_opts = Keyword.put(opts, :probe_memo, memo)
+
+    projects
+    |> Task.async_stream(
+      fn project -> {project.id, metadata(registry, project, probe_opts)} end,
+      max_concurrency: max_concurrency,
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.map(fn {:ok, result} -> result end)
+  end
+
+  defp probe_key(project_root, mix_env, mix_target, opts) do
+    path = Path.join(project_root, "mix.exs")
+
+    with :ok <- readable(path), {:ok, bytes} <- File.read(path) do
+      digest = :crypto.hash(:sha256, bytes)
+      toolchain = Keyword.get_lazy(opts, :toolchain, &toolchain/0)
+      {:ok, {digest, mix_env, mix_target, toolchain}}
+    end
+  end
+
+  defp toolchain do
+    mix_version = :mix |> Application.spec(:vsn) |> to_string()
+    {System.version(), List.to_string(:erlang.system_info(:otp_release)), mix_version}
+  end
+
+  defp evaluate_at(project_root, mix_env, mix_target) do
     case Command.run(
            "timeout",
            [
@@ -67,7 +130,8 @@ defmodule MixWorkspaceOps.Project do
            ],
            cd: project_root,
            env: [
-             {"MIX_ENV", "dev"},
+             {"MIX_ENV", mix_env},
+             {"MIX_TARGET", mix_target},
              {"MIX_WORKSPACE_OPS_BOOTSTRAP", nil},
              {"MIX_WORKSPACE_OPS_CONTEXT_DIGEST", nil},
              {"MIX_WORKSPACE_OPS_LOCKFILE", nil},
@@ -149,8 +213,8 @@ defmodule MixWorkspaceOps.Project do
   defp version_literal(_value, _attributes), do: nil
 
   @spec dependencies(Registry.t(), Registry.project()) :: {:ok, [String.t()]} | {:error, term()}
-  def dependencies(registry, project) do
-    case metadata(registry, project) do
+  def dependencies(registry, project, opts \\ []) do
+    case metadata(registry, project, opts) do
       {:ok, metadata} -> {:ok, metadata.dependencies}
       {:error, reason} -> {:error, reason}
     end

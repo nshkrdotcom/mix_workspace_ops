@@ -2,6 +2,7 @@ defmodule MixWorkspaceOps.ProjectTest do
   use MixWorkspaceOps.WorkspaceCase, async: true
 
   alias MixWorkspaceOps.Project
+  alias MixWorkspaceOps.Project.ProbeMemo
 
   test "reads mix metadata without evaluating runtime configuration", context do
     root = temporary_directory!(context)
@@ -31,6 +32,71 @@ defmodule MixWorkspaceOps.ProjectTest do
     assert metadata.app == nil
     assert metadata.version == "0.1.0"
     assert metadata.dependencies == ["jason"]
+  end
+
+  test "one invocation evaluates an unchanged metadata question once", context do
+    root = temporary_directory!(context)
+    repository = Path.join(root, "alpha")
+    counter = Path.join(root, "probes")
+    File.mkdir_p!(repository)
+
+    File.write!(Path.join(repository, "mix.exs"), instrumented_mix(counter, "0.1.0"))
+    memo = ProbeMemo.new()
+
+    assert {:ok, _metadata} = Project.metadata_at(repository, probe_memo: memo)
+    assert {:ok, _metadata} = Project.metadata_at(repository, probe_memo: memo)
+    assert File.read!(counter) == "x"
+
+    File.write!(Path.join(repository, "mix.exs"), instrumented_mix(counter, "0.2.0"))
+    assert {:ok, %{version: "0.2.0"}} = Project.metadata_at(repository, probe_memo: memo)
+    assert File.read!(counter) == "xx"
+  end
+
+  test "environment, target, and toolchain are part of the probe key", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "alpha"))
+
+    {:ok, base} = Project.probe_key(repository, mix_env: "dev", mix_target: nil)
+    {:ok, env} = Project.probe_key(repository, mix_env: "test", mix_target: nil)
+    {:ok, target} = Project.probe_key(repository, mix_env: "dev", mix_target: "host")
+    {:ok, toolchain} = Project.probe_key(repository, toolchain: {"future", "otp", "mix"})
+
+    refute base == env
+    refute base == target
+    refute base == toolchain
+  end
+
+  test "a later invocation owns no answers from the earlier one", context do
+    root = temporary_directory!(context)
+    repository = Path.join(root, "alpha")
+    counter = Path.join(root, "probes")
+    File.mkdir_p!(repository)
+    File.write!(Path.join(repository, "mix.exs"), instrumented_mix(counter, "0.1.0"))
+
+    assert {:ok, _metadata} =
+             Project.metadata_at(repository, probe_memo: ProbeMemo.new())
+
+    assert {:ok, _metadata} =
+             Project.metadata_at(repository, probe_memo: ProbeMemo.new())
+
+    assert File.read!(counter) == "xx"
+  end
+
+  test "bounded concurrent pre-warm shares one question", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "alpha"))
+    counter = Path.join(root, "probes")
+    File.write!(Path.join(repository, "mix.exs"), instrumented_mix(counter, "0.1.0"))
+    registry = load_fixture_registry!(root)
+    project = registry.projects["alpha"]
+    memo = ProbeMemo.new()
+
+    assert [{"alpha", {:ok, _first}}, {"alpha", {:ok, _second}}] =
+             registry
+             |> Project.prewarm([project, project], memo, max_concurrency: 2)
+             |> Enum.sort()
+
+    assert File.read!(counter) == "x"
   end
 
   describe "declared_version/1" do
@@ -93,5 +159,23 @@ defmodule MixWorkspaceOps.ProjectTest do
       File.write!(Path.join(repository, "mix.exs"), "defmodule Alpha do\n")
       assert {:error, {:unparsable_mix_exs, _path}} = Project.declared_version(repository)
     end
+  end
+
+  defp instrumented_mix(counter, version) do
+    """
+    File.write!(#{inspect(counter)}, "x", [:append])
+
+    defmodule Alpha.MixProject do
+      use Mix.Project
+      def project, do: [app: :alpha, version: #{inspect(version)}, deps: []]
+    end
+    """
+  end
+
+  defp load_fixture_registry!(root) do
+    registry_path = write_registry!(root, [repository("alpha", [project("alpha")])])
+    {:ok, registry} = MixWorkspaceOps.Registry.load(registry_path)
+    {:ok, registry} = MixWorkspaceOps.Registry.bind(registry, root)
+    registry
   end
 end

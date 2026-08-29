@@ -24,7 +24,7 @@ defmodule MixWorkspaceOps.Graph do
           {:ok, resolution()} | {:error, term()}
   def resolve(registry, target, opts \\ []) do
     target = to_string(target)
-    reader = Keyword.get(opts, :dependency_reader, &Project.dependencies(registry, &1))
+    reader = Keyword.get(opts, :dependency_reader, &Project.dependencies(registry, &1, opts))
     seeds = seed_projects(registry, target)
 
     state = %{
