@@ -385,13 +385,17 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(["state", "list" | args]) do
-    with {:ok, options, []} <- options(["state", "list"], args) do
-      Runtime.list(options.state_root)
-    else
+    case options(["state", "list"], args) do
+      {:ok, options, []} ->
+        Runtime.list(options.state_root)
+
       {:ok, _options, positional} ->
         {:usage_error, "state list expects no arguments, got #{inspect(positional)}"}
 
-      error ->
+      {:error, _reason} = error ->
+        error
+
+      {:usage_error, _reason} = error ->
         error
     end
   end

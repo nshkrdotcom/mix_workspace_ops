@@ -4,7 +4,7 @@ defmodule MixWorkspaceOps.RuntimeTest do
   alias MixWorkspaceOps.Runtime
 
   @cache_identity String.duplicate("a", 64)
-  @lock "%{\"alpha\" => {:hex, :alpha, \"1.0.0\"}}\n"
+  @lock ~S|%{"alpha" => {:hex, :alpha, "1.0.0"}}| <> "\n"
 
   test "concurrent identical invocations share identities and no writable path", context do
     state_root = temporary_directory!(context)

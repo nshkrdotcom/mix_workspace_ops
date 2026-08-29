@@ -89,18 +89,13 @@ defmodule MixWorkspaceOps.Overlay do
          context <-
            context_contents(registry, decided, target_project, attributed, lock_bytes),
          context_digest <- digest(context),
-         contents <-
-           contents(
-             registry,
-             decided,
-             mode,
-             resolution,
-             rows,
-             target_head,
-             target_source_digest,
-             lock_bytes,
-             context_digest
-           ),
+         target_state <- %{
+           head: target_head,
+           source_digest: target_source_digest,
+           lock_bytes: lock_bytes,
+           context_digest: context_digest
+         },
+         contents <- contents(registry, decided, mode, resolution, rows, target_state),
          overlay_digest <- digest(contents),
          {:ok, path} <- materialize(state_root, overlay_digest, contents),
          {:ok, bootstrap_path} <- Bootstrap.materialize(state_root),
@@ -324,17 +319,7 @@ defmodule MixWorkspaceOps.Overlay do
     end
   end
 
-  defp contents(
-         registry,
-         decided,
-         mode,
-         resolution,
-         rows,
-         target_head,
-         target_source_digest,
-         lock_bytes,
-         context_digest
-       ) do
+  defp contents(registry, decided, mode, resolution, rows, target_state) do
     metadata = [
       @header,
       "registry_digest\t#{registry.digest}",
@@ -342,13 +327,13 @@ defmodule MixWorkspaceOps.Overlay do
       "graph_digest\t#{resolution.digest}",
       "mix_env\t#{resolution.mix_env}",
       "mix_target\t#{resolution.mix_target}",
-      "context_digest\t#{context_digest}",
+      "context_digest\t#{target_state.context_digest}",
       "target\t#{decided.target}",
       "mode\t#{mode}",
       "publish\t#{decided.publish?}",
-      "target_head\t#{target_head}",
-      "target_source_digest\t#{target_source_digest}",
-      "lock_digest\t#{digest(lock_bytes)}",
+      "target_head\t#{target_state.head}",
+      "target_source_digest\t#{target_state.source_digest}",
+      "lock_digest\t#{digest(target_state.lock_bytes)}",
       "toolchain\telixir-#{System.version()}-otp-#{:erlang.system_info(:otp_release)}"
     ]
 
@@ -659,18 +644,16 @@ defmodule MixWorkspaceOps.Overlay do
   end
 
   defp execute_activation(activation, function) do
-    try do
-      result = function.(activation.report, activation.env)
+    result = function.(activation.report, activation.env)
 
-      case deactivate(activation) do
-        {:ok, runtime_report} -> attach_runtime(result, runtime_report)
-        {:error, reason} -> {:error, reason}
-      end
-    catch
-      kind, reason ->
-        deactivate(activation)
-        :erlang.raise(kind, reason, __STACKTRACE__)
+    case deactivate(activation) do
+      {:ok, runtime_report} -> attach_runtime(result, runtime_report)
+      {:error, reason} -> {:error, reason}
     end
+  catch
+    kind, reason ->
+      deactivate(activation)
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
   defp attach_runtime({:ok, %{source: source} = result}, runtime_report)

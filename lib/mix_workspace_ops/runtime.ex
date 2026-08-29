@@ -15,6 +15,20 @@ defmodule MixWorkspaceOps.Runtime do
   @list_schema "mix_workspace_ops.state_list/v1"
   @gc_schema "mix_workspace_ops.state_gc/v1"
   @attempts 10
+  @report_path_keys %{
+    "root" => :root,
+    "home" => :home,
+    "mix_home" => :mix_home,
+    "archives" => :archives,
+    "hex_home" => :hex_home,
+    "rebar_cache" => :rebar_cache,
+    "tmp" => :tmp,
+    "config_home" => :config_home,
+    "source_lock" => :source_lock,
+    "deps_path" => :deps_path,
+    "build_root" => :build_root,
+    "lockfile" => :lockfile
+  }
   @publication_credentials ~w(
     GH_TOKEN
     GH_ENTERPRISE_TOKEN
@@ -305,9 +319,8 @@ defmodule MixWorkspaceOps.Runtime do
     else
       with :ok <- File.mkdir_p(state_root),
            :ok <- File.chmod(state_root, 0o700),
-           :ok <- write_marker(marker),
-           :ok <- mkdir_private(Path.join(state_root, "runs")) do
-        :ok
+           :ok <- write_marker(marker) do
+        mkdir_private(Path.join(state_root, "runs"))
       end
     end
   end
@@ -425,9 +438,8 @@ defmodule MixWorkspaceOps.Runtime do
   defp copy_archives(destination, source) do
     with :ok <- validate_archive_tree(source),
          {:ok, names} <- list_archives(source),
-         :ok <- copy_archive_entries(names, source, destination),
-         :ok <- validate_archive_tree(destination) do
-      :ok
+         :ok <- copy_archive_entries(names, source, destination) do
+      validate_archive_tree(destination)
     end
   end
 
@@ -457,14 +469,7 @@ defmodule MixWorkspaceOps.Runtime do
         :ok
 
       {:ok, %{type: :directory}} ->
-        with {:ok, names} <- File.ls(path) do
-          Enum.reduce_while(names, :ok, fn name, :ok ->
-            case validate_archive_tree(Path.join(path, name)) do
-              :ok -> {:cont, :ok}
-              error -> {:halt, error}
-            end
-          end)
-        end
+        validate_archive_directory(path)
 
       {:ok, %{type: type}} ->
         {:error, {:unsafe_runtime_archive_entry, path, type}}
@@ -475,6 +480,22 @@ defmodule MixWorkspaceOps.Runtime do
       {:error, reason} ->
         {:error, {:runtime_archives, reason}}
     end
+  end
+
+  defp validate_archive_directory(path) do
+    case File.ls(path) do
+      {:ok, names} -> validate_archive_entries(names, path)
+      {:error, reason} -> {:error, {:runtime_archives, reason}}
+    end
+  end
+
+  defp validate_archive_entries(names, path) do
+    Enum.reduce_while(names, :ok, fn name, :ok ->
+      case validate_archive_tree(Path.join(path, name)) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
   end
 
   defp runtime_environment(handle, paths) do
@@ -601,23 +622,7 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   defp path_key(key) when is_atom(key), do: key
-
-  defp path_key(key) when is_binary(key) do
-    case key do
-      "root" -> :root
-      "home" -> :home
-      "mix_home" -> :mix_home
-      "archives" -> :archives
-      "hex_home" -> :hex_home
-      "rebar_cache" -> :rebar_cache
-      "tmp" -> :tmp
-      "config_home" -> :config_home
-      "source_lock" -> :source_lock
-      "deps_path" -> :deps_path
-      "build_root" -> :build_root
-      "lockfile" -> :lockfile
-    end
-  end
+  defp path_key(key) when is_binary(key), do: Map.fetch!(@report_path_keys, key)
 
   defp final_lock_digest(%{lockfile: nil, source_lock_digest: digest}), do: {:ok, digest}
 
@@ -767,26 +772,27 @@ defmodule MixWorkspaceOps.Runtime do
         ordinary_directory?(Path.dirname(root)) and ordinary_directory?(root) and
         ordinary_regular?(Path.join(root, "runtime.json"))
 
-    if safe? do
-      case lease_status(Path.join(root, "lease.json")) do
-        {:ok, %{active: true}} ->
-          :leased
+    if safe?,
+      do: remove_unleased_run(root),
+      else: {:error, {:unsafe_runtime_gc_target, root}}
+  end
 
-        {:ok, %{active: false}} ->
-          case File.rm_rf(root) do
-            {:ok, _removed} ->
-              File.rmdir(Path.dirname(root))
-              :ok
+  defp remove_unleased_run(root) do
+    case lease_status(Path.join(root, "lease.json")) do
+      {:ok, %{active: true}} -> :leased
+      {:ok, %{active: false}} -> remove_run_directory(root)
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-            {:error, reason, path} ->
-              {:error, {:runtime_gc, path, reason}}
-          end
+  defp remove_run_directory(root) do
+    case File.rm_rf(root) do
+      {:ok, _removed} ->
+        File.rmdir(Path.dirname(root))
+        :ok
 
-        {:error, reason} ->
-          {:error, reason}
-      end
-    else
-      {:error, {:unsafe_runtime_gc_target, root}}
+      {:error, reason, path} ->
+        {:error, {:runtime_gc, path, reason}}
     end
   end
 
