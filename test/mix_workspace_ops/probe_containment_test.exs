@@ -2,7 +2,7 @@ defmodule MixWorkspaceOps.ProbeContainmentTest do
   use MixWorkspaceOps.WorkspaceCase, async: false
 
   alias MixWorkspaceOps.Project
-  alias MixWorkspaceOps.Project.ProbeMemo
+  alias MixWorkspaceOps.Project.{ProbeMemo, ProbeTree}
 
   @sensitive_environment ~w(
     AWS_SECRET_ACCESS_KEY
@@ -66,6 +66,49 @@ defmodule MixWorkspaceOps.ProbeContainmentTest do
     refute File.exists?(staged_project)
   end
 
+  test "internal symlinks are remapped into the disposable tree", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "alpha"))
+    helper = Path.join(repository, "helper")
+    File.write!(helper, "original")
+    File.ln_s!(helper, Path.join(repository, "linked_helper"))
+    File.write!(Path.join(repository, "mix.exs"), symlink_mix())
+
+    assert {:ok, %{app: "alpha", version: "changed"}} = Project.metadata_at(repository)
+    assert File.read!(helper) == "original"
+
+    File.rm!(Path.join(repository, "linked_helper"))
+    File.ln_s!("helper", Path.join(repository, "linked_helper"))
+
+    assert {:ok, %{app: "alpha", version: "changed"}} = Project.metadata_at(repository)
+    assert File.read!(helper) == "original"
+  end
+
+  test "the disposable source tree has a private parent", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "alpha"))
+    assert {:ok, stage} = ProbeTree.stage(repository)
+    on_exit(fn -> ProbeTree.cleanup(stage) end)
+
+    assert Bitwise.band(File.stat!(stage.root).mode, 0o777) == 0o700
+  end
+
+  test "permission-only source changes invalidate the invocation memo", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "alpha"))
+    helper = Path.join(repository, "helper")
+    File.write!(helper, "same bytes")
+    File.chmod!(helper, 0o600)
+    File.write!(Path.join(repository, "mix.exs"), permission_mix())
+    memo = ProbeMemo.new()
+
+    assert {:ok, %{version: "plain"}} = Project.metadata_at(repository, probe_memo: memo)
+    File.chmod!(helper, 0o700)
+
+    assert {:ok, %{version: "executable"}} =
+             Project.metadata_at(repository, probe_memo: memo)
+  end
+
   @tag timeout: 25_000
   test "a hanging contained probe exits 124 at the existing boundary", context do
     root = temporary_directory!(context)
@@ -112,6 +155,32 @@ defmodule MixWorkspaceOps.ProbeContainmentTest do
 
         leaked = leaked_environment or leaked_state or copied_state
         [app: :alpha, version: if(leaked, do: "leaked", else: "clean"), deps: []]
+      end
+    end
+    """
+  end
+
+  defp symlink_mix do
+    """
+    defmodule Alpha.MixProject do
+      use Mix.Project
+
+      def project do
+        File.write!("linked_helper", "changed")
+        [app: :alpha, version: File.read!("linked_helper"), deps: []]
+      end
+    end
+    """
+  end
+
+  defp permission_mix do
+    """
+    defmodule Alpha.MixProject do
+      use Mix.Project
+
+      def project do
+        executable? = Bitwise.band(File.stat!("helper").mode, 0o100) != 0
+        [app: :alpha, version: if(executable?, do: "executable", else: "plain"), deps: []]
       end
     end
     """

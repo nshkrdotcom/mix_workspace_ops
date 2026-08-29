@@ -14,6 +14,7 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
   @excluded_directories ~w(.git _build deps .mix_workspace_ops .hex .mix .ssh .aws .config .codex)
   @excluded_files ~w(.dependency_sources.local.exs .env credentials)
   @excluded_extensions ~w(.key .pem)
+  @temporary_attempts 10
 
   @enforce_keys [:root, :project_root, :source_digest]
   defstruct [:root, :project_root, :source_digest]
@@ -29,19 +30,32 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
     project_root = Path.expand(project_root)
     source_root = source_root(project_root)
     relative_project = Path.relative_to(project_root, source_root)
-    temporary = temporary_root()
+
+    with {:ok, temporary} <- temporary_root() do
+      stage_in(temporary, source_root, relative_project)
+    end
+  end
+
+  defp stage_in(temporary, source_root, relative_project) do
     destination = Path.join(temporary, "source")
 
-    with :ok <- File.mkdir_p(destination),
-         {:ok, digest_parts} <- copy_directory(source_root, destination, source_root, []),
-         staged_project <- Path.expand(relative_project, destination),
-         true <- inside?(staged_project, destination) || {:error, :probe_project_outside_source},
-         true <-
-           File.regular?(Path.join(staged_project, "mix.exs")) ||
-             {:error, {:missing_staged_mix_exs, staged_project}} do
-      digest = digest_parts |> Enum.reverse() |> hash()
-      {:ok, %__MODULE__{root: temporary, project_root: staged_project, source_digest: digest}}
-    else
+    result =
+      with :ok <- File.mkdir(destination),
+           {:ok, digest_parts} <-
+             copy_directory(source_root, destination, source_root, destination, []),
+           staged_project <- Path.expand(relative_project, destination),
+           true <- inside?(staged_project, destination) || {:error, :probe_project_outside_source},
+           true <-
+             File.regular?(Path.join(staged_project, "mix.exs")) ||
+               {:error, {:missing_staged_mix_exs, staged_project}} do
+        digest = digest_parts |> Enum.reverse() |> hash()
+        {:ok, %__MODULE__{root: temporary, project_root: staged_project, source_digest: digest}}
+      end
+
+    case result do
+      {:ok, _stage} = ok ->
+        ok
+
       error ->
         File.rm_rf(temporary)
         error
@@ -61,25 +75,64 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
     end
   end
 
-  defp temporary_root do
-    Path.join(
-      System.tmp_dir!(),
-      "mix_workspace_ops_probe_#{System.unique_integer([:positive, :monotonic])}"
-    )
-  end
+  defp temporary_root(attempts \\ @temporary_attempts)
 
-  defp copy_directory(source, destination, source_root, digest_parts) do
-    with {:ok, names} <- File.ls(source) do
-      names
-      |> Enum.sort()
-      |> Enum.reduce_while(
-        {:ok, digest_parts},
-        &copy_named_entry(&1, source, destination, source_root, &2)
-      )
+  defp temporary_root(attempts) when attempts > 0 do
+    token = :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
+    path = Path.join(System.tmp_dir!(), "mix_workspace_ops_probe_#{token}")
+
+    case File.mkdir(path) do
+      :ok ->
+        case File.chmod(path, 0o700) do
+          :ok ->
+            {:ok, path}
+
+          {:error, reason} ->
+            File.rm_rf(path)
+            {:error, {:probe_temporary_permissions, reason}}
+        end
+
+      {:error, :eexist} ->
+        temporary_root(attempts - 1)
+
+      {:error, reason} ->
+        {:error, {:probe_temporary_directory, reason}}
     end
   end
 
-  defp copy_named_entry(name, source, destination, source_root, {:ok, parts}) do
+  defp temporary_root(0), do: {:error, :probe_temporary_collision}
+
+  defp copy_directory(source, destination, source_root, destination_root, digest_parts) do
+    with {:ok, %{type: :directory, mode: mode}} <- File.stat(source),
+         {:ok, names} <- File.ls(source),
+         {:ok, parts} <-
+           names
+           |> Enum.sort()
+           |> Enum.reduce_while(
+             {:ok, digest_parts},
+             &copy_named_entry(
+               &1,
+               source,
+               destination,
+               source_root,
+               destination_root,
+               &2
+             )
+           ),
+         :ok <- File.chmod(destination, permissions(mode)) do
+      relative = Path.relative_to(source, source_root)
+      {:ok, [["directory\0", relative, <<0>>, mode_token(mode), <<0>>] | parts]}
+    end
+  end
+
+  defp copy_named_entry(
+         name,
+         source,
+         destination,
+         source_root,
+         destination_root,
+         {:ok, parts}
+       ) do
     relative = source |> Path.join(name) |> Path.relative_to(source_root)
 
     if excluded?(relative) do
@@ -91,6 +144,7 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
           Path.join(destination, name),
           relative,
           source_root,
+          destination_root,
           parts
         )
 
@@ -101,23 +155,31 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
   defp continue_copy({:ok, next}), do: {:cont, {:ok, next}}
   defp continue_copy({:error, reason}), do: {:halt, {:error, reason}}
 
-  defp copy_entry(source, destination, relative, source_root, digest_parts) do
+  defp copy_entry(source, destination, relative, source_root, destination_root, digest_parts) do
     case File.lstat(source) do
       {:ok, %{type: :directory}} ->
         with :ok <- File.mkdir(destination),
-             {:ok, parts} <- copy_directory(source, destination, source_root, digest_parts) do
-          {:ok, [["directory\0", relative, <<0>>] | parts]}
-        end
+             {:ok, parts} <-
+               copy_directory(source, destination, source_root, destination_root, digest_parts),
+             do: {:ok, parts}
 
       {:ok, %{type: :regular, mode: mode}} ->
         with {:ok, bytes} <- File.read(source),
              :ok <- File.write(destination, bytes),
-             :ok <- File.chmod(destination, Bitwise.band(mode, 0o777)) do
-          {:ok, [["file\0", relative, <<0>>, bytes, <<0>>] | digest_parts]}
+             :ok <- File.chmod(destination, permissions(mode)) do
+          {:ok,
+           [["file\0", relative, <<0>>, mode_token(mode), <<0>>, bytes, <<0>>] | digest_parts]}
         end
 
       {:ok, %{type: :symlink}} ->
-        copy_symlink(source, destination, relative, source_root, digest_parts)
+        copy_symlink(
+          source,
+          destination,
+          relative,
+          source_root,
+          destination_root,
+          digest_parts
+        )
 
       {:ok, %{type: type}} ->
         {:error, {:unsupported_probe_file, relative, type}}
@@ -127,13 +189,22 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
     end
   end
 
-  defp copy_symlink(source, destination, relative, source_root, digest_parts) do
+  defp copy_symlink(
+         source,
+         destination,
+         relative,
+         source_root,
+         destination_root,
+         digest_parts
+       ) do
     with {:ok, target} <- File.read_link(source),
          expanded <- Path.expand(target, Path.dirname(source)),
          true <- inside?(expanded, source_root) || {:error, {:external_probe_symlink, relative}},
          target_relative <- Path.relative_to(expanded, source_root),
          :ok <- included_symlink(target_relative, relative),
-         :ok <- File.ln_s(target, destination) do
+         staged_target <- Path.join(destination_root, target_relative),
+         staged_link <- Path.relative_to(staged_target, Path.dirname(destination)),
+         :ok <- File.ln_s(staged_link, destination) do
       {:ok, [["symlink\0", relative, <<0>>, target, <<0>>] | digest_parts]}
     end
   end
@@ -146,13 +217,17 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
 
   defp excluded?(relative) do
     basename = Path.basename(relative)
+    segments = Path.split(relative)
 
-    basename in @excluded_directories or
+    Enum.any?(segments, &(&1 in @excluded_directories)) or
       basename in @excluded_files or
       String.starts_with?(basename, ".env.") or
       String.starts_with?(basename, "credentials.") or
       Path.extname(basename) in @excluded_extensions
   end
+
+  defp permissions(mode), do: Bitwise.band(mode, 0o7777)
+  defp mode_token(mode), do: mode |> permissions() |> Integer.to_string(8)
 
   defp inside?(path, root) do
     path = Path.expand(path)
