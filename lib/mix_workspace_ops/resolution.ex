@@ -529,9 +529,18 @@ defmodule MixWorkspaceOps.Resolution do
   @spec why(Registry.t(), String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def why(registry, target, application, opts \\ []) do
     application = to_string(application)
+    target = to_string(target)
 
-    with {:ok, report} <- resolve(registry, target, opts),
-         {:ok, decision} <- fetch_decision(report, application) do
+    with {:ok, declaration} <- fetch_declaration(registry, target, application),
+         {:ok, root} <- target_root(registry, target),
+         {:ok, overrides} <- overrides(root, opts),
+         {:ok, decision} <-
+           decide(
+             registry,
+             application,
+             declaration,
+             Keyword.merge(opts, consumer_root: root, overrides: overrides)
+           ) do
       target_project = Registry.project!(registry, target)
       candidates = Registry.providers(registry, application)
       rule = identity_rule(registry, target_project, application, candidates)
@@ -539,7 +548,7 @@ defmodule MixWorkspaceOps.Resolution do
       {:ok,
        %{
          schema: "mix_workspace_ops.why/v1",
-         target: to_string(target),
+         target: target,
          application: application,
          source: decision.source,
          location: decision.location,
@@ -552,10 +561,10 @@ defmodule MixWorkspaceOps.Resolution do
     end
   end
 
-  defp fetch_decision(report, application) do
-    case Enum.find(report.decisions, &(&1.application == application)) do
-      nil -> {:error, {:unmanaged_application, application, report.target}}
-      decision -> {:ok, decision}
+  defp fetch_declaration(registry, target, application) do
+    case Map.fetch(Registry.dependency_sources(registry, target), application) do
+      {:ok, declaration} -> {:ok, declaration}
+      :error -> {:error, {:unmanaged_application, application, target}}
     end
   end
 
