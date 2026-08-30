@@ -7,7 +7,8 @@ defmodule MixWorkspaceOps.Release.PreparedArtifact do
 
   alias MixWorkspaceOps.StrictJSON
 
-  @schema "mix_workspace_ops.prepared_artifact/v1"
+  @schema_v1 "mix_workspace_ops.prepared_artifact/v1"
+  @schema_v2 "mix_workspace_ops.prepared_artifact/v2"
   @digest ~r/^[0-9a-f]{64}$/
 
   @spec load(String.t()) :: {:ok, map()} | {:error, term()}
@@ -25,7 +26,51 @@ defmodule MixWorkspaceOps.Release.PreparedArtifact do
 
   defp parse(
          %{
-           "schema" => @schema,
+           "schema" => @schema_v2,
+           "package" => package,
+           "version" => version,
+           "source_revision" => source_revision,
+           "manifest_path" => manifest_path,
+           "manifest_sha256" => manifest_sha256,
+           "project_path" => project_path,
+           "project_sha256" => project_sha256,
+           "archive_path" => archive_path,
+           "archive_sha256" => archive_sha256
+         } = raw
+       )
+       when map_size(raw) == 10 and is_binary(package) and is_binary(version) and
+              is_binary(source_revision) and is_binary(project_path) and
+              is_binary(project_sha256) and is_binary(manifest_path) and
+              is_binary(manifest_sha256) do
+    with :ok <- validate_package(package),
+         {:ok, _version} <- Version.parse(version),
+         :ok <- validate_revision(source_revision),
+         :ok <- validate_relative_path(manifest_path),
+         :ok <- validate_digest(manifest_sha256),
+         :ok <- validate_relative_path(project_path),
+         :ok <- validate_digest(project_sha256),
+         {:ok, archive} <- validate_archive(archive_path, archive_sha256) do
+      {:ok,
+       %{
+         package: package,
+         version: version,
+         source_revision: source_revision,
+         manifest_path: manifest_path,
+         manifest_sha256: manifest_sha256,
+         project_path: project_path,
+         project_sha256: project_sha256,
+         archive_path: archive.path,
+         archive_sha256: archive.sha256
+       }}
+    else
+      :error -> {:error, :invalid_prepared_artifact_version}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parse(
+         %{
+           "schema" => @schema_v1,
            "package" => package,
            "version" => version,
            "source_revision" => source_revision,
@@ -49,6 +94,8 @@ defmodule MixWorkspaceOps.Release.PreparedArtifact do
          package: package,
          version: version,
          source_revision: source_revision,
+         manifest_path: nil,
+         manifest_sha256: nil,
          project_path: project_path,
          project_sha256: project_sha256,
          archive_path: archive.path,

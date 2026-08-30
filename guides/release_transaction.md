@@ -67,10 +67,13 @@ shared cache is treated as release evidence.
 ## Prepared-artifact owner seam
 
 A projection tool may add a `handoff` object to its release metadata using
-`mix_workspace_ops.prepared_artifact/v1`. The bounded object identifies the
-package/version, source revision, relative prepared-project and archive paths,
+`mix_workspace_ops.prepared_artifact/v2`. The bounded object identifies the
+package/version, source revision, relative manifest, prepared-project and archive paths,
 and SHA-256 digests. `MixWorkspaceOps.Release.PreparedArtifact` validates that
 portable data without depending on the producer or interpreting its manifest.
+
+The v1 handoff remains readable as incomplete compatibility data, but it lacks the manifest
+identity required to authorize a projected publication.
 
 The producer retains projection and preparation ownership. MWO retains the
 eventual clean-checkout transaction. Consuming this handoff in a real projected
