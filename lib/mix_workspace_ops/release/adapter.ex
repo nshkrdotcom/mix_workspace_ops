@@ -6,4 +6,9 @@ defmodule MixWorkspaceOps.Release.Adapter do
   @type context :: map()
 
   @callback transition(transition(), context()) :: {:ok, context()} | {:error, term()}
+
+  @callback resume(transition(), :completed | :started, context()) ::
+              {:ok, context()} | :rerun | {:error, term()}
+
+  @optional_callbacks resume: 3
 end

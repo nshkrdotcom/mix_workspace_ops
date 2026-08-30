@@ -1,0 +1,58 @@
+root = File.cwd!()
+dist = Path.join(root, "dist")
+project = Path.join(dist, "project")
+File.rm_rf!(dist)
+File.mkdir_p!(project)
+
+File.write!(
+  Path.join(project, "mix.exs"),
+  """
+  defmodule ProjectedPackage.MixProject do
+    use Mix.Project
+    def project, do: [app: :projected_package, version: "1.2.3"]
+  end
+  """
+)
+
+archive = Path.join(dist, "projected_package-1.2.3.tar")
+File.write!(archive, "deterministic archive\n")
+
+sha = fn path ->
+  path
+  |> File.read!()
+  |> then(&:crypto.hash(:sha256, &1))
+  |> Base.encode16(case: :lower)
+end
+
+files =
+  project
+  |> Path.join("**/*")
+  |> Path.wildcard(match_dot: true)
+  |> Enum.filter(&File.regular?/1)
+  |> Enum.sort()
+
+tree =
+  files
+  |> Enum.map_join("\n", fn path -> "#{Path.relative_to(path, project)}:#{sha.(path)}" end)
+  |> then(&:crypto.hash(:sha256, &1))
+  |> Base.encode16(case: :lower)
+
+{head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: root)
+
+handoff = %{
+  schema: "mix_workspace_ops.prepared_artifact/v2",
+  package: "projected_package",
+  version: "1.2.3",
+  source_revision: String.trim(head),
+  manifest_path: "manifest.txt",
+  manifest_sha256: sha.(Path.join(root, "manifest.txt")),
+  project_path: "project",
+  project_sha256: tree,
+  archive_path: Path.basename(archive),
+  archive_sha256: sha.(archive)
+}
+
+File.write!(
+  Path.join(dist, "release.json"),
+  :json.encode(%{handoff: handoff}) |> IO.iodata_to_binary()
+)

@@ -65,6 +65,7 @@ defmodule MixWorkspaceOps.CLITest do
              ["registry", "select"],
              ["registry", "validate"],
              ["registry", "workspace"],
+             ["release", "chain"],
              ["release", "plan"],
              ["release", "publish"],
              ["run"],
@@ -1083,6 +1084,24 @@ defmodule MixWorkspaceOps.CLITest do
 
     assert CLI.dispatch(["release", "plan", "--registry", "missing.json"]) ==
              {:usage_error, "missing --package"}
+  end
+
+  test "release chain requires catalog, package and descriptor" do
+    assert CLI.dispatch(["release", "chain"]) == {:usage_error, "missing --registry"}
+
+    assert CLI.dispatch(["release", "chain", "--registry", "registry.json"]) ==
+             {:usage_error, "missing --package"}
+
+    assert CLI.dispatch([
+             "release",
+             "chain",
+             "--registry",
+             "registry.json",
+             "--checkout-root",
+             ".",
+             "--package",
+             "sample_package"
+           ]) == {:usage_error, "missing --descriptor"}
   end
 
   test "release publish reports an unreadable descriptor", context do

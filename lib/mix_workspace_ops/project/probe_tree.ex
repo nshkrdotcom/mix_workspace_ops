@@ -9,7 +9,7 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
   source surface.
   """
 
-  alias MixWorkspaceOps.Git
+  alias MixWorkspaceOps.Command
 
   @excluded_directories ~w(.git _build deps .mix_workspace_ops .hex .mix .ssh .aws .config .codex)
   @excluded_files ~w(.dependency_sources.local.exs .env credentials)
@@ -69,9 +69,18 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
   end
 
   defp source_root(project_root) do
-    case Git.root(project_root) do
-      {:ok, root} -> root
-      {:error, _reason} -> project_root
+    environment = [
+      {"PATH", System.get_env("PATH") || "/usr/bin:/bin"},
+      {"LANG", System.get_env("LANG") || "C"}
+    ]
+
+    case Command.run("git", ["rev-parse", "--show-toplevel"],
+           cd: project_root,
+           replace_env: true,
+           env: environment
+         ) do
+      {:ok, result} -> String.trim(result.output)
+      {:error, _result} -> project_root
     end
   end
 

@@ -19,7 +19,7 @@ defmodule MixWorkspaceOps.CLI do
 
   alias MixWorkspaceOps.Project.ProbeMemo
   alias MixWorkspaceOps.Registry.{Examples, ReleaseChain}
-  alias MixWorkspaceOps.Release.{Descriptor, LocalAdapter, Transaction}
+  alias MixWorkspaceOps.Release.{Chain, Descriptor, LocalAdapter, Transaction}
   alias MixWorkspaceOps.Release.Plan, as: ReleasePlan
 
   @usage """
@@ -58,6 +58,8 @@ defmodule MixWorkspaceOps.CLI do
       [--max-concurrency N] [--timeout N[s|m|h]] [--allow-lock-mutation] \
       [--state-root PATH]
     release plan --registry PATH --package APP
+    release chain --registry PATH --checkout-root PATH [--binding PATH] --package APP \
+      --descriptor PATH [--state-root PATH] [--resume TRANSACTION]
     release publish --descriptor PATH [--state-root PATH]
     help
   """
@@ -135,6 +137,15 @@ defmodule MixWorkspaceOps.CLI do
       :state_root
     ],
     ["release", "plan"] => [:registry, :package],
+    ["release", "chain"] => [
+      :registry,
+      :checkout_root,
+      :binding,
+      :package,
+      :descriptor,
+      :state_root,
+      :resume
+    ],
     ["release", "publish"] => [:descriptor, :state_root]
   }
 
@@ -435,6 +446,24 @@ defmodule MixWorkspaceOps.CLI do
          :ok <- require_option(options, :descriptor),
          {:ok, plan} <- Descriptor.load(options.descriptor) do
       Transaction.run(plan, LocalAdapter, state_root: options.state_root)
+    end
+  end
+
+  def dispatch(["release", "chain" | args]) do
+    with {:ok, options, []} <- options(["release", "chain"], args),
+         :ok <- require_option(options, :registry),
+         :ok <- require_option(options, :checkout_root),
+         :ok <- require_option(options, :package),
+         :ok <- require_option(options, :descriptor),
+         {:ok, registry} <- Registry.load(options.registry),
+         {:ok, semantic_plan} <- ReleasePlan.build(registry, options.package),
+         {:ok, descriptor} <- Descriptor.load_chain(options.descriptor),
+         {:ok, registry} <-
+           Registry.bind(registry, options.checkout_root, binding_file: options.binding) do
+      Chain.run(registry, semantic_plan, descriptor,
+        state_root: options.state_root,
+        resume: options.resume
+      )
     end
   end
 

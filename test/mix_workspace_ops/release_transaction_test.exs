@@ -15,6 +15,26 @@ defmodule MixWorkspaceOps.Release.TransactionTest do
         else: {:ok, evidence(transition)}
     end
 
+    @impl true
+    def resume(:publish, :started, context) do
+      if Map.get(context.plan, :recover_publish?, false) do
+        send(context.plan.owner, {:recovered, :publish})
+        {:ok, %{registry_checksum: "aaa"}}
+      else
+        :rerun
+      end
+    end
+
+    def resume(transition, :started, context) do
+      send(context.plan.owner, {:rerun, transition})
+      :rerun
+    end
+
+    def resume(transition, :completed, context) do
+      send(context.plan.owner, {:resumed, transition})
+      {:ok, %{}}
+    end
+
     defp evidence(:preflight), do: %{head: "abc123"}
     defp evidence(:checkout), do: %{checkout: "temporary"}
     defp evidence(:archive), do: %{archive: "package.tar", archive_checksum: "aaa"}
@@ -98,6 +118,85 @@ defmodule MixWorkspaceOps.Release.TransactionTest do
              )
   end
 
+  test "an interrupted transaction resumes after publish without publishing twice", context do
+    state_root = temporary_directory!(context)
+
+    assert {:error, {:release_transition, :verify, {:injected, :verify}, receipt}} =
+             Transaction.run(plan(:verify), Adapter,
+               state_root: state_root,
+               transaction_id: "resume-after-publish"
+             )
+
+    first = drain_transitions([])
+    assert Enum.count(first, &(&1 == :publish)) == 1
+
+    assert {:ok, result} =
+             Transaction.run(plan(nil), Adapter,
+               state_root: state_root,
+               transaction_id: "resume-after-publish",
+               resume: true
+             )
+
+    second = drain_messages([])
+    refute {:transition, :publish} in second
+    assert {:resumed, :publish} in second
+    assert {:transition, :verify} in second
+    assert result.completed == Transaction.transitions()
+    assert result.receipt == receipt
+  end
+
+  test "a dangling publish start recovers exact external success instead of republishing",
+       context do
+    state_root = temporary_directory!(context)
+
+    assert {:error, {:release_transition, :publish, {:injected, :publish}, receipt}} =
+             Transaction.run(plan(:publish), Adapter,
+               state_root: state_root,
+               transaction_id: "recover-started-publish"
+             )
+
+    _messages = drain_messages([])
+    remove_last_event!(receipt)
+
+    recovering_plan = plan(nil) |> Map.put(:recover_publish?, true)
+
+    assert {:ok, result} =
+             Transaction.run(recovering_plan, Adapter,
+               state_root: state_root,
+               transaction_id: "recover-started-publish",
+               resume: true
+             )
+
+    messages = drain_messages([])
+    assert {:recovered, :publish} in messages
+    refute {:transition, :publish} in messages
+    assert result.completed == Transaction.transitions()
+  end
+
+  test "resume refuses descriptor drift before calling the adapter", context do
+    state_root = temporary_directory!(context)
+    descriptor = %{package: "sample_package", policy: "one"}
+
+    assert {:error, {:release_transition, :preflight, {:injected, :preflight}, receipt}} =
+             Transaction.run(plan(:preflight), Adapter,
+               state_root: state_root,
+               transaction_id: "descriptor-drift",
+               descriptor: descriptor
+             )
+
+    _messages = drain_messages([])
+
+    assert {:error, {:release_resume, :transaction_drift, ^receipt}} =
+             Transaction.run(plan(nil), Adapter,
+               state_root: state_root,
+               transaction_id: "descriptor-drift",
+               descriptor: %{package: "sample_package", policy: "two"},
+               resume: true
+             )
+
+    assert drain_messages([]) == []
+  end
+
   defp plan(fail_at) do
     %{
       package: "sample_package",
@@ -115,5 +214,18 @@ defmodule MixWorkspaceOps.Release.TransactionTest do
     after
       0 -> acc
     end
+  end
+
+  defp drain_messages(acc) do
+    receive do
+      message -> drain_messages(acc ++ [message])
+    after
+      0 -> acc
+    end
+  end
+
+  defp remove_last_event!(path) do
+    lines = path |> File.read!() |> String.split("\n", trim: true)
+    File.write!(path, Enum.join(Enum.drop(lines, -1), "\n") <> "\n")
   end
 end
