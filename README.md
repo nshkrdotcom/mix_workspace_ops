@@ -280,14 +280,20 @@ committed and pushed revision:
   --registry /path/to/portfolio_registry/registry.json \
   --package sample_package
 
-./mix_workspace_ops release publish \
-  --descriptor /path/to/untracked-release-descriptor.json
+./mix_workspace_ops release chain \
+  --registry /path/to/portfolio_registry/registry.json \
+  --checkout-root /operator/checkouts \
+  --package sample_package \
+  --descriptor /path/to/untracked-release-chain.json
 ```
 
-The semantic plan is catalog-only and self-digested. The transaction never stages or
-commits source. It builds from a detached clean
-checkout, persists every transition, exposes credentials only to its publisher
-step, verifies the Hex checksum, and creates the tag only afterward.
+The semantic plan is catalog-only, canonical, and self-digested. The descriptor
+adds only operator release policy; repository identity, project coordinates,
+branches, and prerequisites remain catalog-owned. Each unit builds from a
+detached clean checkout, persists resumable transition evidence, exposes
+credentials only to its publisher step, verifies the exact Hex checksum, and
+creates the tag only afterward. Weld projections are rebuilt and digest-matched
+inside that checkout rather than accepted as prebuilt directories.
 
 See [Architecture](guides/architecture.md) for the ownership split and safety
 model, [Contract examples](examples/contract_examples.md) for the synthetic runner seam,

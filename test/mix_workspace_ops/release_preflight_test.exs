@@ -118,7 +118,7 @@ defmodule MixWorkspaceOps.Release.PreflightTest do
                registry_lookup: fn "core", "1.2.3" -> :missing end
              )
 
-    assert {:ok, [%{registry: {:unverified, :offline}}]} =
+    assert {:ok, [%{status: :unverified, registry: {:unverified, :offline}}]} =
              Preflight.check(registry, "client",
                dependencies: ["core"],
                check_registry?: true,

@@ -70,5 +70,16 @@ defmodule MixWorkspaceOps.Release.DescriptorTest do
 
     File.write!(path, :json.encode(%{base | "gates" => [["mix", "test"]]}))
     assert {:error, :publisher_executable_must_be_absolute} = Descriptor.load(path)
+
+    File.write!(
+      path,
+      :json.encode(%{
+        base
+        | "gates" => [["/bin/sh", "-c", "printf $HEX_API_KEY"]],
+          "publisher_prefix" => ["/operator/publisher"]
+      })
+    )
+
+    assert {:error, :credential_embedded_in_descriptor} = Descriptor.load(path)
   end
 end

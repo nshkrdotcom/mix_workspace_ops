@@ -137,15 +137,15 @@ defmodule MixWorkspaceOps.Release.Transaction do
     end)
   end
 
-  defp recover_started(_adapter, _receipt, %{started: nil} = history, context),
+  defp recover_started(_adapter, _receipt, %{started: nil, failed: nil} = history, context),
     do: {:ok, history, context}
 
   defp recover_started(adapter, receipt, history, context) do
-    transition = history.started
+    transition = history.started || history.failed
 
     case invoke_resume(adapter, transition, :started, context) do
       :rerun ->
-        {:ok, %{history | started: nil}, context}
+        {:ok, %{history | started: nil, failed: nil}, context}
 
       {:ok, next} ->
         context = merge_context(context, next, transition)
@@ -156,6 +156,7 @@ defmodule MixWorkspaceOps.Release.Transaction do
            %{
              history
              | started: nil,
+               failed: nil,
                completed: history.completed ++ [transition],
                evidence: Map.put(history.evidence, transition, evidence(next))
            }, context}
@@ -183,7 +184,7 @@ defmodule MixWorkspaceOps.Release.Transaction do
 
   defp parse_history([first | rest], transaction_id, identity) do
     with :ok <- validate_identity_event(first, transaction_id, identity) do
-      initial = %{completed: [], evidence: %{}, started: nil, complete?: false}
+      initial = %{completed: [], evidence: %{}, started: nil, failed: nil, complete?: false}
       Enum.reduce_while(rest, {:ok, initial}, &parse_event(&1, &2, transaction_id))
     end
   end
@@ -203,9 +204,14 @@ defmodule MixWorkspaceOps.Release.Transaction do
   defp parse_status(_event, _transition, %{complete?: true}),
     do: {:halt, {:error, :event_after_complete}}
 
-  defp parse_status(%{"status" => "started"}, transition, %{started: nil} = state) do
+  defp parse_status(
+         %{"status" => "started"},
+         transition,
+         %{started: nil, failed: failed} = state
+       )
+       when is_nil(failed) or failed == transition do
     if transition == Enum.at(@transitions, length(state.completed)) do
-      {:cont, {:ok, %{state | started: transition}}}
+      {:cont, {:ok, %{state | started: transition, failed: nil}}}
     else
       {:halt, {:error, {:unexpected_started_transition, transition}}}
     end
@@ -213,26 +219,38 @@ defmodule MixWorkspaceOps.Release.Transaction do
 
   defp parse_status(%{"status" => "succeeded", "evidence" => evidence}, transition, state)
        when transition == state.started and is_map(evidence) do
+    complete_transition(state, transition, evidence)
+  end
+
+  defp parse_status(%{"status" => "succeeded", "evidence" => evidence}, transition, state)
+       when transition == state.failed and is_map(evidence) do
+    complete_transition(state, transition, evidence)
+  end
+
+  defp parse_status(%{"status" => "failed"}, transition, state)
+       when transition == state.started do
+    {:cont, {:ok, %{state | started: nil, failed: transition}}}
+  end
+
+  defp parse_status(%{"status" => "succeeded"}, :complete, state)
+       when length(state.completed) == length(@transitions) and is_nil(state.started) and
+              is_nil(state.failed),
+       do: {:cont, {:ok, %{state | complete?: true}}}
+
+  defp parse_status(event, transition, _state),
+    do: {:halt, {:error, {:invalid_transition_event, transition, event["status"]}}}
+
+  defp complete_transition(state, transition, evidence) do
     {:cont,
      {:ok,
       %{
         state
         | completed: state.completed ++ [transition],
           evidence: Map.put(state.evidence, transition, evidence),
-          started: nil
+          started: nil,
+          failed: nil
       }}}
   end
-
-  defp parse_status(%{"status" => "failed"}, transition, state)
-       when transition == state.started,
-       do: {:cont, {:ok, %{state | started: nil}}}
-
-  defp parse_status(%{"status" => "succeeded"}, :complete, state)
-       when length(state.completed) == length(@transitions) and is_nil(state.started),
-       do: {:cont, {:ok, %{state | complete?: true}}}
-
-  defp parse_status(event, transition, _state),
-    do: {:halt, {:error, {:invalid_transition_event, transition, event["status"]}}}
 
   defp restore_context(context, history) do
     Enum.reduce(history.completed, context, fn transition, current ->
@@ -351,7 +369,9 @@ defmodule MixWorkspaceOps.Release.Transaction do
 
   defp identity(plan, transaction_id, opts) do
     descriptor =
-      Keyword.get(opts, :descriptor, Map.take(plan, [:package, :version, :tag, :repository]))
+      opts
+      |> Keyword.get(:descriptor, Map.take(plan, [:package, :version, :tag, :repository]))
+      |> sanitize()
 
     %{
       schema: @identity_schema,

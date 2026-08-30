@@ -13,7 +13,8 @@ defmodule MixWorkspaceOps.Release.Chain do
     resume_id = Keyword.get(opts, :resume)
     chain_id = resume_id || chain_id(semantic_plan, descriptor)
 
-    with :ok <- validate(registry, semantic_plan, descriptor),
+    with {:ok, canonical_plan} <- Plan.build(registry, field(semantic_plan, :package)),
+         :ok <- validate(registry, semantic_plan, canonical_plan, descriptor),
          {:ok, units} <- execution_units(registry, semantic_plan, descriptor, opts) do
       execute(units, adapter, descriptor, semantic_plan, state_root, chain_id,
         resume?: not is_nil(resume_id)
@@ -21,14 +22,18 @@ defmodule MixWorkspaceOps.Release.Chain do
     end
   end
 
-  defp validate(registry, plan, descriptor) do
+  defp validate(registry, plan, canonical_plan, descriptor) do
     order = field(plan, :order)
     digest = field(plan, :digest)
+    canonical_digest = field(canonical_plan, :digest)
     packages = descriptor.packages |> Map.keys() |> Enum.sort()
 
     cond do
       digest != Plan.digest(plan) ->
         {:error, :release_plan_digest_invalid}
+
+      digest != canonical_digest ->
+        {:error, :release_plan_registry_drift}
 
       descriptor.release_plan_digest != digest ->
         {:error, :release_descriptor_plan_drift}

@@ -23,8 +23,9 @@ defmodule MixWorkspaceOps.Release.Receipt do
     with :ok <- File.mkdir_p(releases),
          :ok <- create_transaction_directory(directory),
          :ok <- File.chmod(directory, 0o700),
-         {:ok, io} <- File.open(path, [:write, :exclusive, :binary]) do
-      {:ok, %{io: io, path: path, directory: directory, events: []}}
+         {:ok, lock} <- acquire_lock(directory),
+         {:ok, io} <- open_receipt(path, [:write, :exclusive, :binary], lock) do
+      {:ok, %{io: io, lock: lock, path: path, directory: directory, events: []}}
     end
   end
 
@@ -34,9 +35,9 @@ defmodule MixWorkspaceOps.Release.Receipt do
     path = Path.join(directory, "events.jsonl")
 
     with true <- File.dir?(directory) || {:error, {:unknown_transaction, directory}},
-         {:ok, events} <- read(path),
-         {:ok, io} <- File.open(path, [:append, :binary]) do
-      {:ok, %{io: io, path: path, directory: directory, events: events}}
+         {:ok, lock} <- acquire_lock(directory),
+         {:ok, events, io} <- open_existing_receipt(path, lock) do
+      {:ok, %{io: io, lock: lock, path: path, directory: directory, events: events}}
     else
       false -> {:error, {:unknown_transaction, directory}}
       {:error, reason} -> {:error, reason}
@@ -51,6 +52,106 @@ defmodule MixWorkspaceOps.Release.Receipt do
     end
   end
 
+  defp acquire_lock(directory) do
+    case Enum.find(["/usr/bin/flock", "/bin/flock"], &File.regular?/1) do
+      nil ->
+        {:error, :receipt_lock_unavailable}
+
+      executable ->
+        path = Path.join(directory, ".receipt.lock")
+
+        environment = "/usr/bin/env"
+
+        port =
+          Port.open(
+            {:spawn_executable, String.to_charlist(environment)},
+            [
+              :binary,
+              :exit_status,
+              :stderr_to_stdout,
+              :use_stdio,
+              args:
+                Enum.map(
+                  [
+                    "-i",
+                    "LC_ALL=C",
+                    executable,
+                    "--exclusive",
+                    "--nonblock",
+                    path,
+                    "/bin/sh",
+                    "-c",
+                    "printf ready; IFS= read -r _"
+                  ],
+                  &String.to_charlist/1
+                )
+            ]
+          )
+
+        await_lock(port, "")
+    end
+  end
+
+  defp await_lock(port, output) do
+    receive do
+      {^port, {:data, bytes}} ->
+        output = output <> bytes
+
+        if String.contains?(output, "ready") do
+          {:ok, port}
+        else
+          await_lock(port, output)
+        end
+
+      {^port, {:exit_status, 1}} ->
+        {:error, :receipt_locked}
+
+      {^port, {:exit_status, status}} ->
+        {:error, {:receipt_lock_failed, status, String.trim(output)}}
+    after
+      2_000 ->
+        close_lock(port)
+        {:error, :receipt_lock_timeout}
+    end
+  end
+
+  defp open_receipt(path, modes, lock) do
+    case File.open(path, modes) do
+      {:ok, io} ->
+        {:ok, io}
+
+      {:error, reason} ->
+        close_lock(lock)
+        {:error, reason}
+    end
+  end
+
+  defp open_existing_receipt(path, lock) do
+    case read(path) do
+      {:ok, events} ->
+        case open_receipt(path, [:append, :binary], lock) do
+          {:ok, io} -> {:ok, events, io}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, reason} ->
+        close_lock(lock)
+        {:error, reason}
+    end
+  end
+
+  defp close_lock(port) do
+    Port.command(port, "\n")
+
+    receive do
+      {^port, {:exit_status, _status}} -> :ok
+    after
+      2_000 -> Port.close(port)
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
   @spec append(map(), map()) :: :ok | {:error, term()}
   def append(receipt, event) do
     bytes = Report.encode(event) <> "\n"
@@ -61,25 +162,33 @@ defmodule MixWorkspaceOps.Release.Receipt do
   end
 
   @spec close(map()) :: :ok
-  def close(receipt), do: File.close(receipt.io)
+  def close(receipt) do
+    result = File.close(receipt.io)
+    close_lock(receipt.lock)
+    result
+  end
 
   @doc "Reads every complete JSONL event or refuses the receipt as malformed."
   @spec read(String.t()) :: {:ok, [map()]} | {:error, term()}
   def read(path) do
     with {:ok, bytes} <- File.read(path) do
-      bytes
-      |> String.split("\n", trim: true)
-      |> Enum.with_index(1)
-      |> Enum.reduce_while({:ok, []}, fn {line, number}, {:ok, acc} ->
-        case StrictJSON.decode(line, maximum_bytes: 4 * 1024 * 1024) do
-          {:ok, event} when is_map(event) -> {:cont, {:ok, [event | acc]}}
-          {:ok, _other} -> {:halt, {:error, {:invalid_receipt_event, number}}}
-          {:error, reason} -> {:halt, {:error, {:invalid_receipt_event, number, reason}}}
+      if bytes != "" and not String.ends_with?(bytes, "\n") do
+        {:error, :truncated_receipt}
+      else
+        bytes
+        |> String.split("\n", trim: true)
+        |> Enum.with_index(1)
+        |> Enum.reduce_while({:ok, []}, fn {line, number}, {:ok, acc} ->
+          case StrictJSON.decode(line, maximum_bytes: 4 * 1024 * 1024) do
+            {:ok, event} when is_map(event) -> {:cont, {:ok, [event | acc]}}
+            {:ok, _other} -> {:halt, {:error, {:invalid_receipt_event, number}}}
+            {:error, reason} -> {:halt, {:error, {:invalid_receipt_event, number, reason}}}
+          end
+        end)
+        |> case do
+          {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+          error -> error
         end
-      end)
-      |> case do
-        {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
-        error -> error
       end
     end
   end

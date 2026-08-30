@@ -68,5 +68,16 @@ defmodule MixWorkspaceOps.Release.ChainDescriptorTest do
 
     File.write!(path, :json.encode(Map.put(base, "repository", "/override")))
     assert {:error, :invalid_release_chain_descriptor} = Descriptor.load_chain(path)
+
+    gate_credential =
+      put_in(
+        base,
+        ["packages", "sample_package", "gates"],
+        [["/bin/sh", "-c", "use $HEX_API_KEY"]]
+      )
+      |> Map.put("publisher_prefix", ["/operator/publisher"])
+
+    File.write!(path, :json.encode(gate_credential))
+    assert {:error, :credential_embedded_in_descriptor} = Descriptor.load_chain(path)
   end
 end

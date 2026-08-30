@@ -119,11 +119,23 @@ defmodule MixWorkspaceOps.Release.Preflight do
       lookup = Keyword.get(opts, :registry_lookup, &HexRegistry.lookup/2)
 
       case lookup.(entry.app, version) do
-        :published -> entry
-        {:published, checksum} -> Map.put(entry, :registry_checksum, checksum)
-        :missing -> entry |> Map.merge(%{status: :blocked, reason: :hex_release_missing})
-        {:unverified, reason} -> Map.put(entry, :registry, {:unverified, reason})
-        other -> Map.put(entry, :registry, {:unverified, {:invalid_registry_result, other}})
+        :published ->
+          entry
+
+        {:published, checksum} ->
+          Map.put(entry, :registry_checksum, checksum)
+
+        :missing ->
+          entry |> Map.merge(%{status: :blocked, reason: :hex_release_missing})
+
+        {:unverified, reason} ->
+          Map.merge(entry, %{status: :unverified, registry: {:unverified, reason}})
+
+        other ->
+          Map.merge(entry, %{
+            status: :unverified,
+            registry: {:unverified, {:invalid_registry_result, other}}
+          })
       end
     else
       entry

@@ -32,12 +32,19 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
 
   defp resume_step(:preflight, :completed, context) do
     repository = context.plan.repository
+    source_project = Path.expand(context.plan.project_path, repository)
+    expected_head = context.head
 
-    cond do
-      git_head!(repository) != context.head -> {:error, :source_revision_changed}
-      not git_clean?(repository) -> {:error, :source_worktree_changed}
-      git_upstream_head!(repository) != context.head -> {:error, :source_upstream_changed}
-      true -> {:ok, %{}}
+    with ^expected_head <- git_head!(repository),
+         true <- git_clean?(repository) || {:error, :source_worktree_changed},
+         ^expected_head <- git_upstream_head!(repository),
+         {:ok, package_evidence} <- package_preflight(context, source_project, expected_head),
+         :ok <- verify_expected_prepared(context, package_evidence),
+         :ok <- ensure_no_overlay() do
+      {:ok, %{}}
+    else
+      {:error, reason} -> {:error, reason}
+      _other -> {:error, :source_revision_changed}
     end
   end
 
@@ -52,7 +59,7 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
       not File.dir?(context.checkout) -> {:error, :release_checkout_missing}
       git_head!(context.checkout) != context.head -> {:error, :release_checkout_changed}
       not git_clean?(context.checkout) -> {:error, :release_checkout_dirty}
-      true -> {:ok, %{}}
+      true -> verify_prepared_state(context)
     end
   end
 
@@ -182,6 +189,16 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
   end
 
   defp publish(context) do
+    with :ok <- verify_publish_inputs(context) do
+      case registry_lookup(context) do
+        :missing -> run_publisher(context)
+        {:published, checksum} -> verify_checksum(context, checksum)
+        {:unverified, reason} -> {:error, {:registry_unverified, reason}}
+      end
+    end
+  end
+
+  defp run_publisher(context) do
     [executable | prefix_args] = context.plan.publisher_prefix
     argv = prefix_args ++ ["mix", "hex.publish", "--yes"]
 
@@ -360,6 +377,44 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
         {:error,
          {:prepared_artifact_drift, field, prepared_field(expected, field),
           prepared_field(rebuilt, field)}}
+    end
+  end
+
+  defp verify_expected_prepared(%{expected_prepared_artifact: expected}, package_evidence)
+       when is_map(expected) do
+    compare_prepared(expected, package_evidence.expected_prepared_artifact)
+  end
+
+  defp verify_expected_prepared(_context, _package_evidence), do: :ok
+
+  defp verify_prepared_state(%{prepared_artifact: artifact} = context)
+       when is_map(artifact) do
+    rebuilt_path = Path.expand(context.plan.prepared_artifact.rebuilt_handoff, context.checkout)
+
+    with {:ok, rebuilt} <- PreparedArtifact.load(rebuilt_path),
+         :ok <- compare_prepared(context.expected_prepared_artifact, rebuilt),
+         {:ok, paths} <- verify_prepared_files(rebuilt, rebuilt_path, context.checkout),
+         true <- paths.project == context.project || {:error, :prepared_project_path_changed},
+         true <- paths.archive == context.archive || {:error, :prepared_archive_path_changed},
+         true <-
+           paths.manifest == context.manifest_path || {:error, :prepared_manifest_path_changed} do
+      {:ok, %{}}
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp verify_prepared_state(_context), do: {:ok, %{}}
+
+  defp verify_publish_inputs(context) do
+    with {:ok, checksum} <- file_checksum(context.archive),
+         true <-
+           checksum == context.archive_checksum ||
+             {:error, {:archive_checksum_changed, context.archive_checksum, checksum}},
+         {:ok, _evidence} <- verify_prepared_state(context) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -556,6 +611,8 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
       File.chmod!(directory, 0o700)
     end
 
+    mix_archives = prepare_mix_archives(mix_home)
+
     environment =
       (@preserved_environment ++ extra_preserved)
       |> Enum.uniq()
@@ -571,7 +628,7 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
         [
           "HOME=#{home}",
           "MIX_HOME=#{mix_home}",
-          "MIX_ARCHIVES=#{mix_archives()}",
+          "MIX_ARCHIVES=#{mix_archives}",
           "HEX_HOME=#{hex_home}",
           "REBAR_CACHE_DIR=#{rebar_cache}",
           "TMPDIR=#{temporary}"
@@ -607,12 +664,21 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
     end
   end
 
-  defp mix_archives do
-    Mix.path_for(:archives)
-  end
+  defp prepare_mix_archives(mix_home) do
+    target = Path.join(mix_home, "archives")
 
-  @doc false
-  defdelegate hex_request_headers, to: HexRegistry, as: :request_headers
+    unless File.dir?(target) do
+      case Mix.path_for(:archives) do
+        source when source != target and is_binary(source) ->
+          if File.dir?(source), do: File.cp_r!(source, target), else: File.mkdir_p!(target)
+
+        _same ->
+          File.mkdir_p!(target)
+      end
+    end
+
+    target
+  end
 
   defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 end

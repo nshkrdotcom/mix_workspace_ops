@@ -145,18 +145,17 @@ defmodule MixWorkspaceOps.Release.TransactionTest do
     assert result.receipt == receipt
   end
 
-  test "a dangling publish start recovers exact external success instead of republishing",
+  test "a failed publish recovers exact external success instead of republishing",
        context do
     state_root = temporary_directory!(context)
 
-    assert {:error, {:release_transition, :publish, {:injected, :publish}, receipt}} =
+    assert {:error, {:release_transition, :publish, {:injected, :publish}, _receipt}} =
              Transaction.run(plan(:publish), Adapter,
                state_root: state_root,
                transaction_id: "recover-started-publish"
              )
 
     _messages = drain_messages([])
-    remove_last_event!(receipt)
 
     recovering_plan = plan(nil) |> Map.put(:recover_publish?, true)
 
@@ -222,10 +221,5 @@ defmodule MixWorkspaceOps.Release.TransactionTest do
     after
       0 -> acc
     end
-  end
-
-  defp remove_last_event!(path) do
-    lines = path |> File.read!() |> String.split("\n", trim: true)
-    File.write!(path, Enum.join(Enum.drop(lines, -1), "\n") <> "\n")
   end
 end

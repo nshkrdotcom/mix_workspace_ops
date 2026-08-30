@@ -4,10 +4,10 @@ defmodule MixWorkspaceOps.Release.LocalAdapterTest do
   import ExUnit.CaptureIO
 
   alias MixWorkspaceOps.Registry
-  alias MixWorkspaceOps.Release.{LocalAdapter, Transaction}
+  alias MixWorkspaceOps.Release.{HexRegistry, LocalAdapter, Transaction}
 
   test "Hex requests identify the release client" do
-    assert [{~c"user-agent", user_agent}] = LocalAdapter.hex_request_headers()
+    assert [{~c"user-agent", user_agent}] = HexRegistry.request_headers()
     assert List.starts_with?(user_agent, ~c"mix_workspace_ops/")
   end
 
@@ -82,29 +82,64 @@ defmodule MixWorkspaceOps.Release.LocalAdapterTest do
 
     assert blocker.reason == :hex_constraint_stale
     assert message =~ "bump it to \"~> 1.2.0\""
+
+    registry =
+      put_in(
+        registry.repositories["sample_package"].dependency_sources["provider"].hex,
+        "~> 1.2"
+      )
+
+    offline = %{
+      release_plan
+      | registry: registry,
+        registry_lookup: fn "provider", "1.2.3" -> {:unverified, :offline} end
+    }
+
+    assert {:error,
+            {:dependency_preflight_unverified,
+             [%{app: "provider", registry: {:unverified, :offline}}]}} =
+             LocalAdapter.transition(:preflight, %{plan: offline})
   end
 
   test "release gates cannot inherit ambient Hex credentials", context do
     root = temporary_directory!(context)
     project = Path.join(root, "package")
+    operator_archives = Path.join(root, "operator-archives")
     File.mkdir_p!(project)
+    File.mkdir_p!(operator_archives)
 
     previous = System.get_env("HEX_API_KEY")
+    previous_archives = System.get_env("MIX_ARCHIVES")
     System.put_env("HEX_API_KEY", "must-not-reach-gates")
+    System.put_env("MIX_ARCHIVES", operator_archives)
 
     on_exit(fn ->
       if previous,
         do: System.put_env("HEX_API_KEY", previous),
         else: System.delete_env("HEX_API_KEY")
+
+      if previous_archives,
+        do: System.put_env("MIX_ARCHIVES", previous_archives),
+        else: System.delete_env("MIX_ARCHIVES")
     end)
 
     context = %{
       project: project,
-      plan: %{gates: [["sh", "-c", "test -z \"$HEX_API_KEY\""]]}
+      plan: %{
+        gates: [
+          [
+            "sh",
+            "-c",
+            "test -z \"$HEX_API_KEY\" && touch \"$MIX_ARCHIVES/child-marker\""
+          ]
+        ]
+      }
     }
 
     assert {:ok, %{gate_results: [%{argv: ["sh", "-c", _], exit_code: 0}]}} =
              LocalAdapter.transition(:gates, context)
+
+    refute File.exists?(Path.join(operator_archives, "child-marker"))
   end
 
   test "the executable preflight refuses an absent provider it cannot verify", context do
@@ -236,6 +271,38 @@ defmodule MixWorkspaceOps.Release.LocalAdapterTest do
     assert archive.archive_checksum == rebuilt.archive_checksum
     assert archive.manifest_sha256 == rebuilt.manifest_sha256
     assert archive.project_sha256 == rebuilt.project_sha256
+
+    File.write!(Path.join(rebuilt.project, "mix.exs"), "changed projected source\n")
+    expected_project_sha256 = rebuilt.project_sha256
+
+    assert {:error, {:prepared_tree_digest, ^expected_project_sha256, _actual}} =
+             LocalAdapter.resume(
+               :checkout,
+               :completed,
+               Map.merge(checkout_context, rebuilt)
+             )
+  end
+
+  test "publish recovers an exact release that appeared after preflight", context do
+    root = temporary_directory!(context)
+    archive = Path.join(root, "sample_package-0.1.0.tar")
+    File.write!(archive, "archive bytes\n")
+    checksum = sha256_file(archive)
+
+    release_context = %{
+      archive: archive,
+      archive_checksum: checksum,
+      project: root,
+      plan: %{
+        package: "sample_package",
+        version: "0.1.0",
+        publisher_prefix: ["/does/not/exist"],
+        registry_lookup: fn "sample_package", "0.1.0" -> {:published, checksum} end
+      }
+    }
+
+    assert {:ok, %{registry_checksum: ^checksum}} =
+             LocalAdapter.transition(:publish, release_context)
   end
 
   test "only the publisher child receives the publication credential", context do
@@ -405,4 +472,11 @@ defmodule MixWorkspaceOps.Release.LocalAdapterTest do
   end
 
   defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
+
+  defp sha256_file(path) do
+    path
+    |> File.read!()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
 end

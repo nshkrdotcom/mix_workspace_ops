@@ -47,7 +47,9 @@ defmodule MixWorkspaceOps.Release.Descriptor do
          :ok <- require_tag(tag, package, version),
          :ok <- require_branch(default_branch),
          :ok <- require_argv_list(gates, :gates),
-         :ok <- require_publisher_prefix(publisher_prefix) do
+         :ok <- require_publisher_prefix(publisher_prefix),
+         :ok <- reject_embedded_credentials(gates),
+         :ok <- reject_embedded_credentials(publisher_prefix) do
       {:ok,
        %{
          repository: Path.expand(repository),
@@ -121,6 +123,7 @@ defmodule MixWorkspaceOps.Release.Descriptor do
     with :ok <- require_version(version),
          :ok <- require_tag(tag, package, version),
          :ok <- require_argv_list(gates, :gates),
+         :ok <- reject_embedded_credentials(gates),
          {:ok, prepared_artifact} <- parse_prepared_artifact(prepared) do
       {:ok, %{version: version, tag: tag, gates: gates, prepared_artifact: prepared_artifact}}
     end
@@ -201,7 +204,19 @@ defmodule MixWorkspaceOps.Release.Descriptor do
   end
 
   defp reject_embedded_credentials(argv) do
-    if Enum.any?(argv, &credential_argument?/1),
+    arguments =
+      case argv do
+        [[_executable | _arguments] | _rest] ->
+          Enum.flat_map(argv, fn [_executable | arguments] -> arguments end)
+
+        [_executable | arguments] ->
+          arguments
+
+        other ->
+          List.flatten(other)
+      end
+
+    if Enum.any?(arguments, &credential_argument?/1),
       do: {:error, :credential_embedded_in_descriptor},
       else: :ok
   end

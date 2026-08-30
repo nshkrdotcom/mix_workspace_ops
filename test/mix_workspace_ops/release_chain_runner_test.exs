@@ -97,6 +97,27 @@ defmodule MixWorkspaceOps.Release.ChainRunnerTest do
               {:release_descriptor_packages, ["core", "leaf"], ["core", "invented", "leaf"]}}
   end
 
+  test "a self-digested plan cannot reorder the catalogued chain", context do
+    root = temporary_directory!(context)
+    registry = registry(root)
+    assert {:ok, semantic_plan} = Plan.build(registry, "leaf")
+    descriptor = descriptor(semantic_plan, registry)
+
+    reordered = %{
+      semantic_plan
+      | order: Enum.reverse(semantic_plan.order),
+        units: Enum.reverse(semantic_plan.units)
+    }
+
+    reordered = %{reordered | digest: Plan.digest(reordered)}
+    descriptor = %{descriptor | release_plan_digest: reordered.digest}
+
+    assert Chain.run(registry, reordered, descriptor, adapter: Adapter) ==
+             {:error, :release_plan_registry_drift}
+
+    assert drain([]) == []
+  end
+
   defp registry(root) do
     registry =
       root

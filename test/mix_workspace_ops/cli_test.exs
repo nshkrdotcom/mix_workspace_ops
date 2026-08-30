@@ -1118,6 +1118,39 @@ defmodule MixWorkspaceOps.CLITest do
              ])
   end
 
+  test "release publish accepts a transaction id for resume", context do
+    %{root: root, state_root: state_root} = workspace!(context)
+    descriptor = Path.join(root, "release.json")
+
+    File.write!(
+      descriptor,
+      :json.encode(%{
+        "schema" => "mix_workspace_ops.release/v1",
+        "repository" => Path.join(root, "plane"),
+        "project_path" => ".",
+        "package" => "plane",
+        "version" => "0.1.0",
+        "tag" => "v0.1.0",
+        "default_branch" => "main",
+        "gates" => [["mix", "test"]],
+        "publisher_prefix" => ["/operator/publisher"]
+      })
+    )
+
+    expected = Path.join([state_root, "releases", "missing-transaction"])
+
+    assert CLI.dispatch([
+             "release",
+             "publish",
+             "--descriptor",
+             descriptor,
+             "--state-root",
+             state_root,
+             "--resume",
+             "missing-transaction"
+           ]) == {:error, {:unknown_transaction, expected}}
+  end
+
   # -- fixtures ------------------------------------------------------------
 
   defp workspace!(context) do

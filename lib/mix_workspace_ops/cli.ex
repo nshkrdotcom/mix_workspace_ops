@@ -60,7 +60,7 @@ defmodule MixWorkspaceOps.CLI do
     release plan --registry PATH --package APP
     release chain --registry PATH --checkout-root PATH [--binding PATH] --package APP \
       --descriptor PATH [--state-root PATH] [--resume TRANSACTION]
-    release publish --descriptor PATH [--state-root PATH]
+    release publish --descriptor PATH [--state-root PATH] [--resume TRANSACTION]
     help
   """
 
@@ -146,7 +146,7 @@ defmodule MixWorkspaceOps.CLI do
       :state_root,
       :resume
     ],
-    ["release", "publish"] => [:descriptor, :state_root]
+    ["release", "publish"] => [:descriptor, :state_root, :resume]
   }
 
   @vocabulary @accepted |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
@@ -445,7 +445,14 @@ defmodule MixWorkspaceOps.CLI do
     with {:ok, options, []} <- options(["release", "publish"], args),
          :ok <- require_option(options, :descriptor),
          {:ok, plan} <- Descriptor.load(options.descriptor) do
-      Transaction.run(plan, LocalAdapter, state_root: options.state_root)
+      transaction_options = [state_root: options.state_root, descriptor: plan]
+
+      transaction_options =
+        if options.resume,
+          do: [transaction_id: options.resume, resume: true] ++ transaction_options,
+          else: transaction_options
+
+      Transaction.run(plan, LocalAdapter, transaction_options)
     end
   end
 
