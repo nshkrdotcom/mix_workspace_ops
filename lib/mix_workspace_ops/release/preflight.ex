@@ -11,15 +11,17 @@ defmodule MixWorkspaceOps.Release.Preflight do
   @spec check(Registry.t(), String.t(), keyword()) :: {:ok, [entry()]} | {:error, [entry()]}
   def check(%Registry{} = registry, package, opts \\ []) when is_binary(package) do
     with {:ok, project} <- provider(registry, package),
-         {:ok, dependencies} <- dependencies(registry, project, opts) do
-      table = Registry.dependency_sources(registry, project)
+         {:ok, dependencies} <- dependencies(registry, project, opts),
+         table = Registry.dependency_sources(registry, project),
+         {:ok, entries} <- entries(registry, project, dependencies, table, package, opts) do
+      blocker_result(entries)
+    end
+  end
 
-      with {:ok, entries} <- entries(registry, project, dependencies, table, package, opts) do
-        case Enum.filter(entries, &(&1.status == :blocked)) do
-          [] -> {:ok, entries}
-          blockers -> {:error, blockers}
-        end
-      end
+  defp blocker_result(entries) do
+    case Enum.filter(entries, &(&1.status == :blocked)) do
+      [] -> {:ok, entries}
+      blockers -> {:error, blockers}
     end
   end
 
@@ -97,20 +99,21 @@ defmodule MixWorkspaceOps.Release.Preflight do
     |> Enum.sort()
     |> Enum.reject(&(&1 == package))
     |> Enum.reduce_while({:ok, []}, fn app, {:ok, acc} ->
-      case Map.fetch(table, app) do
-        {:ok, declaration} ->
-          case check_declaration(registry, project, app, declaration, opts) do
-            {:ok, entry} -> {:cont, {:ok, [entry | acc]}}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-
-        :error ->
-          {:cont, {:ok, acc}}
-      end
+      reduce_entry(Map.fetch(table, app), registry, project, app, opts, acc)
     end)
     |> case do
       {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
       error -> error
+    end
+  end
+
+  defp reduce_entry(:error, _registry, _project, _app, _opts, acc),
+    do: {:cont, {:ok, acc}}
+
+  defp reduce_entry({:ok, declaration}, registry, project, app, opts, acc) do
+    case check_declaration(registry, project, app, declaration, opts) do
+      {:ok, entry} -> {:cont, {:ok, [entry | acc]}}
+      {:error, reason} -> {:halt, {:error, reason}}
     end
   end
 

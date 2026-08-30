@@ -171,25 +171,34 @@ defmodule MixWorkspaceOps.Release.Receipt do
   @doc "Reads every complete JSONL event or refuses the receipt as malformed."
   @spec read(String.t()) :: {:ok, [map()]} | {:error, term()}
   def read(path) do
-    with {:ok, bytes} <- File.read(path) do
-      if bytes != "" and not String.ends_with?(bytes, "\n") do
-        {:error, :truncated_receipt}
-      else
-        bytes
-        |> String.split("\n", trim: true)
-        |> Enum.with_index(1)
-        |> Enum.reduce_while({:ok, []}, fn {line, number}, {:ok, acc} ->
-          case StrictJSON.decode(line, maximum_bytes: 4 * 1024 * 1024) do
-            {:ok, event} when is_map(event) -> {:cont, {:ok, [event | acc]}}
-            {:ok, _other} -> {:halt, {:error, {:invalid_receipt_event, number}}}
-            {:error, reason} -> {:halt, {:error, {:invalid_receipt_event, number, reason}}}
-          end
-        end)
-        |> case do
-          {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
-          error -> error
-        end
-      end
+    with {:ok, bytes} <- File.read(path),
+         :ok <- complete_receipt(bytes) do
+      decode_events(bytes)
+    end
+  end
+
+  defp complete_receipt(""), do: :ok
+
+  defp complete_receipt(bytes) do
+    if String.ends_with?(bytes, "\n"), do: :ok, else: {:error, :truncated_receipt}
+  end
+
+  defp decode_events(bytes) do
+    bytes
+    |> String.split("\n", trim: true)
+    |> Enum.with_index(1)
+    |> Enum.reduce_while({:ok, []}, &decode_event/2)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      error -> error
+    end
+  end
+
+  defp decode_event({line, number}, {:ok, acc}) do
+    case StrictJSON.decode(line, maximum_bytes: 4 * 1024 * 1024) do
+      {:ok, event} when is_map(event) -> {:cont, {:ok, [event | acc]}}
+      {:ok, _other} -> {:halt, {:error, {:invalid_receipt_event, number}}}
+      {:error, reason} -> {:halt, {:error, {:invalid_receipt_event, number, reason}}}
     end
   end
 

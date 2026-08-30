@@ -667,17 +667,15 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
   defp prepare_mix_archives(mix_home) do
     target = Path.join(mix_home, "archives")
 
-    unless File.dir?(target) do
-      case Mix.path_for(:archives) do
-        source when source != target and is_binary(source) ->
-          if File.dir?(source), do: File.cp_r!(source, target), else: File.mkdir_p!(target)
-
-        _same ->
-          File.mkdir_p!(target)
-      end
-    end
+    unless File.dir?(target), do: copy_mix_archives(Mix.path_for(:archives), target)
 
     target
+  end
+
+  defp copy_mix_archives(source, target) when source == target, do: File.mkdir_p!(target)
+
+  defp copy_mix_archives(source, target) do
+    if File.dir?(source), do: File.cp_r!(source, target), else: File.mkdir_p!(target)
   end
 
   defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)

@@ -1,7 +1,8 @@
 defmodule MixWorkspaceOps.Release.Transaction do
   @moduledoc "Fail-closed, resumable release state machine with durable transition evidence."
 
-  alias MixWorkspaceOps.{Report, Release.Receipt}
+  alias MixWorkspaceOps.Release.Receipt
+  alias MixWorkspaceOps.Report
 
   @transitions [:preflight, :checkout, :gates, :archive, :publish, :verify, :tag, :push_tag]
   @event_schema "mix_workspace_ops.release.event/v2"
@@ -83,13 +84,10 @@ defmodule MixWorkspaceOps.Release.Transaction do
          context <- restore_context(context, history),
          {:ok, context} <- verify_completed(adapter, history.completed, context),
          {:ok, history, context} <- recover_started(adapter, receipt, history, context) do
-      cond do
-        history.complete? ->
-          {:ok, Map.put(context, :receipt, receipt.path)}
-
-        true ->
+      if history.complete?,
+        do: {:ok, Map.put(context, :receipt, receipt.path)},
+        else:
           execute(Enum.drop(@transitions, length(history.completed)), adapter, receipt, context)
-      end
     else
       {:error, reason} -> {:error, {:release_resume, reason, receipt.path}}
     end
