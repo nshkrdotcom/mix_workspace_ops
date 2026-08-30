@@ -3,10 +3,10 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
 
   @behaviour MixWorkspaceOps.Release.Adapter
 
-  alias MixWorkspaceOps.{Command, Git, Project}
+  alias MixWorkspaceOps.{Command, Git, Project, Registry}
+  alias MixWorkspaceOps.Release.{HexRegistry, Preflight}
 
   @preserved_environment ~w(HOME PATH USER LOGNAME LANG LC_ALL TERM SHELL ASDF_DIR ASDF_DATA_DIR MIX_HOME MIX_ARCHIVES MIX_ENV MIX_TARGET ERL_AFLAGS ERL_FLAGS ELIXIR_ERL_OPTIONS SSH_AUTH_SOCK XDG_RUNTIME_DIR CI CODEX_CI)
-  @hex_user_agent ~c"mix_workspace_ops/0.1.0"
 
   @impl true
   def transition(:preflight, context), do: preflight(context)
@@ -34,9 +34,16 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
          {:ok, metadata} <- Project.metadata_at(project),
          true <- metadata.app == plan.package || {:error, {:wrong_package, metadata.app}},
          true <- metadata.version == plan.version || {:error, {:wrong_version, metadata.version}},
+         {:ok, dependency_preflight} <- dependency_preflight(context, metadata.dependencies),
          :absent <- release_status(context),
          :ok <- ensure_no_overlay() do
-      {:ok, %{head: head, project: project, origin: Git.remote_url!(repository)}}
+      {:ok,
+       %{
+         head: head,
+         project: project,
+         origin: Git.remote_url!(repository),
+         dependency_preflight: dependency_preflight
+       }}
     else
       {:error, reason} -> {:error, reason}
       value -> {:error, {:preflight_mismatch, value}}
@@ -97,15 +104,10 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
   end
 
   defp verify(context) do
-    url = ~c"https://hex.pm/api/packages/#{context.plan.package}/releases/#{context.plan.version}"
-    :ok = ensure_http_started()
-
-    case :httpc.request(:get, {url, hex_request_headers()}, [ssl: ssl_options()],
-           body_format: :binary
-         ) do
-      {:ok, {{_http, 200, _reason}, _headers, body}} -> verify_checksum(context, body)
-      {:ok, {{_http, status, _reason}, _headers, _body}} -> {:error, {:hex_status, status}}
-      {:error, reason} -> {:error, {:hex_request, reason}}
+    case registry_lookup(context) do
+      {:published, checksum} -> verify_checksum(context, checksum)
+      :missing -> {:error, :hex_release_missing}
+      {:unverified, reason} -> {:error, reason}
     end
   end
 
@@ -152,25 +154,38 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
       else: {:error, :active_workspace_state}
   end
 
+  defp dependency_preflight(%{plan: %{registry: %Registry{} = registry}} = context, dependencies) do
+    lookup = Map.get(context.plan, :registry_lookup, &HexRegistry.lookup/2)
+
+    case Preflight.check(registry, context.plan.package,
+           dependencies: dependencies,
+           check_registry?: true,
+           registry_lookup: lookup
+         ) do
+      {:ok, entries} ->
+        require_verified_dependencies(entries)
+
+      {:error, blockers} ->
+        {:error, {:publish_preflight, blockers, Preflight.format_blockers(blockers)}}
+    end
+  end
+
+  defp dependency_preflight(_context, _dependencies), do: {:ok, []}
+
+  defp require_verified_dependencies(entries) do
+    case Enum.filter(entries, &(&1.status == :unverified)) do
+      [] -> {:ok, entries}
+      unverified -> {:error, {:dependency_preflight_unverified, unverified}}
+    end
+  end
+
   defp ensure_absent(false, _reason), do: :ok
   defp ensure_absent(true, reason), do: {:error, reason}
 
-  defp verify_checksum(context, body) do
-    decoded = :json.decode(body)
-    registry_checksum = decoded["checksum"] |> String.downcase()
-
+  defp verify_checksum(context, registry_checksum) do
     if registry_checksum == context.archive_checksum,
       do: {:ok, %{registry_checksum: registry_checksum}},
       else: {:error, {:checksum_mismatch, context.archive_checksum, registry_checksum}}
-  catch
-    kind, reason -> {:error, {:hex_response, kind, reason}}
-  end
-
-  defp ensure_http_started do
-    with {:ok, _apps} <- Application.ensure_all_started(:inets),
-         {:ok, _apps} <- Application.ensure_all_started(:ssl) do
-      :ok
-    end
   end
 
   defp release_status(%{plan: %{release_status: function}} = context)
@@ -178,25 +193,19 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
        do: function.(context)
 
   defp release_status(context) do
-    url = ~c"https://hex.pm/api/packages/#{context.plan.package}/releases/#{context.plan.version}"
-    :ok = ensure_http_started()
-
-    case :httpc.request(:get, {url, hex_request_headers()}, [ssl: ssl_options()],
-           body_format: :binary
-         ) do
-      {:ok, {{_http, 404, _reason}, _headers, _body}} ->
-        :absent
-
-      {:ok, {{_http, 200, _reason}, _headers, _body}} ->
-        {:error, :version_already_published}
-
-      {:ok, {{_http, status, _reason}, _headers, _body}} ->
-        {:error, {:hex_preflight_status, status}}
-
-      {:error, reason} ->
-        {:error, {:hex_preflight_request, reason}}
+    case registry_lookup(context) do
+      :missing -> :absent
+      {:published, _checksum} -> {:error, :version_already_published}
+      {:unverified, reason} -> {:error, {:hex_preflight_unverified, reason}}
     end
   end
+
+  defp registry_lookup(%{plan: %{registry_lookup: function}} = context)
+       when is_function(function, 2),
+       do: function.(context.plan.package, context.plan.version)
+
+  defp registry_lookup(context),
+    do: HexRegistry.lookup(context.plan.package, context.plan.version)
 
   defp isolated_run(executable, argv, opts \\ []) do
     {extra_preserved, opts} = Keyword.pop(opts, :preserve, [])
@@ -214,16 +223,8 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
     Command.run("/usr/bin/env", ["-i" | environment] ++ [executable | argv], opts)
   end
 
-  defp ssl_options do
-    [
-      verify: :verify_peer,
-      cacerts: :public_key.cacerts_get(),
-      customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]
-    ]
-  end
-
   @doc false
-  def hex_request_headers, do: [{~c"user-agent", @hex_user_agent}]
+  defdelegate hex_request_headers, to: HexRegistry, as: :request_headers
 
   defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 end
