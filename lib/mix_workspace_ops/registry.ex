@@ -16,7 +16,7 @@ defmodule MixWorkspaceOps.Registry do
   ## Selection sits beside the catalog, not in place of it
 
   A view narrows what an operation acts on. It does not narrow the catalog:
-  `select/2` records which repositories and projects a view reached and leaves
+  `select/3` records which repositories and projects a view reached and leaves
   every catalogued record where it was. A pruned catalog would keep the whole
   document's `path` and `digest` while no longer describing that document, so a
   receipt naming the digest would describe a catalog that was never used — and
@@ -358,6 +358,17 @@ defmodule MixWorkspaceOps.Registry do
   """
   @spec select(t(), [project()]) :: t()
   def select(%__MODULE__{} = registry, selected_projects) when is_list(selected_projects) do
+    selected_repositories =
+      selected_projects
+      |> Enum.map(&repository!(registry, &1.repository))
+
+    select(registry, selected_projects, selected_repositories)
+  end
+
+  @doc "Records the repositories and projects a selection reached independently."
+  @spec select(t(), [project()], [repository()]) :: t()
+  def select(%__MODULE__{} = registry, selected_projects, selected_repositories)
+      when is_list(selected_projects) and is_list(selected_repositories) do
     projects =
       selected_projects
       |> Enum.map(& &1.id)
@@ -366,7 +377,14 @@ defmodule MixWorkspaceOps.Registry do
       |> Enum.map(&project!(registry, &1))
 
     project_ids = Enum.map(projects, & &1.id)
-    repository_ids = projects |> Enum.map(& &1.repository) |> Enum.uniq() |> Enum.sort()
+
+    repository_ids =
+      (Enum.map(selected_repositories, & &1.id) ++ Enum.map(projects, & &1.repository))
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.map(&repository!(registry, &1))
+      |> Enum.map(& &1.id)
+
     applications = Contract.index_projects(projects)
 
     selection = %{

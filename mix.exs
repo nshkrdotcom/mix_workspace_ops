@@ -12,16 +12,20 @@ defmodule MixWorkspaceOps.MixProject do
       escript: [main_module: MixWorkspaceOps.CLI],
       deps: deps(),
       docs: docs(),
-      dialyzer: [plt_add_apps: [:mix]]
+      dialyzer: [plt_add_apps: [:blitz, :mix]]
     ]
   end
 
   def application do
-    [extra_applications: [:crypto, :inets, :logger, :ssl]]
+    [
+      extra_applications: [:crypto, :inets, :logger, :ssl],
+      included_applications: [:blitz]
+    ]
   end
 
   defp deps do
     [
+      {:blitz, "== 0.4.1", runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: :dev, runtime: false},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false}

@@ -234,6 +234,42 @@ digests and rejects a mutation unless the invocation explicitly permits it.
 only marked MWO state, rechecks live leases, and leaves immutable overlays and
 bootstraps alone.
 
+## Semantic plans and execution bindings
+
+Fan-out has two documents because portability and execution name different
+facts. `mix_workspace_ops.plan/v1` is a strict, canonical, self-digested semantic
+document. It freezes catalog/view/selection identity, command and policy,
+toolchain, selected unit identities, expected revisions and source digests,
+dependency graph, and portable source decisions. A local source names its
+provider repository and project-relative path; it never names a checkout.
+
+`mix_workspace_ops.binding/v1` is produced only while running. It binds the plan
+digest to checkout directories, exact `Blitz.Command` translations, generated
+overlay/runtime paths, explicit environment values and removals, execution
+limits, timestamps, and final lock audits. It is machine-local and is not a
+portable artifact. Publication credentials appear only as removals with null
+values; inherited values are never serialized.
+
+Planning executes no requested command. Replay loads the bounded strict shape,
+verifies the self-digest and portability again, rebuilds current semantics, and
+reports drift by dimension before allocating runtime state. Revision,
+source-digest, dirty-state, source-decision, graph, registry/view/selection,
+command policy, and toolchain drift require a new plan; there is no force path.
+
+Project units activate the existing managed overlay/runtime contract.
+Repository units—including repositories with no Mix project—receive delegated
+private credential state without an overlay. An absent selected unit is reported
+and skipped. Continue mode passes every present command to one `Blitz.run/2`
+call with bounded concurrency; explicit fail-fast invokes the same executor one
+unit at a time and stops after the first failure. MWO does not implement a
+second scheduler.
+
+Every allocated runtime is finalized and its lease released after success,
+command failure, binding failure, exception, or lock-audit rejection. Results
+retain semantic-plan order even though Blitz runs concurrently, and a failed
+run still emits the semantic plan, machine binding, and complete per-unit JSON
+before the escript exits non-zero.
+
 Non-application workspace roots, including ordinary umbrella roots, are valid
 registry targets. No fake app name is introduced for a tooling or umbrella root.
 

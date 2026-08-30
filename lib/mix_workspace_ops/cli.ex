@@ -2,13 +2,13 @@ defmodule MixWorkspaceOps.CLI do
   @moduledoc false
 
   alias MixWorkspaceOps.{
-    Command,
     Discovery,
     Doctor,
+    Fanout,
     Inventory,
     LocalOverrides,
+    OperationPlan,
     OperatorPaths,
-    Overlay,
     PublishMode,
     Registry,
     Report,
@@ -33,9 +33,10 @@ defmodule MixWorkspaceOps.CLI do
     registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
     inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
     doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
-    plan --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
-      [--mix-env ENV] [--mix-target TARGET] \
-      [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false]
+    plan --registry PATH --checkout-root PATH [--view PATH | --project ID] [--binding PATH] \
+      [--unit project|repository] [--dirty-policy require-clean|allow-recorded] \
+      [--mix-env ENV] [--mix-target TARGET] [--mode auto|local|git|hex] \
+      [--source APP=SOURCE] [--fail-fast] [--output PATH] -- COMMAND [ARG ...]
     sources --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
       [--mix-env ENV] [--mix-target TARGET] \
       [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false]
@@ -46,11 +47,15 @@ defmodule MixWorkspaceOps.CLI do
       [--mix-env ENV] [--mix-target TARGET]
     state list [--state-root PATH]
     state gc --older-than N[s|m|h|d] [--dry-run] [--state-root PATH]
-    run --project ID [--mode auto|local|git|hex] [--source APP=SOURCE] \
-      --mix-state managed|delegated \
-      --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
-      [--mix-env ENV] [--mix-target TARGET] [--allow-lock-mutation] \
-      [--state-root PATH] -- COMMAND [ARG ...]
+    run --registry PATH --checkout-root PATH [--view PATH | --project ID] [--binding PATH] \
+      [--unit project|repository] [--dirty-policy require-clean|allow-recorded] \
+      [--mix-env ENV] [--mix-target TARGET] [--mode auto|local|git|hex] \
+      [--source APP=SOURCE] [--fail-fast] [--max-concurrency N] \
+      [--timeout N[s|m|h]] [--allow-lock-mutation] [--state-root PATH] \
+      -- COMMAND [ARG ...]
+    run --plan PATH --registry PATH --checkout-root PATH --view PATH [--binding PATH] \
+      [--max-concurrency N] [--timeout N[s|m|h]] [--allow-lock-mutation] \
+      [--state-root PATH]
     release publish --descriptor PATH [--state-root PATH]
     help
   """
@@ -78,7 +83,10 @@ defmodule MixWorkspaceOps.CLI do
       :mix_target,
       :mode,
       :source,
-      :as_publish
+      :unit,
+      :dirty_policy,
+      :fail_fast,
+      :output
     ],
     ["sources"] => [
       :project,
@@ -107,9 +115,14 @@ defmodule MixWorkspaceOps.CLI do
     ["state", "gc"] => [:state_root, :older_than, :dry_run],
     ["run"] => [
       :project,
+      :plan,
       :mode,
       :source,
-      :mix_state,
+      :unit,
+      :dirty_policy,
+      :fail_fast,
+      :max_concurrency,
+      :timeout,
       :registry,
       :checkout_root,
       :view,
@@ -123,7 +136,7 @@ defmodule MixWorkspaceOps.CLI do
   }
 
   @vocabulary @accepted |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
-  @switch_options [:allow_lock_mutation, :clear, :dry_run]
+  @switch_options [:allow_lock_mutation, :clear, :dry_run, :fail_fast]
 
   # The two tasks that mutate a package registry. `hex.build` is a publish task
   # for resolution and is not refused here: it writes a tarball and nothing else,
@@ -149,6 +162,11 @@ defmodule MixWorkspaceOps.CLI do
   defp exit_status({:ok, value}) do
     IO.puts(Report.encode(value))
     0
+  end
+
+  defp exit_status({:error, {:fanout_failed, report}}) do
+    IO.puts(Report.encode(report))
+    1
   end
 
   defp exit_status({:error, reason}) do
@@ -237,7 +255,7 @@ defmodule MixWorkspaceOps.CLI do
          {:ok, view} <- View.load(options.view),
          {:ok, repositories} <- View.select_repositories(registry, view),
          {:ok, projects} <- View.select(registry, view) do
-      selected = Registry.select(registry, projects)
+      selected = Registry.select(registry, projects, repositories)
 
       {:ok,
        %{
@@ -282,29 +300,16 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(["plan" | args]) do
-    with {:ok, options, []} <- options(["plan"], args),
-         {:ok, registry, decided} <- resolve_target(options) do
-      resolution = decided.closure
-
-      {:ok,
-       %{
-         schema: "mix_workspace_ops.plan/v2",
-         target: options.project,
-         registry_digest: registry.digest,
-         selection_digest: Registry.selection_digest(registry),
-         graph_digest: resolution.digest,
-         mix_env: resolution.mix_env,
-         mix_target: resolution.mix_target,
-         sets: Registry.sets(registry),
-         mode: options.mode,
-         publish: decided.publish?,
-         projects: Enum.map(resolution.projects, & &1.id),
-         edges: resolution.edges,
-         dependency_applications: resolution.dependency_applications,
-         external_dependencies: resolution.external_dependencies,
-         known_unselected: known_unselected(resolution),
-         sources: Resolution.sources(decided)
-       }}
+    with {:ok, option_args, command} <- split_command("plan", args),
+         {:ok, options, []} <- options(["plan"], option_args),
+         :ok <- require_fanout_scope(options),
+         :ok <- require_command(command),
+         :ok <- require_safe_run_command(command),
+         {:ok, registry, view} <- load_fanout_context(options),
+         {:ok, build_opts} <- semantic_options(options),
+         {:ok, plan} <- OperationPlan.build(registry, view, command, build_opts),
+         :ok <- maybe_write_report(options.output, plan) do
+      {:ok, plan}
     end
   end
 
@@ -415,34 +420,10 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   def dispatch(["run" | args]) do
-    with {:ok, option_args, command} <- split_command(args),
-         {:ok, options, []} <- options(["run"], option_args),
-         :ok <- require_option(options, :project),
-         :ok <- require_command(command),
-         :ok <- require_safe_run_command(command),
-         {:ok, registry} <- load_bound_registry(options),
-         :ok <- ensure_project_in_view(registry, options),
-         {:ok, mode} <- source_mode(options.mode),
-         {:ok, sources} <- source_overrides(options.source),
-         {:ok, mix_state} <- mix_state(options.mix_state) do
-      project_root = Registry.project_root(registry, options.project)
-
-      Overlay.with_activation(
-        registry,
-        options.project,
-        [
-          mode: mode,
-          sources: sources,
-          publish?: PublishMode.publish?(PublishMode.task_argv(command)),
-          mix_env: options.mix_env,
-          mix_target: options.mix_target,
-          allow_lock_mutation: options.allow_lock_mutation,
-          mix_state: mix_state,
-          probe_memo: ProbeMemo.new(),
-          state_root: options.state_root
-        ],
-        fn source_report, env -> run_command(command, project_root, source_report, env) end
-      )
+    case split_optional_command(args) do
+      {:fresh, option_args, command} -> run_fresh(option_args, command)
+      {:replay, option_args} -> run_replay(option_args)
+      {:usage_error, _reason} = error -> error
     end
   end
 
@@ -456,7 +437,36 @@ defmodule MixWorkspaceOps.CLI do
 
   def dispatch(args), do: {:usage_error, "unknown command: #{Enum.join(args, " ")} "}
 
-  # `plan` and `sources` differ in what they project, not in what they decide.
+  defp run_fresh(option_args, command) do
+    with {:ok, options, []} <- options(["run"], option_args),
+         :ok <- reject_option(options.plan, "--plan cannot be combined with a command"),
+         :ok <- require_fanout_scope(options),
+         :ok <- require_command(command),
+         :ok <- require_safe_run_command(command),
+         {:ok, registry, view} <- load_fanout_context(options),
+         {:ok, build_opts} <- semantic_options(options),
+         {:ok, plan} <- OperationPlan.build(registry, view, command, build_opts),
+         {:ok, execution_opts} <- execution_options(options) do
+      Fanout.run(plan, registry, execution_opts)
+    end
+  end
+
+  defp run_replay(option_args) do
+    with {:ok, options, []} <- options(["run"], option_args),
+         :ok <- require_option(options, :plan),
+         :ok <- require_option(options, :view),
+         :ok <- reject_semantic_replay_options(option_args),
+         {:ok, recorded} <- OperationPlan.load(options.plan),
+         :ok <- require_safe_run_command(OperationPlan.command_argv(recorded)),
+         {:ok, registry, view} <- load_fanout_context(options),
+         memo <- ProbeMemo.new(),
+         {:ok, plan} <- OperationPlan.replay(recorded, registry, view, probe_memo: memo),
+         {:ok, execution_opts} <- execution_options(options, memo) do
+      Fanout.run(plan, registry, execution_opts)
+    end
+  end
+
+  # `sources` retains the direct single-project resolution projection.
   defp resolve_target(options) do
     with :ok <- require_option(options, :project),
          {:ok, registry} <- load_bound_registry(options),
@@ -501,16 +511,44 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
+  defp load_fanout_context(options) do
+    with :ok <- require_options(options, [:registry, :checkout_root]),
+         {:ok, registry} <- Registry.load(options.registry),
+         {:ok, registry, view} <- select_fanout_scope(registry, options),
+         {:ok, registry} <-
+           Registry.bind(registry, options.checkout_root, binding_file: options.binding) do
+      {:ok, registry, view}
+    end
+  end
+
+  defp select_fanout_scope(registry, %{view: view_path} = options)
+       when is_binary(view_path) do
+    with {:ok, view} <- View.load(view_path),
+         {:ok, repositories} <- View.select_repositories(registry, view),
+         {:ok, projects} <- View.select(registry, view),
+         selected = Registry.select(registry, projects, repositories),
+         :ok <- ensure_project_in_view(selected, options) do
+      {:ok, selected, view}
+    end
+  end
+
+  defp select_fanout_scope(registry, %{project: project_id}) when is_binary(project_id) do
+    Registry.project!(registry, project_id)
+    {:ok, registry, nil}
+  end
+
   defp select_view(registry, nil), do: {:ok, registry}
 
   defp select_view(registry, view_path) do
     with {:ok, view} <- View.load(view_path),
+         {:ok, repositories} <- View.select_repositories(registry, view),
          {:ok, projects} <- View.select(registry, view) do
-      {:ok, Registry.select(registry, projects)}
+      {:ok, Registry.select(registry, projects, repositories)}
     end
   end
 
   defp ensure_project_in_view(_registry, %{view: nil}), do: :ok
+  defp ensure_project_in_view(_registry, %{project: nil}), do: :ok
 
   defp ensure_project_in_view(registry, options) do
     if Registry.selected?(registry, options.project),
@@ -562,7 +600,11 @@ defmodule MixWorkspaceOps.CLI do
   defp default(:mix_env), do: "dev"
   defp default(:mix_target), do: "host"
   defp default(:source), do: []
-  defp default(:mix_state), do: "managed"
+  defp default(:unit), do: "project"
+  defp default(:dirty_policy), do: "require-clean"
+  defp default(:fail_fast), do: false
+  defp default(:max_concurrency), do: Integer.to_string(System.schedulers_online())
+  defp default(:timeout), do: "infinity"
   defp default(:state_root), do: default_state_root()
   defp default(:allow_lock_mutation), do: false
   defp default(:clear), do: false
@@ -573,7 +615,7 @@ defmodule MixWorkspaceOps.CLI do
     do: {:ok, options, Enum.reverse(positional)}
 
   defp parse_options(["--" <> option | rest], command, accepted, options, positional)
-       when option in ["allow-lock-mutation", "clear", "dry-run"] do
+       when option in ["allow-lock-mutation", "clear", "dry-run", "fail-fast"] do
     with {:ok, key} <- option_key(command, accepted, option),
          true <- key in @switch_options do
       parse_options(rest, command, accepted, Map.put(options, key, true), positional)
@@ -612,6 +654,7 @@ defmodule MixWorkspaceOps.CLI do
       :checkout_root,
       :binding,
       :view,
+      :plan,
       :state_root,
       :output,
       :descriptor,
@@ -629,10 +672,25 @@ defmodule MixWorkspaceOps.CLI do
     {:ok, normalized}
   end
 
-  defp split_command(args) do
+  defp split_command(command_name, args) do
     case Enum.split_while(args, &(&1 != "--")) do
-      {_options, []} -> {:usage_error, "run requires -- followed by a command"}
-      {options, ["--" | command]} -> {:ok, options, command}
+      {_options, []} ->
+        {:usage_error, "#{command_name} requires -- followed by a command"}
+
+      {options, ["--" | command]} ->
+        {:ok, options, command}
+    end
+  end
+
+  defp split_optional_command(args) do
+    case Enum.split_while(args, &(&1 != "--")) do
+      {options, []} ->
+        if "--plan" in options,
+          do: {:replay, options},
+          else: {:usage_error, "run requires -- followed by a command, or --plan PATH"}
+
+      {options, ["--" | command]} ->
+        {:fresh, options, command}
     end
   end
 
@@ -694,12 +752,6 @@ defmodule MixWorkspaceOps.CLI do
     }
   end
 
-  defp known_unselected(resolution) do
-    Enum.map(resolution.known_unselected, fn {consumer, application, candidates} ->
-      %{consumer: consumer, application: application, candidates: candidates}
-    end)
-  end
-
   defp multiply_provided(registry) do
     Enum.count(registry.applications, fn {_app, projects} -> length(projects) > 1 end)
   end
@@ -714,6 +766,94 @@ defmodule MixWorkspaceOps.CLI do
 
   defp require_command([]), do: {:usage_error, "empty command"}
   defp require_command(_command), do: :ok
+
+  defp require_fanout_scope(%{view: nil, project: nil}),
+    do: {:usage_error, "plan and run require --view PATH or --project ID"}
+
+  defp require_fanout_scope(_options), do: :ok
+
+  defp semantic_options(options) do
+    with {:ok, mode} <- source_mode(options.mode),
+         {:ok, sources} <- source_overrides(options.source),
+         {:ok, unit_kind} <- unit_kind(options.unit),
+         {:ok, dirty_policy} <- dirty_policy(options.dirty_policy) do
+      {:ok,
+       [
+         unit_kind: unit_kind,
+         dirty_policy: dirty_policy,
+         failure_policy: if(options.fail_fast, do: :fail_fast, else: :continue),
+         mode: mode,
+         sources: sources,
+         mix_env: options.mix_env,
+         mix_target: options.mix_target,
+         project: options.project,
+         probe_memo: ProbeMemo.new()
+       ]}
+    end
+  end
+
+  defp execution_options(options, memo \\ ProbeMemo.new()) do
+    with {:ok, max_concurrency} <- positive_integer(options.max_concurrency, :max_concurrency),
+         {:ok, timeout} <- timeout(options.timeout) do
+      {:ok,
+       [
+         max_concurrency: max_concurrency,
+         timeout: timeout,
+         state_root: options.state_root,
+         allow_lock_mutation: options.allow_lock_mutation,
+         probe_memo: memo
+       ]}
+    end
+  end
+
+  defp unit_kind("project"), do: {:ok, :project}
+  defp unit_kind("repository"), do: {:ok, :repository}
+  defp unit_kind(value), do: {:usage_error, "invalid unit kind #{inspect(value)}"}
+
+  defp dirty_policy("require-clean"), do: {:ok, :require_clean}
+  defp dirty_policy("allow-recorded"), do: {:ok, :allow_recorded}
+  defp dirty_policy(value), do: {:usage_error, "invalid dirty policy #{inspect(value)}"}
+
+  defp positive_integer(value, field) do
+    case Integer.parse(value) do
+      {number, ""} when number > 0 -> {:ok, number}
+      _other -> {:usage_error, "--#{option_name(field)} expects a positive integer"}
+    end
+  end
+
+  defp timeout("infinity"), do: {:ok, :infinity}
+
+  defp timeout(value) do
+    case Regex.run(~r/^(\d+)([smh]?)$/, value) do
+      [_, amount, suffix] ->
+        {number, ""} = Integer.parse(amount)
+
+        multiplier =
+          Map.fetch!(%{"" => 1_000, "s" => 1_000, "m" => 60_000, "h" => 3_600_000}, suffix)
+
+        if number > 0,
+          do: {:ok, number * multiplier},
+          else: {:usage_error, "--timeout expects a positive duration"}
+
+      _other ->
+        {:usage_error, "--timeout expects N, Ns, Nm, Nh, or infinity"}
+    end
+  end
+
+  defp reject_semantic_replay_options(args) do
+    semantic = ~w(project unit dirty-policy mode source mix-env mix-target fail-fast)
+
+    case Enum.find(args, fn argument ->
+           String.starts_with?(argument, "--") and
+             String.trim_leading(argument, "--") in semantic
+         end) do
+      nil -> :ok
+      option -> {:usage_error, "replay takes semantic policy from the plan; remove #{option}"}
+    end
+  end
+
+  defp reject_option(nil, _message), do: :ok
+  defp reject_option(_value, message), do: {:usage_error, message}
 
   # A guard reading argv position 2 refused `mix hex.publish` and let
   # `mix do compile, hex.publish` and `elixir -S mix hex.publish` past, while the
@@ -783,17 +923,6 @@ defmodule MixWorkspaceOps.CLI do
   defp source_name("github"), do: {:ok, "github"}
   defp source_name("hex"), do: {:ok, "hex"}
   defp source_name(_source), do: :error
-
-  defp mix_state("managed"), do: {:ok, :managed}
-  defp mix_state("delegated"), do: {:ok, :delegated}
-  defp mix_state(mode), do: {:usage_error, "invalid Mix-state ownership #{inspect(mode)}"}
-
-  defp run_command([executable | argv], project_root, source_report, env) do
-    case Command.run(executable, argv, cd: project_root, env: env) do
-      {:ok, command_result} -> {:ok, %{source: source_report, command: command_result}}
-      {:error, command_result} -> {:error, {:command_failed, command_result}}
-    end
-  end
 
   defp maybe_write_report(nil, _report), do: :ok
   defp maybe_write_report(path, report), do: Report.write(path, report)

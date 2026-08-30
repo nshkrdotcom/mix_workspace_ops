@@ -58,3 +58,6 @@
 - Add lease-aware `state list` and `state gc --older-than ... [--dry-run]`.
 - Parse each content-addressed overlay once per invocation and keep dependency
   source/notice state in invocation-local ETS rather than persistent term.
+- Add strict portable semantic plans, named replay drift, machine-local execution
+  bindings, project/repository fan-out through pinned Blitz, absent-unit results,
+  continue/fail-fast policy, and standalone escript packaging coverage.

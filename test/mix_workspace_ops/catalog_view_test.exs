@@ -39,6 +39,11 @@ defmodule MixWorkspaceOps.CatalogViewTest do
     assert {:ok, [repository]} = View.select_repositories(registry, view)
     assert repository.id == "charts"
     assert {:ok, []} = View.select(registry, view)
+
+    selected = Registry.select(registry, [], [repository])
+    assert Enum.map(Registry.selected_repositories(selected), & &1.id) == ["charts"]
+    assert Registry.selected_projects(selected) == []
+    assert Registry.sets(selected).selected.repositories == 1
   end
 
   test "selects on groups, languages, and lifecycles", context do

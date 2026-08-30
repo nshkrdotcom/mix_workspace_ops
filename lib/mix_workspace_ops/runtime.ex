@@ -430,7 +430,8 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   defp archives_source do
-    Path.join(Mix.Utils.mix_home(), "archives")
+    mix_home = System.get_env("MIX_HOME") || Path.join(System.user_home!(), ".mix")
+    mix_home |> Path.expand() |> Path.join("archives")
   end
 
   defp copy_archives(_destination, nil), do: :ok

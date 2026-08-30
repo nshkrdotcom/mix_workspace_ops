@@ -162,12 +162,14 @@ defmodule MixWorkspaceOps.MixInputsTest do
                "--mix-env",
                "dev",
                "--mix-target",
-               "host"
+               "host",
+               "--",
+               "true"
              ])
 
-    assert plan.mix_env == "dev"
-    assert plan.mix_target == "host"
-    assert Enum.map(plan.sources, & &1.application) == ["alpha"]
+    assert plan.policy.mix_env == "dev"
+    assert plan.policy.mix_target == "host"
+    assert Enum.map(hd(plan.units).sources, & &1.application) == ["alpha"]
   end
 
   test "only and targets are classified under the explicit inputs", context do

@@ -148,8 +148,9 @@ flags:
 ./mix_workspace_ops plan \
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \
-  --project example.consumer \
-  --mix-env dev --mix-target host
+  --view /path/to/view.json \
+  --mix-env dev --mix-target host \
+  -- mix compile
 ./mix_workspace_ops seam \
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \
@@ -160,9 +161,9 @@ flags:
 ./mix_workspace_ops run \
   --registry /path/to/registry.json \
   --checkout-root /path/to/checkouts \
-  --project example.consumer \
+  --view /path/to/view.json \
   --mix-env test --mix-target host \
-  --mode local --mix-state managed -- mix test
+  --mode local --max-concurrency 8 -- mix test
 ./mix_workspace_ops state list
 ./mix_workspace_ops state gc --older-than 7d --dry-run
 ```
@@ -170,6 +171,50 @@ flags:
 `--mix-env` and `--mix-target` are graph inputs, not readings of ambient shell
 state. They default deterministically to `dev` and `host`, appear in plans and
 overlays, and contribute to graph and context digests.
+
+### Portable plans and fan-out
+
+`plan` emits a strict, self-digested `mix_workspace_ops.plan/v1` document and
+does not execute the command after `--`. The plan freezes the registry and view
+digests, selected units, command and policy, toolchain, repository revisions and
+source digests, dependency graph, and every resolved source decision. It carries
+portable repository/project coordinates only: no checkout root, generated state
+path, environment binding, or credential.
+
+Project units are the default. `--unit repository` selects repositories instead,
+including repositories with no Mix project. A selected checkout that is absent
+is an `absent` unit rather than a failure. Source dirt is refused by default;
+`--dirty-policy allow-recorded` freezes its exact source digest for replay.
+
+`run` constructs the same semantic plan, binds present units to local checkouts
+and private runtime state, and translates them to real `%Blitz.Command{}` values.
+Blitz owns bounded concurrency. Continue-on-failure is the default;
+`--fail-fast` is explicit. The final `mix_workspace_ops.run/v1` JSON carries the
+semantic plan, the machine-local `mix_workspace_ops.binding/v1`, and stable
+per-unit `passed`, `failed`, `absent`, or `not_run` results. A failed unit makes
+the escript exit non-zero while still emitting that complete JSON report.
+
+Write a portable plan with `--output` and replay it without semantic overrides:
+
+```bash
+./mix_workspace_ops plan \
+  --registry /path/to/registry.json \
+  --checkout-root /path/to/checkouts \
+  --view /path/to/view.json \
+  --output /path/to/plan.json -- mix test
+
+./mix_workspace_ops run \
+  --plan /path/to/plan.json \
+  --registry /path/to/registry.json \
+  --checkout-root /path/to/checkouts \
+  --view /path/to/view.json \
+  --max-concurrency 8 --timeout 20m
+```
+
+Replay reconstructs current semantics and refuses named registry, view,
+selection, revision, source-digest, dirty-state, graph/source-decision, command
+policy, or toolchain drift before allocating runtime state. There is no force
+flag or silent replan; produce a new plan when the intended inputs change.
 
 Local and Git overlays are stored beneath operator-owned XDG state and passed
 only to the child command through `MIX_WORKSPACE_OPS_OVERLAY`. No source-mode
@@ -192,17 +237,14 @@ adds target HEAD/source state plus the explicit Mix environment and target. Each
 activation then adds a random invocation id and receives a private writable run
 root; identities may match, but writable directories never do.
 
-Managed Mix-state mode supplies invocation-unique, operator-owned Home, Mix,
+Project fan-out supplies invocation-unique, operator-owned Home, Mix,
 archives, `MIX_DEPS_PATH`, `MIX_BUILD_ROOT`, `HEX_HOME`, Rebar, temporary, and
 lockfile state. The source lock is copied and its initial and final digests are
 recorded. Mutation is rejected unless that particular run carries
-`--allow-lock-mutation`, and the checkout's lockfile is never changed. Delegated
-mode leaves deps/build/lock ownership with the workspace runner while retaining
-the unique Home/Mix/Hex credential shield and source/bootstrap context:
-
-```bash
-./mix_workspace_ops run ... --mix-state delegated -- runner command
-```
+`--allow-lock-mutation`, and the checkout's lockfile is never changed.
+Repository fan-out delegates deps/build/lock ownership while retaining the
+unique Home/Mix/Hex credential shield. These ownership choices follow the unit
+kind rather than an operator flag.
 
 Recognized publishing task names are refused through `run` as an operator error,
 but task recognition is not the security boundary. Every ordinary activation

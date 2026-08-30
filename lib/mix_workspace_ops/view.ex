@@ -6,11 +6,9 @@ defmodule MixWorkspaceOps.View do
   Mix project is still reachable: `select_repositories/2` returns it and
   `registry select` reports it, even though it contributes no project.
 
-  No command operates on such a repository yet. `MixWorkspaceOps.Registry.select/2`
-  records a repository only where the view reached one of its projects, so a
-  repository-scoped unit of work has nothing to run against. Repository-scoped
-  units arrive with the fan-out work; until then the selection is data, not an
-  execution target.
+  `MixWorkspaceOps.Registry.select/3` records repository and project matches
+  independently, so repository-scoped fan-out can operate on a selected
+  repository even when it has no Mix project.
 
   `portfolio_registry.view/v2` selects on repository identity, groups, languages,
   and lifecycles as well as project identity. `mix_workspace_ops.view/v1` still

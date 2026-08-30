@@ -339,23 +339,69 @@ defmodule MixWorkspaceOps.CLITest do
                "--registry",
                catalog,
                "--checkout-root",
-               root
+               root,
+               "--",
+               "true"
              ])
 
-    assert report.schema == "mix_workspace_ops.plan/v2"
-    assert report.target == "alpha"
-    assert report.projects == ["alpha"]
-    assert report.known_unselected == []
-    assert report.mode == "auto"
-    refute report.publish
+    assert report.schema == "mix_workspace_ops.plan/v1"
+    assert report.command == %{executable: "true", args: []}
+    assert report.policy.unit_kind == :project
+    assert report.policy.source_mode == :auto
+    assert Enum.map(report.units, & &1.id) == ["alpha"]
 
-    # The three sets, named apart. With no view the catalog and the selection
-    # agree, and what is materialized is a fact about this disk.
+    # A direct project gesture narrows units, not the providers resolution may use.
     assert report.sets.catalogued.repositories == 2
     assert report.sets.selected.repositories == 2
     assert report.sets.selected.digest == nil
     assert report.sets.materialized.repositories == 2
     assert report.sets.materialized.absent_repositories == []
+  end
+
+  test "view planning reports present and absent projects without local state", context do
+    root = temporary_directory!(context)
+    alpha = initialize_repository!(Path.join(root, "alpha"))
+
+    catalog =
+      write_catalog!(root, [
+        catalog_repository("alpha", projects: [catalog_project("alpha")]),
+        catalog_repository("missing", projects: [catalog_project("missing")])
+      ])
+
+    view = write_catalog_view!(root, "all", %{})
+    marker = Path.join(alpha, "plan-marker")
+    previous = System.get_env("HEX_API_KEY")
+    System.put_env("HEX_API_KEY", "credential-sentinel")
+
+    on_exit(fn ->
+      if previous,
+        do: System.put_env("HEX_API_KEY", previous),
+        else: System.delete_env("HEX_API_KEY")
+    end)
+
+    assert {:ok, plan} =
+             CLI.dispatch([
+               "plan",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--view",
+               view,
+               "--",
+               "sh",
+               "-c",
+               "touch plan-marker"
+             ])
+
+    assert Enum.map(plan.units, &{&1.id, &1.status}) == [
+             {"alpha", :planned},
+             {"missing", :absent}
+           ]
+
+    refute File.exists?(marker)
+    refute Enum.any?(strings(plan), &String.contains?(&1, root))
+    refute "credential-sentinel" in strings(plan)
   end
 
   test "the three sets stay apart under a view", context do
@@ -373,7 +419,9 @@ defmodule MixWorkspaceOps.CLITest do
                "--view",
                view,
                "--binding",
-               binding
+               binding,
+               "--",
+               "true"
              ])
 
     assert report.sets.catalogued.repositories == 2
@@ -381,9 +429,103 @@ defmodule MixWorkspaceOps.CLITest do
     assert is_binary(report.sets.selected.digest)
     assert report.sets.materialized.repositories == 1
     assert report.sets.materialized.absent == 0
-    assert report.sets.catalogued.digest == report.registry_digest
+    assert report.sets.catalogued.digest == report.registry.digest
     assert report.sets.selected.unselected_applications == ["plane", "plane_legacy"]
     assert report.selection_digest == report.sets.selected.digest
+  end
+
+  test "plan output is replayed without accepting semantic overrides", context do
+    %{root: root, catalog: catalog, view: view, state_root: state_root} = workspace!(context)
+    plan_path = Path.join(root, "portable-plan.json")
+
+    assert {:ok, plan} =
+             CLI.dispatch([
+               "plan",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--view",
+               view,
+               "--output",
+               plan_path,
+               "--",
+               "true"
+             ])
+
+    assert String.trim_trailing(File.read!(plan_path)) == MixWorkspaceOps.Report.encode(plan)
+
+    replay = [
+      "run",
+      "--plan",
+      plan_path,
+      "--registry",
+      catalog,
+      "--checkout-root",
+      root,
+      "--view",
+      view,
+      "--state-root",
+      state_root
+    ]
+
+    assert {:ok, report} = CLI.dispatch(replay)
+    assert report.plan.digest == plan.digest
+    assert [%{id: "alpha", status: :passed}] = report.results
+
+    assert CLI.dispatch(replay ++ ["--fail-fast"]) ==
+             {:usage_error, "replay takes semantic policy from the plan; remove --fail-fast"}
+
+    assert CLI.dispatch(replay ++ ["--", "false"]) ==
+             {:usage_error, "--plan cannot be combined with a command"}
+  end
+
+  test "replay refuses changed source state before launching the child", context do
+    %{root: root, catalog: catalog, view: view, state_root: state_root} = workspace!(context)
+    plan_path = Path.join(root, "drift-plan.json")
+    marker = Path.join(root, "alpha/replay-marker")
+
+    assert {:ok, _plan} =
+             CLI.dispatch([
+               "plan",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--view",
+               view,
+               "--output",
+               plan_path,
+               "--",
+               "sh",
+               "-c",
+               "touch replay-marker"
+             ])
+
+    File.write!(Path.join(root, "alpha/advance"), "advanced\n")
+    {_, 0} = System.cmd("git", ["add", "advance"], cd: Path.join(root, "alpha"))
+
+    {_, 0} =
+      System.cmd("git", ["commit", "--quiet", "-m", "advance"], cd: Path.join(root, "alpha"))
+
+    assert {:error, {:plan_drift, drifts}} =
+             CLI.dispatch([
+               "run",
+               "--plan",
+               plan_path,
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--view",
+               view,
+               "--state-root",
+               state_root
+             ])
+
+    assert Enum.any?(drifts, &(&1.field == :repository_head and &1.unit == "alpha"))
+    refute File.exists?(marker)
+    refute File.exists?(state_root)
   end
 
   test "sources reports where every dependency resolves from", context do
@@ -478,7 +620,7 @@ defmodule MixWorkspaceOps.CLITest do
   test "a report projects publish resolution rather than asserting it", context do
     %{root: root, catalog: catalog} = seam_workspace!(context)
 
-    for command <- ["sources", "plan"] do
+    for command <- ["sources"] do
       assert CLI.dispatch([
                command,
                "--project",
@@ -534,12 +676,15 @@ defmodule MixWorkspaceOps.CLITest do
              "--checkout-root",
              root,
              "--view",
-             view
+             view,
+             "--",
+             "true"
            ]) == {:error, {:project_outside_view, "plane", view}}
   end
 
-  test "plan requires a project" do
-    assert CLI.dispatch(["plan"]) == {:usage_error, "missing --project"}
+  test "plan requires a view or project scope" do
+    assert CLI.dispatch(["plan", "--", "true"]) ==
+             {:usage_error, "plan and run require --view PATH or --project ID"}
   end
 
   # The acceptance item names a gesture, not a rule: remove the sibling and it
@@ -549,7 +694,7 @@ defmodule MixWorkspaceOps.CLITest do
   test "removing a sibling checkout makes every command resolve GitHub", context do
     %{root: root, catalog: catalog, core: core} = sibling_workspace!(context)
 
-    for command <- ["sources", "plan"] do
+    for command <- ["sources"] do
       assert {:ok, report} =
                CLI.dispatch([
                  command,
@@ -564,9 +709,24 @@ defmodule MixWorkspaceOps.CLITest do
       assert [%{application: "core", source: "local"}] = report.sources
     end
 
+    assert {:ok, local_plan} =
+             CLI.dispatch([
+               "plan",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--",
+               "true"
+             ])
+
+    assert [%{sources: [%{application: "core", source: "local"}]}] = local_plan.units
+
     File.rm_rf!(core)
 
-    for command <- ["sources", "plan"] do
+    for command <- ["sources"] do
       assert {:ok, report} =
                CLI.dispatch([
                  command,
@@ -581,22 +741,44 @@ defmodule MixWorkspaceOps.CLITest do
       assert [%{application: "core", source: "github", location: "example-org/core"}] =
                report.sources
     end
+
+    assert {:ok, github_plan} =
+             CLI.dispatch([
+               "plan",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--",
+               "true"
+             ])
+
+    assert [%{sources: [%{application: "core", source: "github"} = source]}] =
+             github_plan.units
+
+    assert source.coordinates.repo == "example-org/core"
   end
 
-  test "an absent target checkout is a typed error naming its path", context do
+  test "an absent target checkout is a non-fatal plan unit", context do
     %{root: root, catalog: catalog, core: core} = sibling_workspace!(context)
     File.rm_rf!(core)
 
-    assert CLI.dispatch([
-             "plan",
-             "--project",
-             "core",
-             "--registry",
-             catalog,
-             "--checkout-root",
-             root
-           ]) ==
-             {:error, {:absent_required_checkout, "core", core}}
+    assert {:ok, plan} =
+             CLI.dispatch([
+               "plan",
+               "--project",
+               "core",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--",
+               "true"
+             ])
+
+    assert [%{id: "core", status: :absent}] = plan.units
   end
 
   test "run executes the command in the project root", context do
@@ -613,17 +795,15 @@ defmodule MixWorkspaceOps.CLITest do
                root,
                "--mode",
                "hex",
-               "--mix-state",
-               "delegated",
                "--state-root",
                state_root,
                "--",
                "pwd"
              ])
 
-    assert report.command.exit_code == 0
-    assert String.trim(report.command.output) == Path.join(root, "alpha")
-    assert report.source.mode == :hex
+    assert [%{status: :passed, exit_code: 0, output_tail: output}] = report.results
+    assert output == [Path.join(root, "alpha")]
+    assert report.plan.policy.source_mode == :hex
   end
 
   test "run resolves through the catalog's own order unless a mode is named", context do
@@ -638,16 +818,14 @@ defmodule MixWorkspaceOps.CLITest do
                catalog,
                "--checkout-root",
                root,
-               "--mix-state",
-               "delegated",
                "--state-root",
                state_root,
                "--",
                "pwd"
              ])
 
-    assert report.source.mode == :auto
-    refute report.source.publish
+    assert report.plan.policy.source_mode == :auto
+    assert report.status == :passed
   end
 
   test "ordinary run reaches an unnamed publish-shaped child without credentials", context do
@@ -663,7 +841,7 @@ defmodule MixWorkspaceOps.CLITest do
     end
     """
 
-    assert {:error, {:command_failed, result}} =
+    assert {:error, {:fanout_failed, report}} =
              CLI.dispatch([
                "run",
                "--project",
@@ -675,14 +853,15 @@ defmodule MixWorkspaceOps.CLITest do
                "--state-root",
                state_root,
                "--",
-               System.find_executable("elixir"),
+               "elixir",
                "-e",
                fixture
              ])
 
+    assert [result] = report.results
     assert result.exit_code == 77
-    assert result.output =~ "publication credentials unavailable"
-    refute result.output =~ "unexpected publication capability"
+    assert "publication credentials unavailable" in result.output_tail
+    refute "unexpected publication capability" in result.output_tail
   end
 
   test "state list and gc expose the same completed run", context do
@@ -750,7 +929,7 @@ defmodule MixWorkspaceOps.CLITest do
 
     command = [
       "--",
-      System.find_executable("elixir"),
+      "elixir",
       "-e",
       ~s|File.write!(System.fetch_env!("MIX_WORKSPACE_OPS_LOCKFILE"), "changed\\n")|
     ]
@@ -763,20 +942,22 @@ defmodule MixWorkspaceOps.CLITest do
       catalog,
       "--checkout-root",
       root,
+      "--dirty-policy",
+      "allow-recorded",
       "--state-root",
       state_root
     ]
 
-    assert {:error, {:lock_mutation_not_allowed, _run_id, initial, final}} =
-             CLI.dispatch(options ++ command)
-
-    refute initial == final
+    assert {:error, {:fanout_failed, rejected}} = CLI.dispatch(options ++ command)
+    assert [%{status: :failed, finalize_error: error}] = rejected.results
+    assert error =~ "lock_mutation_not_allowed"
 
     assert {:ok, report} =
              CLI.dispatch(options ++ ["--allow-lock-mutation"] ++ command)
 
-    assert report.source.runtime.lock_mutated
-    assert report.source.runtime.allow_lock_mutation
+    assert [binding] = report.binding.units
+    assert binding.runtime.lock_mutated
+    assert binding.runtime.allow_lock_mutation
     assert File.read!(project_lock) == "%{}\n"
   end
 
@@ -800,7 +981,7 @@ defmodule MixWorkspaceOps.CLITest do
              {:usage_error, "invalid source \"svn\""}
   end
 
-  test "run refuses an unknown mode and an unknown Mix-state owner", context do
+  test "run refuses an unknown mode, unit kind, and dirty policy", context do
     %{root: root, catalog: catalog} = workspace!(context)
 
     base = [
@@ -816,13 +997,16 @@ defmodule MixWorkspaceOps.CLITest do
     assert CLI.dispatch(base ++ ["--mode", "nonsense", "--", "pwd"]) ==
              {:usage_error, "invalid source mode \"nonsense\""}
 
-    assert CLI.dispatch(base ++ ["--mix-state", "nonsense", "--", "pwd"]) ==
-             {:usage_error, "invalid Mix-state ownership \"nonsense\""}
+    assert CLI.dispatch(base ++ ["--unit", "nonsense", "--", "pwd"]) ==
+             {:usage_error, "invalid unit kind \"nonsense\""}
+
+    assert CLI.dispatch(base ++ ["--dirty-policy", "nonsense", "--", "pwd"]) ==
+             {:usage_error, "invalid dirty policy \"nonsense\""}
   end
 
   test "run requires a command after the separator" do
     assert CLI.dispatch(["run", "--project", "alpha"]) ==
-             {:usage_error, "run requires -- followed by a command"}
+             {:usage_error, "run requires -- followed by a command, or --plan PATH"}
 
     assert CLI.dispatch(["run", "--project", "alpha", "--"]) == {:usage_error, "empty command"}
   end
@@ -1024,5 +1208,11 @@ defmodule MixWorkspaceOps.CLITest do
   end
 
   defp command_terminator(["run"]), do: ["--", "true"]
+  defp command_terminator(["plan"]), do: ["--", "true"]
   defp command_terminator(_command), do: []
+
+  defp strings(value) when is_binary(value), do: [value]
+  defp strings(value) when is_list(value), do: Enum.flat_map(value, &strings/1)
+  defp strings(value) when is_map(value), do: value |> Map.values() |> Enum.flat_map(&strings/1)
+  defp strings(_value), do: []
 end
