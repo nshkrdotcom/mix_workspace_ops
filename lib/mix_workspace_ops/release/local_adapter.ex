@@ -6,22 +6,31 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
   alias MixWorkspaceOps.{Command, Project, Registry}
   alias MixWorkspaceOps.Release.{HexRegistry, Preflight, PreparedArtifact}
 
-  @preserved_environment ~w(HOME PATH USER LOGNAME LANG LC_ALL TERM SHELL ASDF_DIR ASDF_DATA_DIR MIX_HOME MIX_ARCHIVES MIX_ENV MIX_TARGET ERL_AFLAGS ERL_FLAGS ELIXIR_ERL_OPTIONS SSH_AUTH_SOCK XDG_RUNTIME_DIR CI CODEX_CI)
+  @preserved_environment ~w(PATH USER LOGNAME LANG LC_ALL TERM SHELL ASDF_DIR ASDF_DATA_DIR MIX_ENV MIX_TARGET ERL_AFLAGS ERL_FLAGS ELIXIR_ERL_OPTIONS SSH_AUTH_SOCK XDG_RUNTIME_DIR CI CODEX_CI)
+  @environment_key {__MODULE__, :environment_root}
 
   @impl true
-  def transition(:preflight, context), do: preflight(context)
-  def transition(:checkout, context), do: checkout(context)
-  def transition(:gates, context), do: gates(context)
-  def transition(:archive, context), do: archive(context)
-  def transition(:publish, context), do: publish(context)
-  def transition(:verify, context), do: verify(context)
-  def transition(:tag, context), do: tag(context)
-  def transition(:push_tag, context), do: push_tag(context)
+  def transition(transition, context) do
+    with_environment(context, fn -> transition_step(transition, context) end)
+  end
+
+  defp transition_step(:preflight, context), do: preflight(context)
+  defp transition_step(:checkout, context), do: checkout(context)
+  defp transition_step(:gates, context), do: gates(context)
+  defp transition_step(:archive, context), do: archive(context)
+  defp transition_step(:publish, context), do: publish(context)
+  defp transition_step(:verify, context), do: verify(context)
+  defp transition_step(:tag, context), do: tag(context)
+  defp transition_step(:push_tag, context), do: push_tag(context)
 
   @impl true
-  def resume(:preflight, :started, _context), do: :rerun
+  def resume(transition, status, context) do
+    with_environment(context, fn -> resume_step(transition, status, context) end)
+  end
 
-  def resume(:preflight, :completed, context) do
+  defp resume_step(:preflight, :started, _context), do: :rerun
+
+  defp resume_step(:preflight, :completed, context) do
     repository = context.plan.repository
 
     cond do
@@ -32,13 +41,13 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
     end
   end
 
-  def resume(:checkout, :started, context) do
+  defp resume_step(:checkout, :started, context) do
     checkout = Path.join(context.receipt_directory, "checkout")
     File.rm_rf!(checkout)
     :rerun
   end
 
-  def resume(:checkout, :completed, context) do
+  defp resume_step(:checkout, :completed, context) do
     cond do
       not File.dir?(context.checkout) -> {:error, :release_checkout_missing}
       git_head!(context.checkout) != context.head -> {:error, :release_checkout_changed}
@@ -47,11 +56,11 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
     end
   end
 
-  def resume(:gates, :started, _context), do: :rerun
-  def resume(:gates, :completed, _context), do: {:ok, %{}}
-  def resume(:archive, :started, _context), do: :rerun
+  defp resume_step(:gates, :started, _context), do: :rerun
+  defp resume_step(:gates, :completed, _context), do: {:ok, %{}}
+  defp resume_step(:archive, :started, _context), do: :rerun
 
-  def resume(:archive, :completed, context) do
+  defp resume_step(:archive, :completed, context) do
     case file_checksum(context.archive) do
       {:ok, checksum} when checksum == context.archive_checksum -> {:ok, %{}}
       {:ok, checksum} -> {:error, {:archive_checksum_changed, context.archive_checksum, checksum}}
@@ -59,11 +68,11 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
     end
   end
 
-  def resume(:publish, status, context), do: resume_publish(status, context)
-  def resume(:verify, :started, _context), do: :rerun
-  def resume(:verify, :completed, context), do: resume_publish(:completed, context)
-  def resume(:tag, status, context), do: resume_tag(status, context)
-  def resume(:push_tag, status, context), do: resume_push_tag(status, context)
+  defp resume_step(:publish, status, context), do: resume_publish(status, context)
+  defp resume_step(:verify, :started, _context), do: :rerun
+  defp resume_step(:verify, :completed, context), do: resume_publish(:completed, context)
+  defp resume_step(:tag, status, context), do: resume_tag(status, context)
+  defp resume_step(:push_tag, status, context), do: resume_push_tag(status, context)
 
   defp preflight(context) do
     plan = context.plan
@@ -535,6 +544,17 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
 
   defp isolated_run(executable, argv, opts \\ []) do
     {extra_preserved, opts} = Keyword.pop(opts, :preserve, [])
+    environment_root = Process.get(@environment_key)
+    home = Path.join(environment_root, "home")
+    mix_home = Path.join(environment_root, "mix")
+    hex_home = Path.join(environment_root, "hex")
+    rebar_cache = Path.join(environment_root, "rebar")
+    temporary = Path.join(environment_root, "tmp")
+
+    for directory <- [environment_root, home, mix_home, hex_home, rebar_cache, temporary] do
+      File.mkdir_p!(directory)
+      File.chmod!(directory, 0o700)
+    end
 
     environment =
       (@preserved_environment ++ extra_preserved)
@@ -546,7 +566,49 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
         end
       end)
 
+    environment =
+      environment ++
+        [
+          "HOME=#{home}",
+          "MIX_HOME=#{mix_home}",
+          "MIX_ARCHIVES=#{mix_archives()}",
+          "HEX_HOME=#{hex_home}",
+          "REBAR_CACHE_DIR=#{rebar_cache}",
+          "TMPDIR=#{temporary}"
+        ]
+
     Command.run("/usr/bin/env", ["-i" | environment] ++ [executable | argv], opts)
+  end
+
+  defp with_environment(context, function) do
+    previous = Process.get(@environment_key)
+    root = environment_root(context)
+    Process.put(@environment_key, root)
+
+    try do
+      function.()
+    after
+      if previous,
+        do: Process.put(@environment_key, previous),
+        else: Process.delete(@environment_key)
+    end
+  end
+
+  defp environment_root(context) do
+    case Map.get(context, :receipt_directory) do
+      directory when is_binary(directory) ->
+        Path.join(directory, "environment")
+
+      _other ->
+        package = Map.get(context.plan, :package, "anonymous")
+        token = :crypto.hash(:sha256, :erlang.term_to_binary({self(), package}))
+        suffix = Base.encode16(token, case: :lower) |> binary_part(0, 16)
+        Path.join(System.tmp_dir!(), "mix_workspace_ops_release_#{suffix}")
+    end
+  end
+
+  defp mix_archives do
+    Mix.path_for(:archives)
   end
 
   @doc false
