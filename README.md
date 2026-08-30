@@ -276,11 +276,16 @@ Release publication is a separate, fail-closed transaction over an already
 committed and pushed revision:
 
 ```bash
+./mix_workspace_ops release plan \
+  --registry /path/to/portfolio_registry/registry.json \
+  --package sample_package
+
 ./mix_workspace_ops release publish \
   --descriptor /path/to/untracked-release-descriptor.json
 ```
 
-The transaction never stages or commits source. It builds from a detached clean
+The semantic plan is catalog-only and self-digested. The transaction never stages or
+commits source. It builds from a detached clean
 checkout, persists every transition, exposes credentials only to its publisher
 step, verifies the Hex checksum, and creates the tag only afterward.
 

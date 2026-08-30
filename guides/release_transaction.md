@@ -1,5 +1,18 @@
 # Fail-closed release transaction
 
+Start with the catalog-only semantic plan:
+
+```bash
+mix_workspace_ops release plan \
+  --registry /path/to/portfolio_registry/registry.json \
+  --package sample_package
+```
+
+The report is `mix_workspace_ops.release_plan/v1`. It freezes the catalog digest,
+requested package, derived and explicit prerequisite edges, topological order, and portable
+project/repository identities. Planning reads no checkout, queries no package registry, and
+needs no publication credential.
+
 `mix_workspace_ops release publish` consumes an untracked
 `mix_workspace_ops.release/v1` descriptor. It never stages or commits source.
 The release commit must already be clean, pushed, and equal to its upstream.

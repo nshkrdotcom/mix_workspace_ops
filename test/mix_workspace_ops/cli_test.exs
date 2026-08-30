@@ -65,6 +65,7 @@ defmodule MixWorkspaceOps.CLITest do
              ["registry", "select"],
              ["registry", "validate"],
              ["registry", "workspace"],
+             ["release", "plan"],
              ["release", "publish"],
              ["run"],
              ["seam"],
@@ -1056,6 +1057,32 @@ defmodule MixWorkspaceOps.CLITest do
 
   test "release publish requires a descriptor" do
     assert CLI.dispatch(["release", "publish"]) == {:usage_error, "missing --descriptor"}
+  end
+
+  test "release plan exposes the catalog-derived semantic plan", context do
+    %{catalog: catalog} = workspace!(context)
+
+    assert {:ok, plan} =
+             CLI.dispatch([
+               "release",
+               "plan",
+               "--registry",
+               catalog,
+               "--package",
+               "plane"
+             ])
+
+    assert plan.schema == "mix_workspace_ops.release_plan/v1"
+    assert plan.package == "plane"
+    assert plan.order == ["plane"]
+    assert [%{package: "plane", project: %{id: "plane"}}] = plan.units
+  end
+
+  test "release plan requires its registry and package" do
+    assert CLI.dispatch(["release", "plan"]) == {:usage_error, "missing --registry"}
+
+    assert CLI.dispatch(["release", "plan", "--registry", "missing.json"]) ==
+             {:usage_error, "missing --package"}
   end
 
   test "release publish reports an unreadable descriptor", context do

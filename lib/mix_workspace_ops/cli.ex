@@ -20,6 +20,7 @@ defmodule MixWorkspaceOps.CLI do
   alias MixWorkspaceOps.Project.ProbeMemo
   alias MixWorkspaceOps.Registry.{Examples, ReleaseChain}
   alias MixWorkspaceOps.Release.{Descriptor, LocalAdapter, Transaction}
+  alias MixWorkspaceOps.Release.Plan, as: ReleasePlan
 
   @usage """
   mix_workspace_ops <command>
@@ -56,6 +57,7 @@ defmodule MixWorkspaceOps.CLI do
     run --plan PATH --registry PATH --checkout-root PATH --view PATH [--binding PATH] \
       [--max-concurrency N] [--timeout N[s|m|h]] [--allow-lock-mutation] \
       [--state-root PATH]
+    release plan --registry PATH --package APP
     release publish --descriptor PATH [--state-root PATH]
     help
   """
@@ -132,6 +134,7 @@ defmodule MixWorkspaceOps.CLI do
       :allow_lock_mutation,
       :state_root
     ],
+    ["release", "plan"] => [:registry, :package],
     ["release", "publish"] => [:descriptor, :state_root]
   }
 
@@ -432,6 +435,15 @@ defmodule MixWorkspaceOps.CLI do
          :ok <- require_option(options, :descriptor),
          {:ok, plan} <- Descriptor.load(options.descriptor) do
       Transaction.run(plan, LocalAdapter, state_root: options.state_root)
+    end
+  end
+
+  def dispatch(["release", "plan" | args]) do
+    with {:ok, options, []} <- options(["release", "plan"], args),
+         :ok <- require_option(options, :registry),
+         :ok <- require_option(options, :package),
+         {:ok, registry} <- Registry.load(options.registry) do
+      ReleasePlan.build(registry, options.package)
     end
   end
 
