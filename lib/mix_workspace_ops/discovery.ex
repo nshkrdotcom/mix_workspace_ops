@@ -5,22 +5,23 @@ defmodule MixWorkspaceOps.Discovery do
 
   @pruned_directories ~w(.git .github .worktrees .cache _build _legacy deps deps_legacy_* doc cover dist node_modules priv_plts temp tmp backup backups build_support vendor vendored test priv fixtures templates)
 
-  @spec scan(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
-  def scan(checkout_root, github_owner) do
+  @spec scan(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def scan(checkout_root, github_owner, opts \\ []) do
     checkout_root = Path.expand(checkout_root)
 
-    with {:ok, entries} <- File.ls(checkout_root) do
+    with {:ok, inventory} <- inventory(checkout_root, opts) do
+      candidates = candidate_checkouts(inventory.entries, github_owner)
+
       {repositories, unresolved} =
-        entries
-        |> Enum.sort()
-        |> Enum.map(&Path.join(checkout_root, &1))
-        |> Enum.filter(&File.dir?/1)
-        |> Task.async_stream(&discover_checkout(&1, github_owner),
-          max_concurrency: 4,
-          ordered: false,
-          timeout: :infinity
+        candidates
+        |> Task.async_stream(&discover_candidate/1,
+          max_concurrency: Keyword.get(opts, :max_concurrency, 4),
+          ordered: true,
+          timeout: Keyword.get(opts, :timeout, :infinity),
+          on_timeout: :kill_task
         )
-        |> Enum.reduce({[], []}, &collect_checkout/2)
+        |> Enum.zip(candidates)
+        |> Enum.reduce({[], inventory_failures(inventory.entries)}, &collect_candidate/2)
 
       {repositories, repository_duplicates} = reject_duplicate_repositories(repositories)
       {repositories, application_duplicates} = reject_duplicate_applications(repositories)
@@ -33,10 +34,12 @@ defmodule MixWorkspaceOps.Discovery do
          },
          snapshot: %{
            schema: "portfolio_registry.snapshot/v1",
-           observed_on: "2026-08-11",
+           observed_on: inventory.observed_on,
            github_owner: github_owner,
            repositories: length(repositories),
            projects: Enum.sum(Enum.map(repositories, &length(&1["projects"]))),
+           entries: inventory.entries,
+           summary: inventory.summary,
            unresolved:
              Enum.sort_by(
                unresolved ++ repository_duplicates ++ application_duplicates,
@@ -47,66 +50,208 @@ defmodule MixWorkspaceOps.Discovery do
     end
   end
 
-  defp discover_checkout(path, owner) do
-    case canonical_identity(path, owner) do
-      {:ok, identity} -> discover_repository(path, identity)
-      {:ambiguous_owner_identity, identities} -> {:unresolved, [ambiguity(path, identities)]}
-      :skip -> :skip
+  @doc "Inventories every direct child without making Mix eligibility repository identity."
+  @spec inventory(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def inventory(checkout_root, opts \\ []) do
+    checkout_root = Path.expand(checkout_root)
+
+    with {:ok, observed_on} <- observation_date(Keyword.get(opts, :clock, &Date.utc_today/0)),
+         {:ok, names} <- File.ls(checkout_root) do
+      paths = names |> Enum.sort() |> Enum.map(&Path.join(checkout_root, &1))
+      inspector = Keyword.get(opts, :mix_inspector, &inspect_mix/1)
+
+      entries =
+        paths
+        |> Task.async_stream(&protected_inspect(&1, inspector),
+          max_concurrency: Keyword.get(opts, :max_concurrency, 4),
+          ordered: true,
+          timeout: Keyword.get(opts, :timeout, :infinity),
+          on_timeout: :kill_task
+        )
+        |> Enum.zip(paths)
+        |> Enum.map(&inventory_result/1)
+
+      {:ok,
+       %{
+         schema: "portfolio_registry.snapshot/v1",
+         observed_on: observed_on,
+         checkout_root: checkout_root,
+         entries: entries,
+         summary: inventory_summary(entries)
+       }}
+    end
+  end
+
+  defp protected_inspect(path, inspector) do
+    inspect_checkout(path, inspector)
+  rescue
+    error -> failed(path, {:exception, error.__struct__, Exception.message(error)})
+  catch
+    kind, reason -> failed(path, {kind, reason})
+  end
+
+  defp inventory_result({{:ok, entry}, _path}), do: entry
+  defp inventory_result({{:exit, reason}, path}), do: failed(path, {:task_exit, reason})
+
+  defp inspect_checkout(path, _inspector) when not is_binary(path),
+    do: failed(inspect(path), :invalid_path)
+
+  defp inspect_checkout(path, inspector) do
+    if File.dir?(path),
+      do: inspect_directory(path, inspector),
+      else: not_a_repository(path, :not_a_directory)
+  end
+
+  defp inspect_directory(path, inspector) do
+    case Git.root(path) do
+      {:ok, ^path} -> inspect_git_checkout(path, Path.join(path, ".git"), inspector)
+      {:ok, root} -> not_a_repository(path, {:nested_git_root, root})
+      {:error, reason} -> classify_git_failure(path, reason)
+    end
+  end
+
+  defp classify_git_failure(path, reason) do
+    if File.exists?(Path.join(path, ".git")),
+      do: failed(path, reason),
+      else: not_a_repository(path, reason)
+  end
+
+  defp inspect_git_checkout(path, marker, inspector) do
+    with {:ok, common_dir} <- Git.common_dir(path),
+         {:ok, remotes} <- Git.remote_urls(path),
+         identities when identities != [] <- normalized_identities(remotes),
+         {:ok, mix_files} <- inspector.(path) do
+      %{
+        "path" => path,
+        "name" => Path.basename(path),
+        "status" => "discovered",
+        "kind" => if(File.dir?(marker), do: "clone", else: "worktree"),
+        "common_dir" => common_dir,
+        "remotes" => remotes,
+        "identities" => identities,
+        "mix_files" => Enum.map(mix_files, &Path.relative_to(&1, path))
+      }
+    else
+      [] -> failed(path, :unrecognized_remote_identity)
+      {:error, reason} -> failed(path, reason)
+      other -> failed(path, {:invalid_mix_inspector_result, other})
+    end
+  end
+
+  defp normalized_identities(remotes) do
+    remotes
+    |> Enum.flat_map(fn remote ->
+      case Binding.normalize_github(remote) do
+        {:ok, identity} -> [identity]
+        {:error, _reason} -> []
+      end
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp inspect_mix(path), do: find_mix_files_result(path)
+
+  defp observation_date(clock) when is_function(clock, 0) do
+    case clock.() do
+      %Date{} = date -> {:ok, Date.to_iso8601(date)}
+      %DateTime{} = datetime -> {:ok, datetime |> DateTime.to_date() |> Date.to_iso8601()}
+      other -> {:error, {:invalid_observation_clock, other}}
     end
   rescue
-    _error -> :skip
+    error -> {:error, {:observation_clock, error.__struct__, Exception.message(error)}}
   catch
-    _kind, _reason -> :skip
+    kind, reason -> {:error, {:observation_clock, kind, reason}}
   end
 
-  defp collect_checkout({:ok, :skip}, accumulator), do: accumulator
+  defp observation_date(_clock), do: {:error, :invalid_observation_clock}
 
-  defp collect_checkout({:ok, {:resolved, repository, errors}}, {repositories, unresolved}) do
-    {[repository | repositories], errors ++ unresolved}
-  end
-
-  defp collect_checkout({:ok, {:unresolved, errors}}, {repositories, unresolved}) do
-    {repositories, errors ++ unresolved}
-  end
-
-  defp canonical_identity(path, owner) do
-    with true <- File.dir?(Path.join(path, ".git")),
-         {:ok, root} <- Git.root(path),
-         true <- root == path,
-         {:ok, common_dir} <- Git.common_dir(path),
-         true <- common_dir == Path.join(path, ".git"),
-         {:ok, github} <- owned_identity(path, owner),
-         [^owner, repository_name] <- String.split(github, "/"),
-         true <- Path.basename(path) == repository_name do
-      {:ok, %{github: github, repository_name: repository_name}}
-    else
-      {:ambiguous, identities} -> {:ambiguous_owner_identity, identities}
-      _reason -> :skip
-    end
-  end
-
-  # A checkout naming two of the owner's repositories on its origin states two
-  # identities. Taking the first would let the directory name decide which, so
-  # the checkout is reported unresolved and the operator settles it.
-  defp owned_identity(path, owner) do
-    case Enum.filter(Binding.github_identities(path), &String.starts_with?(&1, owner <> "/")) do
-      [identity] -> {:ok, identity}
-      [] -> :skip
-      several -> {:ambiguous, several}
-    end
-  end
-
-  defp ambiguity(path, identities) do
+  defp failed(path, reason) do
     %{
-      "repository" => Path.basename(path),
-      "path" => ".",
-      "reason" => "ambiguous_owner_identity:#{Enum.join(identities, ",")}"
+      "path" => path,
+      "name" => Path.basename(path),
+      "status" => "failed",
+      "reason" => inspect(reason, limit: :infinity)
     }
   end
 
-  defp discover_repository(path, identity) do
-    mix_files = find_mix_files(path)
+  defp not_a_repository(path, reason) do
+    %{
+      "path" => path,
+      "name" => Path.basename(path),
+      "status" => "not_a_repository",
+      "reason" => inspect(reason, limit: :infinity)
+    }
+  end
 
+  defp inventory_summary(entries) do
+    counts = Enum.frequencies_by(entries, & &1["status"])
+
+    %{
+      "total" => length(entries),
+      "discovered" => Map.get(counts, "discovered", 0),
+      "not_a_repository" => Map.get(counts, "not_a_repository", 0),
+      "failed" => Map.get(counts, "failed", 0)
+    }
+  end
+
+  defp candidate_checkouts(entries, owner) do
+    Enum.flat_map(entries, &candidate_checkout(&1, owner))
+  end
+
+  defp candidate_checkout(entry, owner) do
+    identities = Enum.filter(entry["identities"] || [], &String.starts_with?(&1, owner <> "/"))
+
+    case identities do
+      [identity] -> candidate_identity(entry, identity)
+      _other -> []
+    end
+  end
+
+  defp candidate_identity(entry, identity) do
+    repository_name = identity |> String.split("/") |> List.last()
+    if Path.basename(entry["path"]) == repository_name, do: [{entry, identity}], else: []
+  end
+
+  defp discover_candidate({entry, github}) do
+    identity = %{github: github, repository_name: Path.basename(entry["path"])}
+    mix_files = Enum.map(entry["mix_files"], &Path.join(entry["path"], &1))
+    discover_repository(entry["path"], identity, mix_files)
+  end
+
+  defp inventory_failures(entries) do
+    for entry <- entries, entry["status"] == "failed" do
+      %{"repository" => entry["name"], "path" => ".", "reason" => entry["reason"]}
+    end
+  end
+
+  defp collect_candidate({{:ok, :skip}, _candidate}, accumulator), do: accumulator
+
+  defp collect_candidate(
+         {{:ok, {:resolved, repository, errors}}, _candidate},
+         {repositories, unresolved}
+       ) do
+    {[repository | repositories], errors ++ unresolved}
+  end
+
+  defp collect_candidate(
+         {{:ok, {:unresolved, errors}}, _candidate},
+         {repositories, unresolved}
+       ) do
+    {repositories, errors ++ unresolved}
+  end
+
+  defp collect_candidate({{:exit, reason}, {entry, _identity}}, {repositories, unresolved}) do
+    error = %{
+      "repository" => entry["name"],
+      "path" => ".",
+      "reason" => "task_exit:#{inspect(reason, limit: :infinity)}"
+    }
+
+    {repositories, [error | unresolved]}
+  end
+
+  defp discover_repository(path, identity, mix_files) do
     if mix_files == [] do
       :skip
     else
@@ -190,7 +335,7 @@ defmodule MixWorkspaceOps.Discovery do
     "examples" in Path.split(relative_path)
   end
 
-  defp find_mix_files(root) do
+  defp find_mix_files_result(root) do
     prune_expression =
       @pruned_directories
       |> Enum.flat_map(&["-name", &1, "-o"])
@@ -202,8 +347,8 @@ defmodule MixWorkspaceOps.Discovery do
         [")", "-type", "d", "-prune", "-o", "-type", "f", "-name", "mix.exs", "-print"]
 
     case Command.run("find", arguments) do
-      {:ok, result} -> result.output |> String.split("\n", trim: true) |> Enum.sort()
-      {:error, _reason} -> []
+      {:ok, result} -> {:ok, result.output |> String.split("\n", trim: true) |> Enum.sort()}
+      {:error, reason} -> {:error, {:mix_inspector_find, reason}}
     end
   end
 

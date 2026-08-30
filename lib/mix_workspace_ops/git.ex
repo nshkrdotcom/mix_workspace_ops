@@ -54,9 +54,23 @@ defmodule MixWorkspaceOps.Git do
   """
   @spec remote_urls!(String.t()) :: [String.t()]
   def remote_urls!(repo) do
-    (urls!(repo, ["remote", "get-url", "--all", "origin"]) ++
-       urls!(repo, ["remote", "get-url", "--all", "--push", "origin"]))
-    |> Enum.uniq()
+    case remote_urls(repo) do
+      {:ok, urls} -> urls
+      {:error, reason} -> raise "cannot read Git origin URLs: #{inspect(reason)}"
+    end
+  end
+
+  @doc "Every origin fetch/push URL, or typed command evidence when it cannot be read."
+  @spec remote_urls(String.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def remote_urls(repo) do
+    with {:ok, fetch} <- urls(repo, ["remote", "get-url", "--all", "origin"]),
+         {:ok, push} <- urls(repo, ["remote", "get-url", "--all", "--push", "origin"]),
+         urls when urls != [] <- Enum.uniq(fetch ++ push) do
+      {:ok, Enum.sort(urls)}
+    else
+      [] -> {:error, :missing_origin_urls}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @spec clean?(String.t()) :: boolean()
@@ -102,12 +116,18 @@ defmodule MixWorkspaceOps.Git do
     |> String.trim()
   end
 
-  defp urls!(repo, args) do
-    repo
-    |> output!(args)
-    |> String.split("\n", trim: true)
-    |> Enum.map(&String.trim/1)
-    |> Enum.reject(&(&1 == ""))
+  defp urls(repo, args) do
+    case Command.run("git", args, cd: repo) do
+      {:ok, result} ->
+        {:ok,
+         result.output
+         |> String.split("\n", trim: true)
+         |> Enum.map(&String.trim/1)
+         |> Enum.reject(&(&1 == ""))}
+
+      {:error, result} ->
+        {:error, {:git_remote_urls, args, result.exit_code, result.output}}
+    end
   end
 
   defp root!(repo) do

@@ -3,6 +3,63 @@ defmodule MixWorkspaceOps.DiscoveryTest do
 
   alias MixWorkspaceOps.Discovery
 
+  test "inventories non-Elixir repositories and ordinary directories with an injected date",
+       context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "alpha"), "[]", "example-org/alpha")
+    beta = initialize_repository!(Path.join(root, "beta"), "[]", "example-org/beta")
+    File.rm!(Path.join(beta, "mix.exs"))
+    File.write!(Path.join(beta, "README.md"), "non-Elixir fixture\n")
+    git!(beta, ["add", "-A"])
+    git!(beta, ["commit", "--quiet", "-m", "replace Mix project"])
+    File.mkdir_p!(Path.join(root, "ordinary"))
+
+    assert {:ok, inventory} =
+             Discovery.inventory(root, clock: fn -> ~D[2031-02-03] end)
+
+    assert inventory.observed_on == "2031-02-03"
+    assert Enum.map(inventory.entries, & &1["name"]) == ["alpha", "beta", "ordinary"]
+
+    assert %{"status" => "discovered", "mix_files" => ["mix.exs"]} =
+             Enum.find(inventory.entries, &(&1["name"] == "alpha"))
+
+    assert %{"status" => "discovered", "mix_files" => []} =
+             Enum.find(inventory.entries, &(&1["name"] == "beta"))
+
+    assert %{"status" => "not_a_repository"} =
+             Enum.find(inventory.entries, &(&1["name"] == "ordinary"))
+  end
+
+  test "inspector failure remains typed while a successful peer remains visible", context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "alpha"), "[]", "example-org/alpha")
+    initialize_repository!(Path.join(root, "beta"), "[]", "example-org/beta")
+
+    inspector = fn path ->
+      if Path.basename(path) == "beta", do: {:error, :broken_inspector}, else: {:ok, []}
+    end
+
+    assert {:ok, inventory} = Discovery.inventory(root, mix_inspector: inspector)
+    assert Enum.find(inventory.entries, &(&1["name"] == "alpha"))["status"] == "discovered"
+
+    beta = Enum.find(inventory.entries, &(&1["name"] == "beta"))
+    assert beta["status"] == "failed"
+    assert beta["reason"] =~ "broken_inspector"
+    assert inventory.summary["failed"] == 1
+  end
+
+  test "production observation date comes from the command clock", context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "alpha"), "[]", "example-org/alpha")
+
+    assert {:ok, discovery} = Discovery.scan(root, "example-org")
+    assert discovery.snapshot.observed_on == Date.to_iso8601(Date.utc_today())
+    refute discovery.snapshot.observed_on == "2026-08-11"
+
+    assert {:error, {:invalid_observation_clock, :forged}} =
+             Discovery.inventory(root, clock: fn -> :forged end)
+  end
+
   test "discovers only canonical checkouts for the requested owner", context do
     root = temporary_directory!(context)
     initialize_repository!(Path.join(root, "alpha"), "[]", "example-org/alpha")
@@ -125,5 +182,10 @@ defmodule MixWorkspaceOps.DiscoveryTest do
     assert [%{"projects" => projects}] = discovery.registry.repositories
     assert Enum.any?(projects, &(&1["id"] == "lab" and &1["kind"] == "standalone"))
     assert Enum.any?(projects, &(&1["app"] == "proof"))
+  end
+
+  defp git!(repository, args) do
+    {output, 0} = System.cmd("git", args, cd: repository, stderr_to_stdout: true)
+    output
   end
 end
