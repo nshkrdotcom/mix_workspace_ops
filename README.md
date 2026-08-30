@@ -130,7 +130,11 @@ by walking upward. A configured checkout therefore needs no repeated path
 flags:
 
 ```json
-{"registry": "/catalog/registry.json", "checkout_root": "/operator/checkouts"}
+{
+  "registry": "/catalog/registry.json",
+  "checkout_root": "/operator/checkouts",
+  "ledger": "/operator/config/mix_workspace_ops/operator_ledger.json"
+}
 ```
 
 ```bash
@@ -139,6 +143,10 @@ flags:
   --checkout-root /path/to/checkouts \
   --github-owner example-org \
   --output /path/to/discovery.json
+./mix_workspace_ops registry drift \
+  --registry /path/to/registry.json \
+  --checkout-root /path/to/checkouts \
+  --ledger /path/to/operator_ledger.json
 ./mix_workspace_ops registry select \
   --registry /path/to/registry.json \
   --view /path/to/view.json

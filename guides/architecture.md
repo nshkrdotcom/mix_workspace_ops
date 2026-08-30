@@ -364,7 +364,11 @@ Registry and checkout paths follow one order everywhere: explicit flags,
 discovery. The configuration file is a JSON object:
 
 ```json
-{"registry": "/catalog/registry.json", "checkout_root": "/operator/checkouts"}
+{
+  "registry": "/catalog/registry.json",
+  "checkout_root": "/operator/checkouts",
+  "ledger": "/operator/config/mix_workspace_ops/operator_ledger.json"
+}
 ```
 
 Inside a configured checkout, `mwo plan --project example.consumer`,

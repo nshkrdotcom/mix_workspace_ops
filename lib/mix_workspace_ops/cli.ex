@@ -4,6 +4,7 @@ defmodule MixWorkspaceOps.CLI do
   alias MixWorkspaceOps.{
     Discovery,
     Doctor,
+    Drift,
     Fanout,
     Inventory,
     LocalOverrides,
@@ -32,6 +33,7 @@ defmodule MixWorkspaceOps.CLI do
     registry chain --registry PATH [--package APP]
     registry examples --guide PATH
     registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
+    registry drift --registry PATH --checkout-root PATH [--ledger PATH] [--output PATH]
     inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
     doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
     plan --registry PATH --checkout-root PATH [--view PATH | --project ID] [--binding PATH] \
@@ -75,6 +77,7 @@ defmodule MixWorkspaceOps.CLI do
     ["registry", "chain"] => [:registry, :package],
     ["registry", "examples"] => [:guide],
     ["registry", "discover"] => [:checkout_root, :github_owner, :output],
+    ["registry", "drift"] => [:registry, :checkout_root, :ledger, :output],
     ["inventory"] => [:registry, :checkout_root, :view, :binding, :output],
     ["doctor"] => [:registry, :checkout_root, :view, :binding],
     ["plan"] => [
@@ -179,6 +182,11 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   defp exit_status({:error, {:fanout_failed, report}}) do
+    IO.puts(Report.encode(report))
+    1
+  end
+
+  defp exit_status({:error, {:registry_drift, report}}) do
     IO.puts(Report.encode(report))
     1
   end
@@ -292,6 +300,16 @@ defmodule MixWorkspaceOps.CLI do
          {:ok, discovery} <- Discovery.scan(options.checkout_root, options.github_owner),
          :ok <- maybe_write_report(options.output, discovery) do
       {:ok, discovery}
+    end
+  end
+
+  def dispatch(["registry", "drift" | args]) do
+    with {:ok, options, []} <- options(["registry", "drift"], args),
+         :ok <- require_options(options, [:registry, :checkout_root]),
+         {:ok, registry} <- Registry.load(options.registry) do
+      registry
+      |> Drift.run(options.checkout_root, ledger: options.ledger)
+      |> drift_result(options.output)
     end
   end
 
@@ -701,6 +719,7 @@ defmodule MixWorkspaceOps.CLI do
       :registry,
       :checkout_root,
       :binding,
+      :ledger,
       :view,
       :plan,
       :state_root,
@@ -974,6 +993,19 @@ defmodule MixWorkspaceOps.CLI do
 
   defp maybe_write_report(nil, _report), do: :ok
   defp maybe_write_report(path, report), do: Report.write(path, report)
+
+  defp drift_result({:ok, report}, output) do
+    with :ok <- maybe_write_report(output, report), do: {:ok, report}
+  end
+
+  defp drift_result({:error, {:registry_drift, report}} = error, output) do
+    case maybe_write_report(output, report) do
+      :ok -> error
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp drift_result({:error, _reason} = error, _output), do: error
 
   # A typed error is what one function hands another; a sentence is what an
   # operator reads. Where resolution can say what happened in words, it does, and

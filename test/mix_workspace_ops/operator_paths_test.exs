@@ -8,12 +8,14 @@ defmodule MixWorkspaceOps.OperatorPathsTest do
     original_xdg = System.get_env("XDG_CONFIG_HOME")
     original_registry = System.get_env("MIX_WORKSPACE_OPS_REGISTRY")
     original_checkout = System.get_env("MIX_WORKSPACE_OPS_CHECKOUT_ROOT")
+    original_ledger = System.get_env("MIX_WORKSPACE_OPS_LEDGER")
 
     on_exit(fn ->
       File.cd!(original_cwd)
       restore("XDG_CONFIG_HOME", original_xdg)
       restore("MIX_WORKSPACE_OPS_REGISTRY", original_registry)
       restore("MIX_WORKSPACE_OPS_CHECKOUT_ROOT", original_checkout)
+      restore("MIX_WORKSPACE_OPS_LEDGER", original_ledger)
     end)
 
     :ok
@@ -31,15 +33,16 @@ defmodule MixWorkspaceOps.OperatorPathsTest do
 
     File.write!(
       Path.join(config_dir, "config.json"),
-      ~s({"registry":"configured.json","checkout_root":"configured"})
+      ~s({"registry":"configured.json","checkout_root":"configured","ledger":"ledger.json"})
     )
 
     System.put_env("XDG_CONFIG_HOME", config_home)
     File.cd!(nested)
 
-    assert {:ok, configured} = OperatorPaths.resolve(%{}, [:registry, :checkout_root])
+    assert {:ok, configured} = OperatorPaths.resolve(%{}, [:registry, :checkout_root, :ledger])
     assert configured.registry == Path.join(config_dir, "configured.json")
     assert configured.checkout_root == Path.join(config_dir, "configured")
+    assert configured.ledger == Path.join(config_dir, "ledger.json")
 
     System.put_env("MIX_WORKSPACE_OPS_REGISTRY", Path.join(root, "environment.json"))
     assert {:ok, environment} = OperatorPaths.resolve(%{}, [:registry])
