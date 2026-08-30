@@ -12,7 +12,8 @@ defmodule MixWorkspaceOps.OperatorPaths do
 
   @fields %{
     registry: {"MIX_WORKSPACE_OPS_REGISTRY", "registry"},
-    checkout_root: {"MIX_WORKSPACE_OPS_CHECKOUT_ROOT", "checkout_root"}
+    checkout_root: {"MIX_WORKSPACE_OPS_CHECKOUT_ROOT", "checkout_root"},
+    ledger: {"MIX_WORKSPACE_OPS_LEDGER", "ledger"}
   }
 
   @spec resolve(map(), [atom()]) :: {:ok, map()} | {:error, term()}
@@ -88,7 +89,7 @@ defmodule MixWorkspaceOps.OperatorPaths do
   end
 
   defp validate_config(path, decoded) when is_map(decoded) do
-    unknown = Map.keys(decoded) -- ~w(registry checkout_root)
+    unknown = Map.keys(decoded) -- ~w(registry checkout_root ledger)
     invalid = Enum.reject(decoded, fn {_key, value} -> is_binary(value) and value != "" end)
 
     cond do
@@ -115,6 +116,8 @@ defmodule MixWorkspaceOps.OperatorPaths do
       {:error, _reason} -> :missing
     end
   end
+
+  defp discover(:ledger), do: :missing
 
   defp walk_up(directory, name) do
     candidate = Path.join(directory, name)

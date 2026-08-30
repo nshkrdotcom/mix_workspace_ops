@@ -9,7 +9,7 @@ defmodule MixWorkspaceOps.Binding do
   contradiction rather than a choice.
   """
 
-  alias MixWorkspaceOps.{Git, Registry, StrictJSON}
+  alias MixWorkspaceOps.{Git, OperatorLedger, Registry, StrictJSON}
 
   @remote_schemes ~w(git http https ssh)
   @url_remote ~r{^(?<scheme>[A-Za-z][A-Za-z0-9+.\-]*)://(?<authority>[^/]*)/(?<path>.+)$}
@@ -40,7 +40,7 @@ defmodule MixWorkspaceOps.Binding do
   def resolve(registry, checkout_root, opts \\ []) do
     checkout_root = Path.expand(checkout_root)
 
-    with {:ok, overrides} <- load_overrides(Keyword.get(opts, :binding_file)),
+    with {:ok, overrides} <- load_overrides(registry, Keyword.get(opts, :binding_file)),
          {:ok, report} <- bind_all(registry, checkout_root, overrides),
          :ok <- reject_duplicate_common_dirs(report.bound) do
       {:ok, report}
@@ -124,9 +124,10 @@ defmodule MixWorkspaceOps.Binding do
     registry
     |> Registry.selected_repositories()
     |> Enum.reduce_while({:ok, empty}, fn repository, {:ok, report} ->
-      path = Map.get(overrides, repository.id, conventional_path(checkout_root, repository))
+      override = Map.get(overrides, repository.id)
+      path = if override, do: override.path, else: conventional_path(checkout_root, repository)
 
-      case verify(repository, path, catalogued) do
+      case verify(repository, path, catalogued, override) do
         {:ok, root} ->
           {:cont, {:ok, put_in(report.bound[repository.id], root)}}
 
@@ -139,7 +140,7 @@ defmodule MixWorkspaceOps.Binding do
     end)
   end
 
-  defp verify(repository, path, catalogued) do
+  defp verify(repository, path, catalogued, override) do
     path = Path.expand(path)
 
     with true <- File.dir?(path) || {:absent, path},
@@ -149,7 +150,7 @@ defmodule MixWorkspaceOps.Binding do
          true <-
            common_dir == Path.join(path, ".git") ||
              {:error, {:noncanonical_git_common_dir, repository.id, common_dir}},
-         :ok <- verify_identity(repository, path, catalogued) do
+         :ok <- verify_identity(repository, path, catalogued, override) do
       {:ok, root}
     else
       {:absent, expected} -> {:absent, expected}
@@ -157,7 +158,7 @@ defmodule MixWorkspaceOps.Binding do
     end
   end
 
-  defp verify_identity(repository, path, catalogued) do
+  defp verify_identity(repository, path, catalogued, nil) do
     case resolve_identity(path, catalogued) do
       {:ok, identity} ->
         if identity == repository.github,
@@ -170,6 +171,43 @@ defmodule MixWorkspaceOps.Binding do
       {:ambiguous, identities} ->
         {:error, {:ambiguous_origin, repository.id, path, identities}}
     end
+  end
+
+  defp verify_identity(repository, path, _catalogued, %{remotes: expected})
+       when is_list(expected) do
+    with {:ok, actual} <- Git.remote_urls(path),
+         true <-
+           actual == expected ||
+             {:error, {:binding_remote_drift, repository.id, expected, actual}},
+         identities <- normalized_identities(actual) do
+      ledger_identity(repository, path, identities)
+    end
+  end
+
+  defp verify_identity(repository, path, catalogued, %{remotes: nil}),
+    do: verify_identity(repository, path, catalogued, nil)
+
+  defp ledger_identity(_repository, _path, []), do: :ok
+
+  defp ledger_identity(repository, path, identities) do
+    expected = String.downcase(repository.github)
+    normalized = Enum.map(identities, &String.downcase/1)
+
+    if normalized == [expected],
+      do: :ok,
+      else: {:error, {:wrong_origin, repository.id, repository.github, identities, path}}
+  end
+
+  defp normalized_identities(remotes) do
+    remotes
+    |> Enum.flat_map(fn remote ->
+      case normalize_github(remote) do
+        {:ok, identity} -> [identity]
+        {:error, _reason} -> []
+      end
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
   defp remote_path(remote) do
@@ -226,23 +264,39 @@ defmodule MixWorkspaceOps.Binding do
     Path.join(checkout_root, name)
   end
 
-  defp load_overrides(nil), do: {:ok, %{}}
+  defp load_overrides(_registry, nil), do: {:ok, %{}}
 
-  defp load_overrides(path) do
+  defp load_overrides(registry, path) do
     with {:ok, bytes} <- File.read(Path.expand(path)),
-         {:ok, decoded} <- decode(bytes),
-         true <- is_map(decoded) || {:error, :invalid_binding_file},
-         true <-
+         {:ok, decoded} <- decode(bytes) do
+      load_override_shape(registry, path, decoded)
+    else
+      {:error, reason} -> {:error, {:binding_file, reason}}
+    end
+  end
+
+  defp load_override_shape(registry, path, %{"schema" => "mix_workspace_ops.operator_ledger/v1"}) do
+    case OperatorLedger.load(path, registry) do
+      {:ok, ledger} -> {:ok, OperatorLedger.binding_overrides(ledger)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp load_override_shape(_registry, _path, decoded) when is_map(decoded) do
+    with true <-
            Enum.all?(decoded, fn {key, value} -> is_binary(key) and is_binary(value) end) ||
              {:error, :invalid_binding_file},
          true <-
            Enum.all?(Map.values(decoded), &(Path.type(&1) == :absolute)) ||
              {:error, :binding_paths_must_be_absolute} do
-      {:ok, decoded}
-    else
-      {:error, reason} -> {:error, {:binding_file, reason}}
+      {:ok,
+       Map.new(decoded, fn {repository, path} ->
+         {repository, %{repository: repository, path: Path.expand(path), remotes: nil}}
+       end)}
     end
   end
+
+  defp load_override_shape(_registry, _path, _decoded), do: {:error, :invalid_binding_file}
 
   defp decode(bytes) do
     StrictJSON.decode(bytes, maximum_bytes: 1024 * 1024)
