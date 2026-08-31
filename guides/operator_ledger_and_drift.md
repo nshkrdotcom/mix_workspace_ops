@@ -5,10 +5,11 @@ record where one operator cloned a repository or which extra checkout that opera
 deliberately excluded. Those machine-local facts live together in one strict ledger.
 
 The conventional location is
-`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/operator_ledger.json`. Pass it explicitly
-with `--ledger`, set `MIX_WORKSPACE_OPS_LEDGER`, or name it as `ledger` in MWO's operator
-configuration. Existing commands that document `--binding` accept the same versioned
-ledger at that option; the legacy id-to-path JSON binding map remains readable.
+`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/operator_ledger.json`; `registry drift`
+loads it automatically when that file exists. Override it explicitly with `--ledger`, set
+`MIX_WORKSPACE_OPS_LEDGER`, or name it as `ledger` in MWO's operator configuration.
+Existing commands that document `--binding` accept the same versioned ledger at that
+option; the legacy id-to-path JSON binding map remains readable.
 
 ## Format
 

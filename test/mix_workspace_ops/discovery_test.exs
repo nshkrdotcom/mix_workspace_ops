@@ -48,6 +48,31 @@ defmodule MixWorkspaceOps.DiscoveryTest do
     assert inventory.summary["failed"] == 1
   end
 
+  test "permission and task failures are evidence rather than skips", context do
+    root = temporary_directory!(context)
+    denied = initialize_repository!(Path.join(root, "denied"), "[]", "example-org/denied")
+    initialize_repository!(Path.join(root, "killed"), "[]", "example-org/killed")
+    File.chmod!(denied, 0o000)
+    on_exit(fn -> File.chmod(denied, 0o755) end)
+
+    inspector = fn path ->
+      if Path.basename(path) == "killed", do: Process.exit(self(), :kill), else: {:ok, []}
+    end
+
+    assert {:ok, inventory} = Discovery.inventory(root, mix_inspector: inspector)
+    assert inventory.summary["failed"] == 2
+
+    denied_entry = Enum.find(inventory.entries, &(&1["name"] == "denied"))
+    assert denied_entry["status"] == "failed"
+    assert denied_entry["reason"] =~ "git_marker"
+    assert denied_entry["reason"] =~ "eacces"
+
+    killed_entry = Enum.find(inventory.entries, &(&1["name"] == "killed"))
+    assert killed_entry["status"] == "failed"
+    assert killed_entry["reason"] =~ "task_exit"
+    assert killed_entry["reason"] =~ "killed"
+  end
+
   test "production observation date comes from the command clock", context do
     root = temporary_directory!(context)
     initialize_repository!(Path.join(root, "alpha"), "[]", "example-org/alpha")
@@ -76,6 +101,55 @@ defmodule MixWorkspaceOps.DiscoveryTest do
     assert discovery.snapshot.repositories == 1
     assert discovery.snapshot.projects == 1
     assert discovery.snapshot.unresolved == []
+  end
+
+  test "inventory observes a local-only origin but registration does not invent its identity",
+       context do
+    base = temporary_directory!(context)
+    root = Path.join(base, "checkouts")
+    File.mkdir_p!(root)
+    alpha = initialize_repository!(Path.join(root, "alpha"), "[]", "example-org/alpha")
+    local_origin = Path.join(base, "mirrors/alpha.git")
+    File.mkdir_p!(Path.dirname(local_origin))
+    {_, 0} = System.cmd("git", ["clone", "--quiet", "--bare", alpha, local_origin])
+    git!(alpha, ["remote", "set-url", "origin", local_origin])
+
+    assert {:ok, inventory} = Discovery.inventory(root)
+
+    assert [%{"status" => "discovered", "identities" => [], "remotes" => [^local_origin]}] =
+             inventory.entries
+
+    assert {:ok, discovery} = Discovery.scan(root, "example-org")
+    assert discovery.registry.repositories == []
+  end
+
+  test "malformed hosted identity remains failed evidence", context do
+    root = temporary_directory!(context)
+    alpha = initialize_repository!(Path.join(root, "alpha"), "[]", "example-org/alpha")
+    malformed = "https://github.com/example-org/alpha/extra"
+    git!(alpha, ["remote", "set-url", "origin", malformed])
+
+    assert {:ok, inventory} = Discovery.inventory(root)
+    assert [%{"status" => "failed", "reason" => reason}] = inventory.entries
+    assert reason =~ "remote_identity"
+    assert reason =~ malformed
+  end
+
+  test "linked worktrees are inventory evidence but never registration candidates", context do
+    base = temporary_directory!(context)
+    source = initialize_repository!(Path.join(base, "source"), "[]", "example-org/alpha")
+    root = Path.join(base, "checkouts")
+    File.mkdir_p!(root)
+    worktree = Path.join(root, "alpha")
+
+    git!(source, ["worktree", "add", "--quiet", "-b", "registration-proof", worktree])
+
+    assert {:ok, inventory} = Discovery.inventory(root)
+    assert [%{"status" => "discovered", "kind" => "worktree"}] = inventory.entries
+
+    assert {:ok, discovery} = Discovery.scan(root, "example-org")
+    assert discovery.registry.repositories == []
+    assert [%{"kind" => "worktree"}] = discovery.snapshot.entries
   end
 
   test "keeps an exact standalone application and records shadowed copies", context do

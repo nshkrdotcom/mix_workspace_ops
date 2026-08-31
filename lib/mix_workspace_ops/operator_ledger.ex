@@ -6,7 +6,7 @@ defmodule MixWorkspaceOps.OperatorLedger do
   catalog data and never belongs in an application repository.
   """
 
-  alias MixWorkspaceOps.{Registry, StrictJSON}
+  alias MixWorkspaceOps.{Registry, RemoteIdentity, StrictJSON}
 
   @schema "mix_workspace_ops.operator_ledger/v1"
   @top_keys ~w(schema bindings ignores)
@@ -121,7 +121,7 @@ defmodule MixWorkspaceOps.OperatorLedger do
     |> Enum.reduce_while({:ok, %{}, MapSet.new()}, fn {row, index}, {:ok, acc, signatures} ->
       with {:ok, ignore} <- parse_ignore(row, index),
            :ok <- absent_key(acc, ignore.path, {:duplicate_ignore_path, ignore.path}),
-           signature = ignore.remotes,
+           {:ok, signature} <- identity_signature(ignore.remotes),
            :ok <-
              absent_member(signatures, signature, {:duplicate_ignore_identity, signature}) do
         {:cont, {:ok, Map.put(acc, ignore.path, ignore), MapSet.put(signatures, signature)}}
@@ -177,6 +177,25 @@ defmodule MixWorkspaceOps.OperatorLedger do
   end
 
   defp remotes(_values, field), do: {:error, {field, :must_be_unique_non_empty_strings}}
+
+  defp identity_signature(remotes) do
+    identities =
+      remotes
+      |> Enum.flat_map(fn remote ->
+        case RemoteIdentity.github(remote) do
+          {:ok, identity} -> [String.downcase(identity)]
+          {:error, _reason} -> []
+        end
+      end)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    case identities do
+      [] -> {:ok, {:remote_urls, remotes}}
+      [identity] -> {:ok, {:hosted_identity, identity}}
+      several -> {:error, {:ambiguous_ignore_identity, several}}
+    end
+  end
 
   defp disjoint_paths(bindings, ignores) do
     binding_paths = bindings |> Map.values() |> MapSet.new(& &1.path)

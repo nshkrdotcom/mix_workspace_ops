@@ -124,10 +124,11 @@ The operator supplies a checkout root at runtime; every checkout is then
 verified against its Git origin and Git common directory.
 
 Path flags are optional. Every command resolves them in the same order: flag,
-`MIX_WORKSPACE_OPS_REGISTRY` / `MIX_WORKSPACE_OPS_CHECKOUT_ROOT`,
-`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/config.json`, then discovery
-by walking upward. A configured checkout therefore needs no repeated path
-flags:
+the matching `MIX_WORKSPACE_OPS_*` environment variable,
+`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/config.json`, then discovery.
+For the ledger, discovery means the conventional
+`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/operator_ledger.json` when it
+exists. A configured checkout therefore needs no repeated path flags:
 
 ```json
 {

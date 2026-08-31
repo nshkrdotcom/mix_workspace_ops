@@ -5,10 +5,10 @@ defmodule MixWorkspaceOps.OperatorPaths do
   An explicit flag wins, followed by the matching environment variable, then
   `${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/config.json`, then discovery
   by walking upward from the working directory. The configuration document may
-  carry `registry` and `checkout_root`; both paths are expanded when read.
+  carry `registry`, `checkout_root`, and `ledger`; all paths are expanded when read.
   """
 
-  alias MixWorkspaceOps.{Git, StrictJSON}
+  alias MixWorkspaceOps.{Git, OperatorLedger, StrictJSON}
 
   @fields %{
     registry: {"MIX_WORKSPACE_OPS_REGISTRY", "registry"},
@@ -117,7 +117,10 @@ defmodule MixWorkspaceOps.OperatorPaths do
     end
   end
 
-  defp discover(:ledger), do: :missing
+  defp discover(:ledger) do
+    path = OperatorLedger.default_path()
+    if File.regular?(path), do: {:ok, path}, else: :missing
+  end
 
   defp walk_up(directory, name) do
     candidate = Path.join(directory, name)

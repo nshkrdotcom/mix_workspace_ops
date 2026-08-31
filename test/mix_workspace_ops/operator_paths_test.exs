@@ -1,7 +1,7 @@
 defmodule MixWorkspaceOps.OperatorPathsTest do
   use MixWorkspaceOps.WorkspaceCase, async: false
 
-  alias MixWorkspaceOps.OperatorPaths
+  alias MixWorkspaceOps.{OperatorLedger, OperatorPaths}
 
   setup do
     original_cwd = File.cwd!()
@@ -55,9 +55,15 @@ defmodule MixWorkspaceOps.OperatorPathsTest do
 
     File.rm!(Path.join(config_dir, "config.json"))
     System.delete_env("MIX_WORKSPACE_OPS_REGISTRY")
-    assert {:ok, discovered} = OperatorPaths.resolve(%{}, [:registry, :checkout_root])
+    default_ledger = OperatorLedger.default_path()
+    File.write!(default_ledger, "{}")
+
+    assert {:ok, discovered} =
+             OperatorPaths.resolve(%{}, [:registry, :checkout_root, :ledger])
+
     assert discovered.registry == Path.join(checkout, "registry.json")
     assert discovered.checkout_root == root
+    assert discovered.ledger == default_ledger
   end
 
   test "an empty config requests the ordinary discovery fallbacks", context do

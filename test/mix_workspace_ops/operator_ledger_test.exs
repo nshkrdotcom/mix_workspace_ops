@@ -56,13 +56,38 @@ defmodule MixWorkspaceOps.OperatorLedgerTest do
         [],
         [
           %{"path" => absolute, "remotes" => remotes, "reason" => "first"},
-          %{"path" => absolute <> "-two", "remotes" => remotes, "reason" => "second"}
+          %{
+            "path" => absolute <> "-two",
+            "remotes" => ["git@github.com:example-org/ignored.git"],
+            "reason" => "second"
+          }
         ],
         "duplicate.json"
       )
 
-    assert {:error, {:operator_ledger, ^duplicate, {:duplicate_ignore_identity, ^remotes}}} =
+    assert {:error,
+            {:operator_ledger, ^duplicate,
+             {:duplicate_ignore_identity, {:hosted_identity, "example-org/ignored"}}}} =
              OperatorLedger.load(duplicate, registry)
+
+    ambiguous =
+      write_ledger!(
+        root,
+        [],
+        [
+          %{
+            "path" => absolute,
+            "remotes" => ["n:example-org/first", "n:example-org/second"],
+            "reason" => "contradictory"
+          }
+        ],
+        "ambiguous.json"
+      )
+
+    assert {:error,
+            {:operator_ledger, ^ambiguous,
+             {:ambiguous_ignore_identity, ["example-org/first", "example-org/second"]}}} =
+             OperatorLedger.load(ambiguous, registry)
 
     path = Path.join(root, "unknown-key.json")
 

@@ -1,7 +1,7 @@
 defmodule MixWorkspaceOps.Discovery do
   @moduledoc "Discovers canonical Git repositories and Mix projects without embedding ecosystem policy."
 
-  alias MixWorkspaceOps.{Binding, Command, Git, Project}
+  alias MixWorkspaceOps.{Command, Git, Project, RemoteIdentity}
 
   @pruned_directories ~w(.git .github .worktrees .cache _build _legacy deps deps_legacy_* doc cover dist node_modules priv_plts temp tmp backup backups build_support vendor vendored test priv fixtures templates)
 
@@ -14,7 +14,7 @@ defmodule MixWorkspaceOps.Discovery do
 
       {repositories, unresolved} =
         candidates
-        |> Task.async_stream(&discover_candidate/1,
+        |> async_results(&discover_candidate/1,
           max_concurrency: Keyword.get(opts, :max_concurrency, 4),
           ordered: true,
           timeout: Keyword.get(opts, :timeout, :infinity),
@@ -62,7 +62,7 @@ defmodule MixWorkspaceOps.Discovery do
 
       entries =
         paths
-        |> Task.async_stream(&protected_inspect(&1, inspector),
+        |> async_results(&protected_inspect(&1, inspector),
           max_concurrency: Keyword.get(opts, :max_concurrency, 4),
           ordered: true,
           timeout: Keyword.get(opts, :timeout, :infinity),
@@ -79,6 +79,18 @@ defmodule MixWorkspaceOps.Discovery do
          entries: entries,
          summary: inventory_summary(entries)
        }}
+    end
+  end
+
+  defp async_results(enumerable, function, options) do
+    {:ok, supervisor} = Task.Supervisor.start_link()
+
+    try do
+      supervisor
+      |> Task.Supervisor.async_stream_nolink(enumerable, function, options)
+      |> Enum.to_list()
+    after
+      Supervisor.stop(supervisor)
     end
   end
 
@@ -111,15 +123,17 @@ defmodule MixWorkspaceOps.Discovery do
   end
 
   defp classify_git_failure(path, reason) do
-    if File.exists?(Path.join(path, ".git")),
-      do: failed(path, reason),
-      else: not_a_repository(path, reason)
+    case File.lstat(Path.join(path, ".git")) do
+      {:ok, _stat} -> failed(path, reason)
+      {:error, :enoent} -> not_a_repository(path, reason)
+      {:error, marker_reason} -> failed(path, {:git_marker, marker_reason, reason})
+    end
   end
 
   defp inspect_git_checkout(path, marker, inspector) do
     with {:ok, common_dir} <- Git.common_dir(path),
          {:ok, remotes} <- Git.remote_urls(path),
-         identities when identities != [] <- normalized_identities(remotes),
+         {:ok, identities} <- RemoteIdentity.hosted_identities(remotes),
          {:ok, mix_files} <- inspector.(path) do
       %{
         "path" => path,
@@ -132,22 +146,9 @@ defmodule MixWorkspaceOps.Discovery do
         "mix_files" => Enum.map(mix_files, &Path.relative_to(&1, path))
       }
     else
-      [] -> failed(path, :unrecognized_remote_identity)
       {:error, reason} -> failed(path, reason)
       other -> failed(path, {:invalid_mix_inspector_result, other})
     end
-  end
-
-  defp normalized_identities(remotes) do
-    remotes
-    |> Enum.flat_map(fn remote ->
-      case Binding.normalize_github(remote) do
-        {:ok, identity} -> [identity]
-        {:error, _reason} -> []
-      end
-    end)
-    |> Enum.uniq()
-    |> Enum.sort()
   end
 
   defp inspect_mix(path), do: find_mix_files_result(path)
@@ -199,7 +200,20 @@ defmodule MixWorkspaceOps.Discovery do
     Enum.flat_map(entries, &candidate_checkout(&1, owner))
   end
 
-  defp candidate_checkout(entry, owner) do
+  defp candidate_checkout(
+         %{"status" => "discovered", "kind" => "clone", "path" => path} = entry,
+         owner
+       ) do
+    if entry["common_dir"] == Path.join(path, ".git") do
+      candidate_identities(entry, owner)
+    else
+      []
+    end
+  end
+
+  defp candidate_checkout(_entry, _owner), do: []
+
+  defp candidate_identities(entry, owner) do
     identities = Enum.filter(entry["identities"] || [], &String.starts_with?(&1, owner <> "/"))
 
     case identities do

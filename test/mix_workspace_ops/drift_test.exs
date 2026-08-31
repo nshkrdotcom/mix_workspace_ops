@@ -17,6 +17,7 @@ defmodule MixWorkspaceOps.DriftTest do
     assert status(report, "beta") == "discovered"
 
     failed_output = Path.join(Path.dirname(root), "failed-drift.json")
+    empty_ledger = write_ledger!(Path.dirname(root), [], [])
 
     assert {:error, {:registry_drift, failed_cli_report}} =
              CLI.dispatch([
@@ -26,6 +27,8 @@ defmodule MixWorkspaceOps.DriftTest do
                catalog,
                "--checkout-root",
                root,
+               "--ledger",
+               empty_ledger,
                "--output",
                failed_output
              ])
@@ -145,6 +148,99 @@ defmodule MixWorkspaceOps.DriftTest do
     assert Enum.any?(report.unexplained, &String.ends_with?(&1, "/broken"))
   end
 
+  test "a local-only out-of-root binding contributes exact per-path evidence", context do
+    base = temporary_directory!(context)
+    root = Path.join(base, "checkouts")
+    File.mkdir_p!(root)
+    alpha = initialize_repository!(Path.join(base, "elsewhere/alpha"), "[]", "example-org/alpha")
+    mirror = Path.join(base, "mirrors/alpha.git")
+    File.mkdir_p!(Path.dirname(mirror))
+    {_, 0} = System.cmd("git", ["clone", "--quiet", "--bare", alpha, mirror])
+    {_, 0} = System.cmd("git", ["remote", "set-url", "origin", mirror], cd: alpha)
+
+    catalog = write_catalog!(base, [catalog_repository("alpha")])
+    {:ok, registry} = Registry.load(catalog)
+    ledger = write_ledger!(base, [binding("alpha", alpha)], [])
+
+    assert {:ok, report} = Drift.run(registry, root, ledger: ledger)
+
+    assert report.summary == %{
+             absent_catalog: 0,
+             discovered: 0,
+             dispositioned: 1,
+             failed: 0,
+             ignored: 0,
+             not_a_repository: 0,
+             total: 1
+           }
+
+    assert [%{"path" => ^alpha, "source" => "ledger_binding", "status" => "dispositioned"}] =
+             report.entries
+  end
+
+  test "an exact binding cannot recast malformed hosted evidence as a local origin", context do
+    base = temporary_directory!(context)
+    root = Path.join(base, "checkouts")
+    File.mkdir_p!(root)
+    alpha = initialize_repository!(Path.join(base, "elsewhere/alpha"), "[]", "example-org/alpha")
+    malformed = "https://github.com/example-org/alpha/extra"
+    {_, 0} = System.cmd("git", ["remote", "set-url", "origin", malformed], cd: alpha)
+
+    catalog = write_catalog!(base, [catalog_repository("alpha")])
+    {:ok, registry} = Registry.load(catalog)
+    ledger = write_ledger!(base, [binding("alpha", alpha)], [])
+
+    assert {:error, {:binding_remote_identity, _reason}} =
+             Registry.bind(registry, root, binding_file: ledger)
+
+    assert {:error, {:registry_drift, report}} = Drift.run(registry, root, ledger: ledger)
+    assert report.summary.failed == 1
+    assert [%{"reason" => reason}] = report.entries
+    assert reason =~ "binding_remote_identity"
+  end
+
+  test "a linked worktree cannot masquerade as a bindable canonical checkout", context do
+    base = temporary_directory!(context)
+    root = Path.join(base, "checkouts")
+    File.mkdir_p!(root)
+    source = initialize_repository!(Path.join(base, "source"), "[]", "example-org/alpha")
+    worktree = Path.join(base, "elsewhere/alpha")
+    File.mkdir_p!(Path.dirname(worktree))
+
+    {_, 0} =
+      System.cmd("git", ["worktree", "add", "--quiet", "-b", "binding-proof", worktree],
+        cd: source
+      )
+
+    catalog = write_catalog!(base, [catalog_repository("alpha")])
+    {:ok, registry} = Registry.load(catalog)
+    ledger = write_ledger!(base, [binding("alpha", worktree)], [])
+
+    assert {:error, {:registry_drift, report}} = Drift.run(registry, root, ledger: ledger)
+    assert report.summary.failed == 1
+    assert report.summary.absent_catalog == 1
+    assert [%{"path" => ^worktree, "reason" => reason}] = report.entries
+    assert reason =~ "binding_noncanonical_git_common_dir"
+  end
+
+  test "an ignore path reused by an ordinary directory yields one failed row", context do
+    %{root: root, registry: registry} = fixture(context)
+    ordinary = Path.join(root, "ordinary")
+    File.mkdir_p!(ordinary)
+
+    ledger =
+      write_ledger!(
+        Path.dirname(root),
+        [],
+        [%{"path" => ordinary, "remotes" => ["n:example-org/old"], "reason" => "old"}]
+      )
+
+    assert {:error, {:registry_drift, report}} = Drift.run(registry, root, ledger: ledger)
+
+    assert [%{"status" => "failed", "reason" => "stale_ignore_checkout"}] =
+             Enum.filter(report.entries, &(&1["path"] == ordinary))
+  end
+
   defp fixture(context) do
     base = temporary_directory!(context)
     root = Path.join(base, "checkouts")
@@ -164,6 +260,11 @@ defmodule MixWorkspaceOps.DriftTest do
   defp ignore(path, reason) do
     {:ok, remotes} = Git.remote_urls(path)
     %{"path" => path, "remotes" => remotes, "reason" => reason}
+  end
+
+  defp binding(repository, path) do
+    {:ok, remotes} = Git.remote_urls(path)
+    %{"repository" => repository, "path" => path, "remotes" => remotes}
   end
 
   defp write_ledger!(root, bindings, ignores) do

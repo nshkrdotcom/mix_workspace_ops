@@ -358,10 +358,11 @@ the local file or a flag; experimenting never requires a catalog commit.
 `mwo use --clear [APP]` removes entries. `mwo why APP` shows the identity rule,
 source candidates, rejections, and the exact gesture that changes the answer.
 
-Registry and checkout paths follow one order everywhere: explicit flags,
-`MIX_WORKSPACE_OPS_REGISTRY` / `MIX_WORKSPACE_OPS_CHECKOUT_ROOT`, then
-`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/config.json`, then upward
-discovery. The configuration file is a JSON object:
+Registry, checkout, and ledger paths follow one order everywhere: explicit
+flags, their matching `MIX_WORKSPACE_OPS_*` environment variables, then
+`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/config.json`, then discovery.
+Ledger discovery uses the conventional `operator_ledger.json` beside that
+configuration file when present. The configuration file is a JSON object:
 
 ```json
 {

@@ -9,12 +9,7 @@ defmodule MixWorkspaceOps.Binding do
   contradiction rather than a choice.
   """
 
-  alias MixWorkspaceOps.{Git, OperatorLedger, Registry, StrictJSON}
-
-  @remote_schemes ~w(git http https ssh)
-  @url_remote ~r{^(?<scheme>[A-Za-z][A-Za-z0-9+.\-]*)://(?<authority>[^/]*)/(?<path>.+)$}
-  @scp_remote ~r{^(?<authority>[^/:]+):(?<path>.+)$}
-  @segment ~r{^[A-Za-z0-9_.\-]+$}
+  alias MixWorkspaceOps.{Git, OperatorLedger, Registry, RemoteIdentity, StrictJSON}
 
   @typedoc """
   What binding found for every catalogued repository.
@@ -58,16 +53,7 @@ defmodule MixWorkspaceOps.Binding do
   manufacture a coordinate no other machine could resolve.
   """
   @spec normalize_github(String.t()) :: {:ok, String.t()} | {:error, term()}
-  def normalize_github(remote) do
-    trimmed = String.trim(remote)
-
-    with {:ok, path} <- remote_path(trimmed),
-         {:ok, identity} <- owner_repository(path) do
-      {:ok, identity}
-    else
-      :error -> {:error, {:unrecognized_git_remote, remote}}
-    end
-  end
+  def normalize_github(remote), do: RemoteIdentity.github(remote)
 
   @doc "Every catalogued remote coordinate, as a set."
   @spec catalogued_identities(Registry.t()) :: MapSet.t()
@@ -179,7 +165,7 @@ defmodule MixWorkspaceOps.Binding do
          true <-
            actual == expected ||
              {:error, {:binding_remote_drift, repository.id, expected, actual}},
-         identities <- normalized_identities(actual) do
+         {:ok, identities} <- normalized_identities(actual) do
       ledger_identity(repository, path, identities)
     end
   end
@@ -199,63 +185,9 @@ defmodule MixWorkspaceOps.Binding do
   end
 
   defp normalized_identities(remotes) do
-    remotes
-    |> Enum.flat_map(fn remote ->
-      case normalize_github(remote) do
-        {:ok, identity} -> [identity]
-        {:error, _reason} -> []
-      end
-    end)
-    |> Enum.uniq()
-    |> Enum.sort()
-  end
-
-  defp remote_path(remote) do
-    case url_path(remote) do
-      {:ok, path} -> {:ok, path}
-      :error -> scp_path(remote)
-    end
-  end
-
-  defp url_path(remote) do
-    case Regex.named_captures(@url_remote, remote) do
-      %{"scheme" => scheme, "authority" => authority, "path" => path} ->
-        if scheme in @remote_schemes and host(authority) != "", do: {:ok, path}, else: :error
-
-      nil ->
-        :error
-    end
-  end
-
-  defp scp_path(remote) do
-    case Regex.named_captures(@scp_remote, remote) do
-      %{"authority" => authority, "path" => path} ->
-        if host(authority) != "", do: {:ok, path}, else: :error
-
-      nil ->
-        :error
-    end
-  end
-
-  defp host(authority) do
-    authority |> String.split("@") |> List.last() |> String.split(":") |> List.first()
-  end
-
-  defp owner_repository(path) do
-    segments =
-      path
-      |> String.trim_leading("/")
-      |> String.replace_suffix(".git", "")
-      |> String.split("/", trim: true)
-
-    case segments do
-      [owner, repository] ->
-        if Regex.match?(@segment, owner) and Regex.match?(@segment, repository),
-          do: {:ok, owner <> "/" <> repository},
-          else: :error
-
-      _other ->
-        :error
+    case RemoteIdentity.hosted_identities(remotes) do
+      {:ok, identities} -> {:ok, identities}
+      {:error, reason} -> {:error, {:binding_remote_identity, reason}}
     end
   end
 

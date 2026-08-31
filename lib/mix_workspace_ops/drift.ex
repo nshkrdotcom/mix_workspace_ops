@@ -1,7 +1,7 @@
 defmodule MixWorkspaceOps.Drift do
   @moduledoc "Fail-closed reconciliation of live checkout evidence with catalog and ledger."
 
-  alias MixWorkspaceOps.{Binding, Discovery, Git, OperatorLedger, Registry}
+  alias MixWorkspaceOps.{Discovery, Git, OperatorLedger, Registry, RemoteIdentity}
 
   @schema "mix_workspace_ops.registry_drift/v1"
 
@@ -25,11 +25,18 @@ defmodule MixWorkspaceOps.Drift do
     catalog = catalog_identities(registry)
     {valid_bindings, binding_rows} = validate_bindings(ledger, registry)
 
+    binding_failures =
+      binding_rows
+      |> Enum.filter(&(&1["status"] == "failed"))
+      |> Map.new(&{&1["path"], &1})
+
+    inventory_paths = MapSet.new(inventory.entries, & &1["path"])
+
     {classified, observed_ids, consumed_ignores} =
       Enum.reduce(inventory.entries, {[], MapSet.new(), MapSet.new()}, fn entry,
                                                                           {rows, ids, ignores} ->
         {classified, repository, ignored_path} =
-          classify(entry, catalog, valid_bindings, ledger.ignores)
+          classify(entry, catalog, valid_bindings, binding_failures, ledger.ignores)
 
         ids = if repository, do: MapSet.put(ids, repository), else: ids
         ignores = if ignored_path, do: MapSet.put(ignores, ignored_path), else: ignores
@@ -41,7 +48,9 @@ defmodule MixWorkspaceOps.Drift do
     stale_ignore_rows = stale_ignores(ledger.ignores, consumed_ignores)
 
     entries =
-      (classified ++ binding_rows ++ stale_ignore_rows)
+      (classified ++
+         Enum.reject(binding_rows, &MapSet.member?(inventory_paths, &1["path"])) ++
+         stale_ignore_rows)
       |> Enum.sort_by(&{&1["path"], &1["status"], &1["source"] || "checkout"})
 
     counts = Enum.frequencies_by(entries, & &1["status"])
@@ -69,19 +78,40 @@ defmodule MixWorkspaceOps.Drift do
     }
   end
 
-  defp classify(%{"status" => "discovered"} = entry, catalog, bindings, ignores) do
+  defp classify(entry, catalog, bindings, binding_failures, ignores) do
     path = entry["path"]
 
-    case Map.get(bindings, path) do
+    case Map.get(binding_failures, path) do
+      nil -> classify_checkout(entry, catalog, bindings, ignores)
+      failure -> {failure, nil, nil}
+    end
+  end
+
+  defp classify_checkout(%{"status" => "discovered"} = entry, catalog, bindings, ignores) do
+    case Map.get(bindings, entry["path"]) do
       %{repository: repository} ->
         {dispositioned(entry, repository, "ledger_binding"), repository, nil}
 
       nil ->
-        classify_identity(entry, catalog, Map.get(ignores, path))
+        classify_identity(entry, catalog, Map.get(ignores, entry["path"]))
     end
   end
 
-  defp classify(entry, _catalog, _bindings, _ignores), do: {entry, nil, nil}
+  defp classify_checkout(entry, _catalog, _bindings, ignores) do
+    case Map.get(ignores, entry["path"]) do
+      nil ->
+        {entry, nil, nil}
+
+      ignore ->
+        evidence = %{
+          expected_remotes: ignore.remotes,
+          checkout_status: entry["status"],
+          checkout_reason: entry["reason"]
+        }
+
+        {failure(entry, "stale_ignore_checkout", evidence), nil, ignore.path}
+    end
+  end
 
   defp classify_identity(entry, catalog, ignore) do
     matches =
@@ -92,13 +122,36 @@ defmodule MixWorkspaceOps.Drift do
 
     case matches do
       [repository] ->
-        {dispositioned(entry, repository, "catalog_identity"), repository, nil}
+        classify_catalog_identity(entry, repository, ignore)
 
       [] ->
         classify_ignore(entry, ignore)
 
       several ->
         {failure(entry, "ambiguous_catalog_identity", several), nil, nil}
+    end
+  end
+
+  defp classify_catalog_identity(entry, repository, nil) do
+    {dispositioned(entry, repository, "catalog_identity"), repository, nil}
+  end
+
+  defp classify_catalog_identity(entry, repository, ignore) do
+    if entry["remotes"] == ignore.remotes do
+      classified =
+        entry
+        |> dispositioned(repository, "catalog_identity")
+        |> Map.put("ledger_ignore_reason", ignore.reason)
+
+      {classified, repository, ignore.path}
+    else
+      classified =
+        failure(entry, "stale_ignore_remotes", %{
+          expected: ignore.remotes,
+          actual: entry["remotes"]
+        })
+
+      {classified, repository, ignore.path}
     end
   end
 
@@ -138,8 +191,12 @@ defmodule MixWorkspaceOps.Drift do
   defp validate_bindings(ledger, registry) do
     Enum.reduce(ledger.bindings, {%{}, []}, fn {_repository, binding}, {valid, failures} ->
       case validate_binding(binding, registry) do
-        :ok -> {Map.put(valid, binding.path, binding), failures}
-        {:error, reason} -> {valid, [binding_failure(binding, reason) | failures]}
+        :ok ->
+          row = binding_success(binding)
+          {Map.put(valid, binding.path, binding), [row | failures]}
+
+        {:error, reason} ->
+          {valid, [binding_failure(binding, reason) | failures]}
       end
     end)
   end
@@ -150,6 +207,10 @@ defmodule MixWorkspaceOps.Drift do
     with true <- File.dir?(binding.path) || {:error, :absent_binding_path},
          {:ok, root} <- Git.root(binding.path),
          true <- root == binding.path || {:error, {:binding_not_git_root, root}},
+         {:ok, common_dir} <- Git.common_dir(binding.path),
+         true <-
+           common_dir == Path.join(binding.path, ".git") ||
+             {:error, {:binding_noncanonical_git_common_dir, common_dir}},
          {:ok, actual} <- Git.remote_urls(binding.path),
          true <-
            actual == binding.remotes ||
@@ -159,26 +220,19 @@ defmodule MixWorkspaceOps.Drift do
   end
 
   defp binding_identity(expected, remotes) do
-    identities = normalized_identities(remotes)
-    expected = String.downcase(expected)
+    case RemoteIdentity.hosted_identities(remotes) do
+      {:ok, identities} ->
+        expected = String.downcase(expected)
 
-    case Enum.map(identities, &String.downcase/1) do
-      [] -> :ok
-      [^expected] -> :ok
-      _other -> {:error, {:binding_wrong_identity, expected, identities}}
+        case Enum.map(identities, &String.downcase/1) do
+          [] -> :ok
+          [^expected] -> :ok
+          _other -> {:error, {:binding_wrong_identity, expected, identities}}
+        end
+
+      {:error, reason} ->
+        {:error, {:binding_remote_identity, reason}}
     end
-  end
-
-  defp normalized_identities(remotes) do
-    remotes
-    |> Enum.flat_map(fn remote ->
-      case Binding.normalize_github(remote) do
-        {:ok, identity} -> [identity]
-        {:error, _reason} -> []
-      end
-    end)
-    |> Enum.uniq()
-    |> Enum.sort()
   end
 
   defp binding_failure(binding, reason) do
@@ -189,6 +243,17 @@ defmodule MixWorkspaceOps.Drift do
       "source" => "ledger_binding",
       "repository" => binding.repository,
       "reason" => inspect(reason, limit: :infinity)
+    }
+  end
+
+  defp binding_success(binding) do
+    %{
+      "path" => binding.path,
+      "name" => Path.basename(binding.path),
+      "status" => "dispositioned",
+      "source" => "ledger_binding",
+      "repository" => binding.repository,
+      "remotes" => binding.remotes
     }
   end
 
