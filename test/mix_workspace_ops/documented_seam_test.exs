@@ -54,6 +54,23 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
            ]
   end
 
+  test "the documented seam supports an explicit whole-table comprehension", context do
+    %{core: core, consumer: consumer, activation: activation} = activated(context)
+    File.write!(Path.join(consumer, "mix.exs"), mixfile(whole_table_seam(seam(hd(@documents)))))
+
+    assert deps(consumer, activation.env) == [
+             {:example_core, [path: core]},
+             {:example_edge,
+              [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
+           ]
+
+    assert deps(consumer, inactive()) == [
+             {:example_core, "~> 1.0"},
+             {:example_edge,
+              [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
+           ]
+  end
+
   # The Mix task the file this seam replaces defined, restored where it always
   # belonged: inside the process that loaded the seam, with nothing installed in
   # the repository to make it available.
@@ -145,6 +162,22 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
       nil -> flunk("#{document} prints no elixir block defining workspace_dep")
       block -> block
     end
+  end
+
+  defp whole_table_seam(block) do
+    replacement = """
+    defp deps do
+      for {app, committed_default, extra_opts} <- [
+            {:example_core, "~> 1.0", []},
+            {:example_edge, [github: "example-org/example_edge", branch: "main"],
+             [only: [:dev, :test]]}
+          ] do
+        workspace_dep(app, committed_default, extra_opts)
+      end
+    end
+    """
+
+    Regex.replace(~r/defp deps do\n.*?^end\n/ms, block, replacement, global: false)
   end
 
   defp elixir_block("elixir\n" <> body) do
