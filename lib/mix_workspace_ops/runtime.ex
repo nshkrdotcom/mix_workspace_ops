@@ -748,7 +748,18 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   defp prepare_hex_objects(handle, paths, objects, opts) do
-    fetch = Keyword.get(opts, :hex_fetch, &HexCache.fetch/1)
+    mix_executable = HexCache.mix_executable()
+
+    fetch =
+      Keyword.get_lazy(opts, :hex_fetch, fn ->
+        fn object ->
+          HexCache.fetch(object,
+            command: mix_executable,
+            env: cache_command_environment(paths),
+            temporary_root: paths.tmp
+          )
+        end
+      end)
 
     map_objects(objects, opts, fn object ->
       with {:ok, object_report} <- HexCache.ensure(handle.state_root, object, fetch),
@@ -820,7 +831,11 @@ defmodule MixWorkspaceOps.Runtime do
       {"XDG_CONFIG_HOME", paths.config},
       {"XDG_CACHE_HOME", paths.xdg_cache},
       {"MIX_XDG", "1"},
+      {"MIX_HOME", paths.mix},
+      {"MIX_ARCHIVES", paths.archives},
       {"HEX_HOME", nil},
+      {"HEX_NO_UPDATE_CHECK", "1"},
+      {"ERL_AFLAGS", "+S 1:1"},
       {"GCM_INTERACTIVE", "never"},
       {"GIT_TERMINAL_PROMPT", "0"}
     ]

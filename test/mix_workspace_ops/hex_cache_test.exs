@@ -3,6 +3,63 @@ defmodule MixWorkspaceOps.HexCacheTest do
 
   alias MixWorkspaceOps.HexCache
 
+  test "fetch delegates network semantics to Hex in the supplied private environment",
+       context do
+    root = temporary_directory!(context)
+    environment = [{"HOME", Path.join(root, "private-home")}, {"EXAMPLE_TOKEN", nil}]
+    parent = self()
+
+    runner = fn command, arguments, received_environment, cwd ->
+      send(parent, {:hex_fetch, command, arguments, received_environment, cwd})
+      output = Enum.at(arguments, -1)
+      File.mkdir_p!(output)
+      File.write!(Path.join(output, "example_package-1.2.3.tar"), "archive bytes")
+      {"Hex fetched package\n", 0}
+    end
+
+    object = %{repository: "hexpm", package: "example_package", version: "1.2.3"}
+
+    assert HexCache.fetch(object,
+             command: "/path/to/mix",
+             env: environment,
+             temporary_root: root,
+             runner: runner
+           ) == {:ok, "archive bytes"}
+
+    assert_receive {:hex_fetch, "/path/to/mix", arguments, received_environment, cwd}
+
+    assert Map.new(received_environment)["HOME"] == Path.join(root, "private-home")
+    assert Map.new(received_environment)["EXAMPLE_TOKEN"] == nil
+    assert Map.new(received_environment)["PATH"] |> String.starts_with?("/path/to:")
+
+    assert arguments == [
+             "hex.package",
+             "fetch",
+             "example_package",
+             "1.2.3",
+             "--repo",
+             "hexpm",
+             "--output",
+             Path.join(cwd, "output")
+           ]
+
+    refute File.exists?(cwd)
+  end
+
+  test "fetch rejects coordinates that could escape or alter the Hex command", context do
+    root = temporary_directory!(context)
+
+    assert HexCache.fetch(
+             %{repository: "hexpm", package: "../escape", version: "1.2.3"},
+             temporary_root: root
+           ) == {:error, {:hex_package, "../escape"}}
+
+    assert HexCache.fetch(
+             %{repository: "hexpm", package: "example_package", version: "--output"},
+             temporary_root: root
+           ) == {:error, {:hex_version, "--output"}}
+  end
+
   test "retains two checksums for one package version and selects the exact object", context do
     state_root = temporary_directory!(context)
     first = object("same", "1.0.0", "first archive")

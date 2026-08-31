@@ -157,6 +157,10 @@ defmodule MixWorkspaceOps.DependencyLock do
 
     with :ok <- hex_application(app),
          true <- is_atom(package) || is_binary(package) || {:error, {:hex_package, app, package}},
+         package = to_string(package),
+         true <-
+           Regex.match?(~r/^[a-z][a-z0-9_]*$/, package) ||
+             {:error, {:hex_package, app, package}},
          true <- is_binary(version) || {:error, {:hex_version, app, version}},
          true <-
            match?({:ok, _version}, Version.parse(version)) ||
@@ -167,7 +171,7 @@ defmodule MixWorkspaceOps.DependencyLock do
          true <- is_binary(repository) || {:error, {:hex_repository, app, repository}} do
       canonical = %{
         repository: repository,
-        package: to_string(package),
+        package: package,
         version: version,
         inner_checksum: inner,
         outer_checksum: outer

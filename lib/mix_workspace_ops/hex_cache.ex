@@ -16,6 +16,17 @@ defmodule MixWorkspaceOps.HexCache do
   @schema "mix_workspace_ops.hex_object/v1"
   @digest ~r/^[0-9a-f]{64}$/
 
+  @doc "Returns the native Mix executable selected for the current toolchain."
+  @spec mix_executable() :: String.t()
+  def mix_executable do
+    discovered = System.find_executable("mix")
+
+    Enum.find(
+      [mix_from_code_path(), resolve_version_manager_shim(discovered), discovered],
+      &usable_executable?/1
+    ) || discovered || "mix"
+  end
+
   @spec ensure(String.t(), map(), (map() -> {:ok, binary()} | {:error, term()}), keyword()) ::
           {:ok, map()} | {:error, term()}
   def ensure(state_root, object, fetch, opts \\ [])
@@ -47,29 +58,144 @@ defmodule MixWorkspaceOps.HexCache do
     end
   end
 
-  @doc "Fetches a public Hex archive without reading operator credentials."
-  @spec fetch(map()) :: {:ok, binary()} | {:error, term()}
-  def fetch(%{repository: "hexpm", package: package, version: version}) do
-    url =
-      "https://repo.hex.pm/tarballs/#{URI.encode(package)}-#{URI.encode(version)}.tar"
-      |> String.to_charlist()
-
-    with {:ok, _apps} <- Application.ensure_all_started(:inets),
-         {:ok, _apps} <- Application.ensure_all_started(:ssl) do
-      case :httpc.request(
-             :get,
-             {url, [{~c"user-agent", ~c"mix_workspace_ops/0.1.0"}]},
-             [ssl: ssl_options()],
-             body_format: :binary
-           ) do
-        {:ok, {{_http, 200, _reason}, _headers, body}} -> {:ok, body}
-        {:ok, {{_http, status, _reason}, _headers, _body}} -> {:error, {:hex_status, status}}
-        {:error, reason} -> {:error, {:hex_request, reason}}
-      end
+  @doc "Fetches one archive through Hex's own task in a supplied private environment."
+  @spec fetch(map(), keyword()) :: {:ok, binary()} | {:error, term()}
+  def fetch(%{repository: repository, package: package, version: version}, opts)
+      when is_binary(repository) and is_binary(package) and is_binary(version) and
+             is_list(opts) do
+    with :ok <- fetch_package(package),
+         :ok <- fetch_version(version),
+         {:ok, temporary_root} <- Keyword.fetch(opts, :temporary_root),
+         true <-
+           is_binary(temporary_root) || {:error, {:hex_fetch_temporary_root, temporary_root}},
+         temporary_root = Path.expand(temporary_root),
+         :ok <- mkdir_private(temporary_root),
+         {:ok, temporary} <- create_fetch_directory(temporary_root) do
+      result = fetch_with_hex(temporary, repository, package, version, opts)
+      File.rm_rf(temporary)
+      result
     end
   end
 
-  def fetch(%{repository: repository}), do: {:error, {:hex_repository_unsupported, repository}}
+  def fetch(_object, _opts), do: {:error, :invalid_hex_fetch_request}
+
+  defp fetch_package(package) do
+    if Regex.match?(~r/^[a-z][a-z0-9_]*$/, package),
+      do: :ok,
+      else: {:error, {:hex_package, package}}
+  end
+
+  defp fetch_version(version) do
+    if match?({:ok, _version}, Version.parse(version)),
+      do: :ok,
+      else: {:error, {:hex_version, version}}
+  end
+
+  defp create_fetch_directory(root) do
+    path = Path.join(root, ".hex-fetch-#{random_suffix()}")
+
+    with :ok <- File.mkdir(path),
+         :ok <- File.chmod(path, 0o700) do
+      {:ok, path}
+    end
+  end
+
+  defp fetch_with_hex(temporary, repository, package, version, opts) do
+    output = Path.join(temporary, "output")
+    archive = Path.join(output, "#{package}-#{version}.tar")
+    {command, environment} = fetch_command(opts)
+    runner = Keyword.get(opts, :runner, &run_hex_fetch/4)
+
+    arguments =
+      ["hex.package", "fetch", package, version, "--repo", repository, "--output", output]
+
+    case runner.(command, arguments, environment, temporary) do
+      {_console, 0} ->
+        read_fetched_archive(archive)
+
+      {_console, status} ->
+        {:error, {:hex_fetch_exit, repository, package, version, status}}
+
+      other ->
+        {:error, {:hex_fetch_runner, other}}
+    end
+  rescue
+    error -> {:error, {:hex_fetch_command, error.__struct__, Exception.message(error)}}
+  end
+
+  defp fetch_command(opts) do
+    environment = Keyword.get(opts, :env, [])
+    command = Keyword.get_lazy(opts, :command, &mix_executable/0)
+    {command, prepend_toolchain_path(environment, command)}
+  end
+
+  defp mix_from_code_path do
+    case :code.lib_dir(:mix) do
+      path when is_list(path) ->
+        path
+        |> List.to_string()
+        |> Path.dirname()
+        |> Path.dirname()
+        |> Path.join("bin/mix")
+        |> Path.expand()
+
+      _other ->
+        nil
+    end
+  end
+
+  defp resolve_version_manager_shim(command) when is_binary(command) do
+    if "shims" in Path.split(Path.expand(command)) do
+      Enum.find_value(["asdf", "mise", "rtx"], &manager_executable(&1, "mix"))
+    end
+  end
+
+  defp resolve_version_manager_shim(_command), do: nil
+
+  defp manager_executable(manager, executable) do
+    with manager_path when is_binary(manager_path) <- System.find_executable(manager),
+         {output, 0} <-
+           System.cmd(manager_path, ["which", executable], stderr_to_stdout: true) do
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.find(&usable_executable?/1)
+    else
+      _other -> nil
+    end
+  rescue
+    _error -> nil
+  end
+
+  defp usable_executable?(path), do: is_binary(path) and File.regular?(path)
+
+  defp prepend_toolchain_path(environment, command) do
+    current = Map.new(environment)["PATH"] || System.get_env("PATH", "")
+    otp_root = :code.root_dir() |> List.to_string() |> Path.expand()
+    erts_bin = Path.join([otp_root, "erts-#{:erlang.system_info(:version)}", "bin"])
+
+    path =
+      [Path.dirname(command), erts_bin, Path.join(otp_root, "bin") | String.split(current, ":")]
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+      |> Enum.join(":")
+
+    environment
+    |> Map.new()
+    |> Map.put("PATH", path)
+    |> Enum.sort_by(&elem(&1, 0))
+  end
+
+  defp run_hex_fetch(command, arguments, environment, cwd) do
+    System.cmd(command, arguments, cd: cwd, env: environment, stderr_to_stdout: true)
+  end
+
+  defp read_fetched_archive(path) do
+    case File.read(path) do
+      {:ok, bytes} when byte_size(bytes) > 0 -> {:ok, bytes}
+      {:ok, _empty} -> {:error, {:hex_fetch_archive, path, :empty}}
+      {:error, reason} -> {:error, {:hex_fetch_archive, path, reason}}
+    end
+  end
 
   @doc "Materializes one retained exact archive into an exact Mix dependency path."
   @spec materialize(String.t(), map(), String.t()) :: {:ok, map()} | {:error, term()}
@@ -468,7 +594,13 @@ defmodule MixWorkspaceOps.HexCache do
              {:error, {:hex_inner_checksum, object.inner_checksum}},
          true <-
            Regex.match?(@digest, String.downcase(object.outer_checksum)) ||
-             {:error, {:hex_outer_checksum, object.outer_checksum}} do
+             {:error, {:hex_outer_checksum, object.outer_checksum}},
+         true <-
+           Regex.match?(~r/^[a-z][a-z0-9_]*$/, object.package) ||
+             {:error, {:hex_package, object.package}},
+         true <-
+           match?({:ok, _version}, Version.parse(object.version)) ||
+             {:error, {:hex_version, object.version}} do
       normalized =
         object
         |> Map.take(keys ++ [:app, :managers])
@@ -506,14 +638,6 @@ defmodule MixWorkspaceOps.HexCache do
     if actual == object.outer_checksum,
       do: :ok,
       else: {:error, {:hex_outer_checksum, object.outer_checksum, actual}}
-  end
-
-  defp ssl_options do
-    [
-      verify: :verify_peer,
-      cacerts: :public_key.cacerts_get(),
-      customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]
-    ]
   end
 
   defp inside?(path, root) do
