@@ -53,11 +53,11 @@ defmodule MixWorkspaceOps.CLI do
     run --registry PATH --checkout-root PATH [--view PATH | --project ID] [--binding PATH] \
       [--unit project|repository] [--dirty-policy require-clean|allow-recorded] \
       [--mix-env ENV] [--mix-target TARGET] [--mode auto|local|git|hex] \
-      [--source APP=SOURCE] [--fail-fast] [--max-concurrency N] \
+      [--source APP=SOURCE] [--fail-fast] [--max-concurrency N] [--beam-schedulers N] \
       [--timeout N[s|m|h]] [--allow-lock-mutation] [--state-root PATH] \
       -- COMMAND [ARG ...]
-    run --plan PATH --registry PATH --checkout-root PATH --view PATH [--binding PATH] \
-      [--max-concurrency N] [--timeout N[s|m|h]] [--allow-lock-mutation] \
+    run --plan PATH --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
+      [--max-concurrency N] [--beam-schedulers N] [--timeout N[s|m|h]] [--allow-lock-mutation] \
       [--state-root PATH]
     release plan --registry PATH --package APP
     release chain --registry PATH --checkout-root PATH [--binding PATH] --package APP \
@@ -129,6 +129,7 @@ defmodule MixWorkspaceOps.CLI do
       :dirty_policy,
       :fail_fast,
       :max_concurrency,
+      :beam_schedulers,
       :timeout,
       :registry,
       :checkout_root,
@@ -520,15 +521,42 @@ defmodule MixWorkspaceOps.CLI do
   defp run_replay(option_args) do
     with {:ok, options, []} <- options(["run"], option_args),
          :ok <- require_option(options, :plan),
-         :ok <- require_option(options, :view),
          :ok <- reject_semantic_replay_options(option_args),
          {:ok, recorded} <- OperationPlan.load(options.plan),
+         {:ok, options} <- replay_scope(recorded, options),
          :ok <- require_safe_run_command(OperationPlan.command_argv(recorded)),
          {:ok, registry, view} <- load_fanout_context(options),
          memo <- ProbeMemo.new(),
          {:ok, plan} <- OperationPlan.replay(recorded, registry, view, probe_memo: memo),
          {:ok, execution_opts} <- execution_options(options, memo) do
       Fanout.run(plan, registry, execution_opts)
+    end
+  end
+
+  # A view-scoped portable plan records the view identity but not its
+  # machine-local path, so replay still needs --view. A project-scoped plan
+  # already records its project identity and must not acquire a new view on
+  # replay merely to reconstruct the same selection.
+  defp replay_scope(recorded, options) do
+    view = OperationPlan.field(recorded, :view)
+    policy = OperationPlan.field(recorded, :policy)
+    project = OperationPlan.field(policy, :project)
+
+    cond do
+      is_map(view) and is_binary(options.view) ->
+        {:ok, options}
+
+      is_map(view) ->
+        {:usage_error, "missing --view"}
+
+      is_binary(project) and is_nil(options.view) ->
+        {:ok, %{options | project: project}}
+
+      is_binary(project) ->
+        {:usage_error, "project-scoped replay does not accept --view"}
+
+      true ->
+        {:error, {:operation_plan, :missing_scope}}
     end
   end
 
@@ -861,17 +889,26 @@ defmodule MixWorkspaceOps.CLI do
 
   defp execution_options(options, memo \\ ProbeMemo.new()) do
     with {:ok, max_concurrency} <- positive_integer(options.max_concurrency, :max_concurrency),
+         {:ok, beam_schedulers} <-
+           optional_positive_integer(options.beam_schedulers, :beam_schedulers),
          {:ok, timeout} <- timeout(options.timeout) do
       {:ok,
        [
          max_concurrency: max_concurrency,
+         beam_schedulers: beam_schedulers,
          timeout: timeout,
          state_root: options.state_root,
          allow_lock_mutation: options.allow_lock_mutation,
          probe_memo: memo
        ]}
+      |> drop_nil_options()
     end
   end
+
+  defp optional_positive_integer(nil, _field), do: {:ok, nil}
+  defp optional_positive_integer(value, field), do: positive_integer(value, field)
+
+  defp drop_nil_options({:ok, options}), do: {:ok, Enum.reject(options, &(elem(&1, 1) == nil))}
 
   defp unit_kind("project"), do: {:ok, :project}
   defp unit_kind("repository"), do: {:ok, :repository}

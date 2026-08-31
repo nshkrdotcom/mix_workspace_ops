@@ -958,7 +958,7 @@ defmodule MixWorkspaceOps.ResolutionTest do
 
       assert Enum.map(report.decisions, & &1.application) == ["beta", "gamma"]
       assert {:ok, [line]} = Resolution.seam_lines(report)
-      assert line =~ "workspace_dep(:beta,"
+      assert line == ~s|workspace_dep({:beta, "~> 1.0"})|
       refute line =~ ":gamma"
     end
   end

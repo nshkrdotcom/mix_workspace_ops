@@ -59,32 +59,21 @@ declarative manifest rather than a copied helper subsystem.
 ```elixir
 if bootstrap = System.get_env("MIX_WORKSPACE_OPS_BOOTSTRAP"), do: Code.require_file(bootstrap)
 
-@compile {:no_warn_undefined, MixWorkspaceOpsBootstrap}
-
 defp deps do
   [
-    workspace_dep(:example_core, "~> 1.0"),
-    workspace_dep(:example_edge, [github: "example-org/example_edge", branch: "main"],
-      only: [:dev, :test]
+    workspace_dep({:example_core, "~> 1.0"}),
+    workspace_dep(
+      {:example_edge,
+       [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
     )
   ]
 end
 
-defp workspace_dep(app, committed_default, extra_opts \\ []) do
-  if Code.ensure_loaded?(MixWorkspaceOpsBootstrap) do
-    MixWorkspaceOpsBootstrap.dep(app, committed_default, __DIR__, extra_opts)
-  else
-    committed_dep(app, committed_default, extra_opts)
-  end
+defp workspace_dep(committed) do
+  if function_exported?(MixWorkspaceOpsBootstrap, :dep, 2),
+    do: apply(MixWorkspaceOpsBootstrap, :dep, [committed, __DIR__]),
+    else: committed
 end
-
-defp committed_dep(app, requirement, []) when is_binary(requirement), do: {app, requirement}
-
-defp committed_dep(app, requirement, opts) when is_binary(requirement),
-  do: {app, requirement, opts}
-
-defp committed_dep(app, coordinates, opts) when is_list(coordinates),
-  do: {app, Keyword.merge(coordinates, opts)}
 ```
 
 The first line is what puts the bootstrap on the code path, and the rest goes
@@ -94,14 +83,14 @@ arrives in `MIX_WORKSPACE_OPS_BOOTSTRAP`, so a `mix.exs` that only asks whether
 the module is loaded gets `false` every time and resolves nothing, while looking
 wired.
 
-The second argument is the committed default — a Hex requirement, or committed
-git coordinates for a dependency that has no Hex release. It is what the
-repository resolves to on a fresh clone with no tool involved, and
-`mwo seam --project ID` prints it for a project rather than leaving it to be
-written by hand. Options given at the call site are carried whether or not an
-overlay is active, because `only:`, `optional:`, `runtime:` and `targets:` say
-whether a dependency exists here at all and dropping them changes what Mix
-resolves.
+The argument is an ordinary committed Mix dependency tuple. With no bootstrap,
+the wrapper returns it byte-for-byte unchanged. With a bootstrap, only its
+source may be substituted. The tuple contains the Hex requirement, or committed
+git coordinates for a dependency that has no Hex release, plus any call-site
+options. It is what the repository resolves to on a fresh clone with no tool
+involved, and `mwo seam --project ID` prints it rather than leaving it to be
+written by hand. `only:`, `optional:`, `runtime:` and `targets:` stay in the
+tuple because they say whether a dependency exists here at all.
 
 Where an operator has activated an overlay, the row for that application decides
 instead, and the plan records which source it chose and why.
@@ -220,6 +209,11 @@ Write a portable plan with `--output` and replay it without semantic overrides:
   --max-concurrency 8 --timeout 20m
 ```
 
+A plan created with `--project ID` is replayed without either `--project` or
+`--view`; the recorded project identity is the scope. A view-scoped plan still
+requires the local `--view PATH`, whose identity and digest must match the
+recorded view.
+
 Replay reconstructs current semantics and refuses named registry, view,
 selection, revision, source-digest, dirty-state, graph/source-decision, command
 policy, or toolchain drift before allocating runtime state. There is no force
@@ -241,31 +235,46 @@ MWO materializes its bootstrap in operator state and supplies its path through
 the repository. `MIX_WORKSPACE_OPS_CONTEXT_DIGEST` identifies the normalized,
 path-independent dependency-source selection for cache-aware callers.
 
-The path-independent context digest is a cache identity. The execution identity
-adds target HEAD/source state plus the explicit Mix environment and target. Each
-activation then adds a random invocation id and receives a private writable run
-root; identities may match, but writable directories never do.
+The source context, exact source lock, target HEAD/source state, bound checkout,
+toolchain, Mix environment and target select stable external dependency and
+build paths. Repeating the exact question reuses those paths. Different
+versions, source states or build inputs select different paths and coexist.
+Mix's own path-scoped cross-process locks coordinate identical work; unrelated
+contexts continue in parallel.
 
-Project fan-out supplies invocation-unique, operator-owned Home, Mix,
-archives, `MIX_DEPS_PATH`, `MIX_BUILD_ROOT`, `HEX_HOME`, Rebar, temporary, and
-lockfile state. The source lock is copied and its initial and final digests are
-recorded. Mutation is rejected unless that particular run carries
-`--allow-lock-mutation`, and the checkout's lockfile is never changed.
-Repository fan-out delegates deps/build/lock ownership while retaining the
-unique Home/Mix/Hex credential shield. These ownership choices follow the unit
-kind rather than an operator flag.
+Only transient state is invocation-specific: Home, configuration, temporary
+files, leases, reports and the operational lock. Hex's XDG download cache,
+Rebar downloads and toolchain-scoped Mix archives are shared without sharing
+credentials. Locked Hex archives are retained by verified outer checksum and
+materialized into the exact dependency context. For ordinary managed work, the
+bootstrap places a narrow exact-Hex SCM ahead of Hex's SCM. It recognizes only
+applications in the verified manifest and only Hex-shaped dependency tuples,
+so Mix reaches the retained path at every dependency depth while local and Git
+sources pass through unchanged. The manifest carries the exact locked version,
+and the SCM preserves Mix's requirement check before selecting it. Reports
+retain the logical Hex source.
+Bare Git mirrors eliminate repeated network fetches while Mix remains the Git
+checkout authority. Every consumed commit receives a private retention ref, so
+a later force-push and mirror prune cannot discard a still-addressable object.
+The source lock remains byte-for-byte untouched. A derived
+operational lock omits path-backed entries, and its canonical term digest is
+audited before and after execution. The checkout's `mix.lock` is never changed.
+The run record says whether a mutable dependency or build context was already
+present; it does not infer a cache hit from the existence of a directory.
+Exact-object hits and warm-build reuse come from verified operations.
 
 Recognized publishing task names are refused through `run` as an operator error,
 but task recognition is not the security boundary. Every ordinary activation
-gets a fresh empty Home/Hex/Mix state and has inherited publication credentials
-removed, so an unrecognized publishing path still lacks publication capability.
+gets private Home and configuration state, explicitly removes `HEX_HOME` and
+inherited publication credentials, and shares only credential-free caches.
 Capability is available only through the release transaction below.
 
-`state list` reports durable runs and live leases. `state gc --older-than
-N[s|m|h|d] --dry-run` previews exactly the old, unleased run identities a
-matching destructive invocation would remove from unchanged state; live leases
-are rechecked and retained. Shared overlays and bootstraps are immutable,
-content-addressed inputs and are not removed by runtime GC.
+`state list` reports durable runs, reusable dependency/build contexts and live
+leases. `state gc --older-than N[s|m|h|d] --dry-run` previews exactly the old,
+unleased runs and contexts a matching destructive invocation would remove.
+Context locks and a second live-lease check close the prepare/GC race. Shared
+overlays, bootstraps, verified archives and Git mirrors are not removed by
+runtime GC.
 
 Discovery is also generic. It accepts the owner explicitly, deduplicates by Git
 identity, rejects worktrees and wrongly named clones, prunes generated and

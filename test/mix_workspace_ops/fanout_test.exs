@@ -26,6 +26,11 @@ defmodule MixWorkspaceOps.FanoutTest do
              )
 
     assert report.status == :passed
+    assert report.binding.max_concurrency == 2
+    assert report.binding.binding_concurrency == 2
+    assert report.binding.cache_concurrency == 1
+    assert report.binding.beam_schedulers == max(div(System.schedulers_online(), 2), 1)
+    assert report.binding.scheduler_budget == System.schedulers_online()
 
     assert Enum.map(report.results, &{&1.id, &1.status}) == [
              {"alpha", :passed},
@@ -33,6 +38,14 @@ defmodule MixWorkspaceOps.FanoutTest do
            ]
 
     assert Enum.map(report.binding.units, & &1.id) == ["alpha", "beta"]
+
+    for unit <- report.binding.units do
+      erl_aflags = Enum.find_value(unit.command.env, &if(&1.name == "ERL_AFLAGS", do: &1.value))
+
+      assert erl_aflags =~
+               "+S #{report.binding.beam_schedulers}:#{report.binding.beam_schedulers}"
+    end
+
     assert {:ok, state} = Runtime.list(fixture.state_root)
     assert length(state.runs) == 2
     refute Enum.any?(state.runs, & &1.leased)
@@ -147,7 +160,37 @@ defmodule MixWorkspaceOps.FanoutTest do
     assert absent_report.results == [%{id: "missing", status: :absent}]
   end
 
-  test "binding records local paths and removals but no credential values", context do
+  test "repository commands reuse one unchanged exact runtime context", context do
+    fixture = project_fixture(context)
+
+    assert {:ok, first_plan} =
+             OperationPlan.build(
+               fixture.registry,
+               fixture.view,
+               ["sh", "-c", ~s|touch "$MIX_BUILD_PATH/reuse-proof"|],
+               unit_kind: :repository
+             )
+
+    assert {:ok, first} =
+             Fanout.run(first_plan, fixture.registry, state_root: fixture.state_root)
+
+    assert {:ok, second_plan} =
+             OperationPlan.build(fixture.registry, fixture.view, ["sh", "-c", "true"],
+               unit_kind: :repository
+             )
+
+    assert {:ok, second} =
+             Fanout.run(second_plan, fixture.registry, state_root: fixture.state_root)
+
+    first_runtime = hd(first.binding.units).runtime
+    second_runtime = hd(second.binding.units).runtime
+
+    assert first_runtime.deps_path == second_runtime.deps_path
+    assert first_runtime.build_path == second_runtime.build_path
+    assert second_runtime.build_present
+  end
+
+  test "binding records local paths but no removed credential names or values", context do
     fixture = project_fixture(context)
     previous = System.get_env("HEX_API_KEY")
     System.put_env("HEX_API_KEY", "credential-sentinel")
@@ -168,9 +211,27 @@ defmodule MixWorkspaceOps.FanoutTest do
     refute "credential-sentinel" in strings
 
     for unit <- report.binding.units do
-      credential = Enum.find(unit.command.env, &(&1.name == "HEX_API_KEY"))
-      assert credential.value == nil
+      refute Enum.any?(unit.command.env, &(&1.name == "HEX_API_KEY"))
       assert unit.runtime.status == "complete"
+    end
+  end
+
+  test "an explicit child scheduler budget reaches every command", context do
+    fixture = project_fixture(context)
+    assert {:ok, plan} = OperationPlan.build(fixture.registry, fixture.view, ["true"])
+
+    assert {:ok, report} =
+             Fanout.run(plan, fixture.registry,
+               state_root: fixture.state_root,
+               max_concurrency: 2,
+               beam_schedulers: 3
+             )
+
+    assert report.binding.beam_schedulers == 3
+
+    for unit <- report.binding.units do
+      assert %{value: value} = Enum.find(unit.command.env, &(&1.name == "ERL_AFLAGS"))
+      assert value =~ "+S 3:3"
     end
   end
 

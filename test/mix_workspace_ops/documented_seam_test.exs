@@ -167,12 +167,12 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
   defp whole_table_seam(block) do
     replacement = """
     defp deps do
-      for {app, committed_default, extra_opts} <- [
-            {:example_core, "~> 1.0", []},
-            {:example_edge, [github: "example-org/example_edge", branch: "main"],
-             [only: [:dev, :test]]}
+      for committed <- [
+            {:example_core, "~> 1.0"},
+            {:example_edge,
+             [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
           ] do
-        workspace_dep(app, committed_default, extra_opts)
+        workspace_dep(committed)
       end
     end
     """

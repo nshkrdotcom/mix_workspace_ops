@@ -1,9 +1,9 @@
 defmodule MixWorkspaceOpsBootstrap do
   @moduledoc false
 
-  # The Mix-load seam. A `mix.exs` loads this file by path and calls `dep/4`
+  # The Mix-load seam. A `mix.exs` loads this file by path and calls `dep/2`
   # for each cross-repository dependency. It has no access to Mix Workspace Ops
-  # and reads nothing but the two variables the launching process sets, so the
+  # and reads only the files named by the launching process, so the
   # tables and the parsers below are deliberate duplicates of
   # `MixWorkspaceOps.PublishMode` and `MixWorkspaceOps.Overlay`. Tests hold each
   # pair to one shared table so they cannot drift.
@@ -12,7 +12,9 @@ defmodule MixWorkspaceOpsBootstrap do
   @maximum_mix_bytes 1024 * 1024
   @overlay_env "MIX_WORKSPACE_OPS_OVERLAY"
   @lockfile_env "MIX_WORKSPACE_OPS_LOCKFILE"
+  @exact_hex_env "MIX_WORKSPACE_OPS_EXACT_HEX"
   @maximum_overlay_bytes 16 * 1024 * 1024
+  @maximum_exact_hex_entries 4096
   @modes ["auto", "local", "git", "hex"]
   @absent "-"
 
@@ -41,31 +43,49 @@ defmodule MixWorkspaceOpsBootstrap do
   @maximum_option_values 8
   @maximum_option_value_bytes 32
   @revision_keys ["branch", "ref", "tag"]
+  @source_coordinate_keys [
+    :path,
+    :in_umbrella,
+    :git,
+    :github,
+    :branch,
+    :ref,
+    :tag,
+    :sparse,
+    :subdir,
+    :depth,
+    :submodules,
+    :hex,
+    :repo,
+    :organization,
+    :warn_if_outdated
+  ]
   @state_table __MODULE__
 
   @doc """
-  The dependency tuple for `app`.
+  Selects a source for an ordinary committed Mix dependency tuple.
 
-  `committed_default` is what this repository resolves to with no overlay
-  active — a binary is a Hex requirement, and a keyword list is committed git
-  coordinates such as `[github: "example-org/example_core", branch: "main"]`.
-  A dependency with no Hex release needs the second form, or a fresh clone and
-  a consumer of the published package have nowhere to resolve it from.
+  With no overlay active, the tuple is returned unchanged. A Hex dependency is
+  `{app, requirement}` or `{app, requirement, options}`. A git dependency is
+  `{app, coordinates_and_options}`, with committed coordinates such as
+  `[github: "example-org/example_core", branch: "main"]`.
 
-  With an overlay carrying the application, the overlay row decides.
+  With an overlay carrying the application, its row replaces only the source;
+  the dependency options from the committed tuple still win.
   """
-  def dep(app, committed_default, project_root, extra_opts \\ []) when is_atom(app) do
+  def dep(committed, project_root) do
+    app = committed_application!(committed)
     overlay = overlay()
     notify_local_paths(project_root, overlay)
+    source = overlay_source(overlay, Atom.to_string(app))
 
-    tuple =
-      case overlay_source(overlay, Atom.to_string(app)) do
-        nil -> committed_tuple(app, committed_default, extra_opts)
-        source -> overlay_tuple(app, source, extra_opts)
-      end
+    selected =
+      if source,
+        do: overlay_tuple(app, source, committed_options!(committed)),
+        else: committed
 
-    record_source(project_root, tuple)
-    tuple
+    record_source(project_root, selected)
+    selected
   end
 
   @doc """
@@ -132,9 +152,16 @@ defmodule MixWorkspaceOpsBootstrap do
       repo = Keyword.get(opts, :github) ->
         %{app: app, source: "github", location: repo, version: revision_label(opts)}
 
+      repo = Keyword.get(opts, :git) ->
+        %{app: app, source: "git", location: repo, version: revision_label(opts)}
+
       true ->
         %{app: app, source: "unknown", location: "?", version: nil}
     end
+  end
+
+  defp source_entry(tuple) do
+    %{app: elem(tuple, 0), source: "unknown", location: "?", version: nil}
   end
 
   defp revision_label(opts) do
@@ -177,11 +204,37 @@ defmodule MixWorkspaceOpsBootstrap do
 
   def active?(_project_root \\ nil), do: not is_nil(overlay())
 
-  def project_options(_project_root \\ nil) do
+  @doc "Installs the operator lockfile into Mix's pending project configuration."
+  def install_project_options! do
     case System.get_env(@lockfile_env) do
-      nil -> []
-      "" -> []
-      path -> [lockfile: validate_lockfile!(path)]
+      value when value in [nil, ""] ->
+        :ok
+
+      path ->
+        if Process.whereis(Mix.ProjectStack) do
+          Mix.ProjectStack.post_config(lockfile: validate_lockfile!(path))
+        end
+
+        :ok
+    end
+  end
+
+  @doc "Installs exact retained Hex paths ahead of Hex's ordinary SCM."
+  def install_exact_dependencies! do
+    with false <- publish_mode?(System.argv()),
+         path when is_binary(path) <- exact_hex_manifest_path(),
+         exact when map_size(exact) > 0 <- cached_exact_hex!(path) do
+      Mix.SCM.prepend(MixWorkspaceOpsBootstrap.ExactHexSCM)
+    else
+      _inactive_or_publishing -> :ok
+    end
+  end
+
+  @doc "Returns the retained exact Hex entry for one application, when active."
+  def exact_hex_entry(app) when is_atom(app) do
+    case exact_hex_manifest_path() do
+      nil -> nil
+      path -> path |> cached_exact_hex!() |> Map.get(Atom.to_string(app))
     end
   end
 
@@ -217,24 +270,37 @@ defmodule MixWorkspaceOpsBootstrap do
     |> Enum.sort_by(&elem(&1, 0))
   end
 
-  defp committed_tuple(app, requirement, extra_opts) when is_binary(requirement) do
-    case extra_opts do
-      [] -> {app, requirement}
-      opts -> {app, requirement, opts}
-    end
-  end
+  defp committed_application!({app, _value}) when is_atom(app), do: app
+  defp committed_application!({app, _requirement, _options}) when is_atom(app), do: app
 
-  defp committed_tuple(app, coordinates, extra_opts) when is_list(coordinates) do
-    unless Keyword.keyword?(coordinates) and Keyword.has_key?(coordinates, :github) do
-      raise "committed git coordinates for #{app} must be a keyword list carrying :github"
-    end
-
-    {app, Keyword.merge(coordinates, extra_opts)}
-  end
-
-  defp committed_tuple(app, other, _extra_opts) do
-    raise "committed default for #{app} must be a Hex requirement or git coordinates, got: " <>
+  defp committed_application!(other) do
+    raise "committed dependency must be an ordinary Mix dependency tuple, got: " <>
             inspect(other)
+  end
+
+  defp committed_options!({_app, requirement})
+       when is_binary(requirement) or is_struct(requirement, Regex),
+       do: []
+
+  defp committed_options!({app, requirement, options})
+       when (is_binary(requirement) or is_struct(requirement, Regex)) and is_list(options) do
+    keyword_options!(app, options)
+  end
+
+  defp committed_options!({app, coordinates}) when is_list(coordinates) do
+    coordinates = keyword_options!(app, coordinates)
+    {_source_coordinates, extra_opts} = Keyword.split(coordinates, @source_coordinate_keys)
+    extra_opts
+  end
+
+  defp committed_options!(other) do
+    raise "cannot substitute a source into committed dependency: " <> inspect(other)
+  end
+
+  defp keyword_options!(app, options) do
+    if Keyword.keyword?(options),
+      do: options,
+      else: raise("committed options for #{app} must be a keyword list")
   end
 
   defp overlay_tuple(app, %{kind: :local, path: path, opts: opts}, extra_opts) do
@@ -254,6 +320,156 @@ defmodule MixWorkspaceOpsBootstrap do
     case Keyword.merge(opts, extra_opts) do
       [] -> {app, requirement}
       merged -> {app, requirement, merged}
+    end
+  end
+
+  defp exact_hex_manifest_path do
+    case System.get_env(@exact_hex_env) do
+      value when value in [nil, ""] -> nil
+      path when is_binary(path) -> absolute_path!(@exact_hex_env, path)
+    end
+  end
+
+  defp cached_exact_hex!(path) do
+    table = state_table()
+    key = {:exact_hex, path}
+
+    case :ets.lookup(table, key) do
+      [{^key, entries}] ->
+        entries
+
+      [] ->
+        entries = parse_exact_hex!(path)
+
+        if :ets.insert_new(table, {key, entries}) do
+          entries
+        else
+          [{^key, winner}] = :ets.lookup(table, key)
+          winner
+        end
+    end
+  end
+
+  defp parse_exact_hex!(path) do
+    unless File.regular?(path) and File.stat!(path).size <= @maximum_overlay_bytes do
+      raise "#{@exact_hex_env} points to a missing or oversized manifest: #{path}"
+    end
+
+    case path |> File.read!() |> String.split("\n", trim: true) do
+      ["mix_workspace_ops.exact_hex/v2" | rows] ->
+        Enum.reduce(rows, %{}, &parse_exact_hex_row!/2)
+
+      _invalid ->
+        raise "invalid Mix Workspace Ops exact Hex manifest at #{path}"
+    end
+  end
+
+  defp parse_exact_hex_row!(row, entries) do
+    with [app, version, encoded] <- String.split(row, "\t"),
+         true <- Regex.match?(~r/^[a-z][a-z0-9_]*$/, app),
+         {:ok, _version} <- Version.parse(version),
+         true <- map_size(entries) < @maximum_exact_hex_entries,
+         false <- Map.has_key?(entries, app),
+         {:ok, path} <- Base.url_decode64(encoded, padding: false),
+         true <- Path.type(path) == :absolute,
+         true <- File.regular?(Path.join(path, "mix.exs")),
+         true <- File.regular?(Path.join(path, ".hex")) do
+      Map.put(entries, app, %{path: path, version: version})
+    else
+      _invalid -> raise "invalid Mix Workspace Ops exact Hex row: #{inspect(row)}"
+    end
+  end
+
+  defp absolute_path!(environment, path) do
+    if Path.type(path) == :absolute,
+      do: path,
+      else: raise("#{environment} must contain an absolute path")
+  end
+
+  defmodule ExactHexSCM do
+    @moduledoc false
+    @behaviour Mix.SCM
+
+    @explicit_sources [:path, :git, :github, :in_umbrella]
+    @hex_sources [:hex, :repo, :organization, :warn_if_outdated]
+
+    @impl Mix.SCM
+    def fetchable?, do: false
+
+    @impl Mix.SCM
+    def format(opts), do: "exact Hex object at #{opts[:path]}"
+
+    @impl Mix.SCM
+    def format_lock(_opts), do: nil
+
+    @impl Mix.SCM
+    def accepts_options(app, opts) do
+      with false <- MixWorkspaceOpsBootstrap.publish_mode?(System.argv()),
+           false <- Enum.any?(@explicit_sources, &Keyword.has_key?(opts, &1)),
+           %{path: path, version: version} <- MixWorkspaceOpsBootstrap.exact_hex_entry(app),
+           :ok <- validate_requirement!(app, version) do
+        opts
+        |> Keyword.drop(@hex_sources)
+        |> Keyword.put(:path, path)
+        |> Keyword.put(:dest, path)
+        |> Keyword.put(:mix_workspace_ops_exact_hex, true)
+      else
+        _other_source_or_absent -> nil
+      end
+    end
+
+    @impl Mix.SCM
+    def checked_out?(opts), do: File.dir?(opts[:dest])
+
+    @impl Mix.SCM
+    def lock_status(_opts), do: :ok
+
+    @impl Mix.SCM
+    def equal?(left, right), do: left[:dest] == right[:dest]
+
+    @impl Mix.SCM
+    def managers(_opts), do: []
+
+    @impl Mix.SCM
+    def checkout(opts) do
+      Mix.raise("Missing retained exact Hex object at #{opts[:dest]}")
+    end
+
+    @impl Mix.SCM
+    def update(opts), do: opts[:lock]
+
+    defp validate_requirement!(app, version) do
+      requirement = declared_requirement(app)
+
+      case Mix.Dep.Loader.vsn_match(requirement, version, app) do
+        {:ok, true} ->
+          :ok
+
+        {:ok, false} ->
+          Mix.raise(
+            "Retained exact Hex dependency #{inspect(app)} #{version} does not match " <>
+              "the requirement #{inspect(requirement)}"
+          )
+
+        {:error, reason} ->
+          Mix.raise("Invalid retained exact Hex version #{inspect(version)} for #{inspect(app)}: #{inspect(reason)}")
+      end
+    end
+
+    defp declared_requirement(app) do
+      Mix.Project.config()
+      |> Keyword.get(:deps, [])
+      |> Enum.find_value(fn
+        {^app, requirement, _opts}
+        when is_binary(requirement) or is_struct(requirement, Regex) ->
+          requirement
+
+        {^app, requirement} when is_binary(requirement) or is_struct(requirement, Regex) ->
+          requirement
+
+        _other ->
+          nil
+      end)
     end
   end
 
@@ -320,9 +536,7 @@ defmodule MixWorkspaceOpsBootstrap do
   end
 
   defp absolute_overlay_path!(path) do
-    if Path.type(path) == :absolute,
-      do: path,
-      else: raise("#{@overlay_env} must contain an absolute path")
+    absolute_path!(@overlay_env, path)
   end
 
   defp validate_overlay_path!(path) do
@@ -560,6 +774,8 @@ defmodule MixWorkspaceOpsBootstrap do
     end
   end
 end
+
+MixWorkspaceOpsBootstrap.install_project_options!()
 
 # The Mix task the file this seam replaces defined, at zero cost in repository
 # files: this bootstrap is already loaded into the Mix process by path, so the

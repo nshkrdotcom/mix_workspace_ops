@@ -329,7 +329,7 @@ defmodule MixWorkspaceOps.Resolution do
     end)
     |> Enum.reduce_while({:ok, []}, fn decision, {:ok, acc} ->
       case committed_default(decision) do
-        {:ok, default} -> {:cont, {:ok, [seam_line(decision, default) | acc]}}
+        {:ok, committed} -> {:cont, {:ok, [seam_line(committed) | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
@@ -347,17 +347,25 @@ defmodule MixWorkspaceOps.Resolution do
     Enum.join(["defp deps do", "  [", "    " <> Enum.join(lines, ",\n    "), "  ]", "end"], "\n")
   end
 
-  defp seam_line(decision, default) do
-    case call_site_options(decision.opts) do
-      [] -> "workspace_dep(:#{decision.application}, #{default})"
-      opts -> "workspace_dep(:#{decision.application}, #{default}, #{render_options(opts)})"
-    end
+  defp seam_line(committed), do: "workspace_dep(#{committed})"
+
+  defp committed_default(%{source: @hex} = decision) do
+    tuple =
+      case call_site_options(decision.opts) do
+        [] ->
+          "{:#{decision.application}, #{inspect(decision.location)}}"
+
+        opts ->
+          "{:#{decision.application}, #{inspect(decision.location)}, #{render_options(opts)}}"
+      end
+
+    {:ok, tuple}
   end
 
-  defp committed_default(%{source: @hex, location: requirement}), do: {:ok, inspect(requirement)}
-
-  defp committed_default(%{source: @github, location: coordinates}),
-    do: {:ok, inspect(github_coordinates(coordinates))}
+  defp committed_default(%{source: @github} = decision) do
+    options = github_coordinates(decision.location) ++ call_site_options(decision.opts)
+    {:ok, "{:#{decision.application}, #{inspect(options)}}"}
+  end
 
   defp committed_default(%{source: @local, application: app}),
     do: {:error, {:local_committed_default, app}}

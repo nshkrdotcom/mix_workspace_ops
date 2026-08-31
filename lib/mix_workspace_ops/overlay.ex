@@ -103,9 +103,14 @@ defmodule MixWorkspaceOps.Overlay do
            prepare_runtime(mix_state, state_root, context_digest, lock_bytes,
              target_head: target_head,
              target_source_digest: target_source_digest,
+             binding_root: target_root,
              mix_env: inputs.mix_env,
              mix_target: inputs.mix_target,
-             allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false)
+             allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
+             prepare_objects: Keyword.get(opts, :prepare_objects, false),
+             managed_sources: Map.new(rows, fn [app, source | _rest] -> {app, source} end),
+             path_apps: for([app, "local" | _rest] <- rows, do: app),
+             cache_concurrency: Keyword.get(opts, :cache_concurrency, System.schedulers_online())
            ) do
       env =
         [

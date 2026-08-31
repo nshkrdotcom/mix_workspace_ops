@@ -18,7 +18,7 @@ defmodule MixWorkspaceOps.MixProject do
 
   def application do
     [
-      extra_applications: [:crypto, :inets, :logger, :ssl],
+      extra_applications: [:crypto, :inets, :logger, :mix, :ssl],
       included_applications: [:blitz]
     ]
   end

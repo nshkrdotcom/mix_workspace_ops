@@ -77,32 +77,21 @@ The seam is one function call per cross-repository dependency:
 ```elixir
 if bootstrap = System.get_env("MIX_WORKSPACE_OPS_BOOTSTRAP"), do: Code.require_file(bootstrap)
 
-@compile {:no_warn_undefined, MixWorkspaceOpsBootstrap}
-
 defp deps do
   [
-    workspace_dep(:example_core, "~> 1.0"),
-    workspace_dep(:example_edge, [github: "example-org/example_edge", branch: "main"],
-      only: [:dev, :test]
+    workspace_dep({:example_core, "~> 1.0"}),
+    workspace_dep(
+      {:example_edge,
+       [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
     )
   ]
 end
 
-defp workspace_dep(app, committed_default, extra_opts \\ []) do
-  if Code.ensure_loaded?(MixWorkspaceOpsBootstrap) do
-    MixWorkspaceOpsBootstrap.dep(app, committed_default, __DIR__, extra_opts)
-  else
-    committed_dep(app, committed_default, extra_opts)
-  end
+defp workspace_dep(committed) do
+  if function_exported?(MixWorkspaceOpsBootstrap, :dep, 2),
+    do: apply(MixWorkspaceOpsBootstrap, :dep, [committed, __DIR__]),
+    else: committed
 end
-
-defp committed_dep(app, requirement, []) when is_binary(requirement), do: {app, requirement}
-
-defp committed_dep(app, requirement, opts) when is_binary(requirement),
-  do: {app, requirement, opts}
-
-defp committed_dep(app, coordinates, opts) when is_list(coordinates),
-  do: {app, Keyword.merge(coordinates, opts)}
 ```
 
 The first line goes above the `MixProject` module and the rest goes inside it.
@@ -112,19 +101,19 @@ operator state and named by `MIX_WORKSPACE_OPS_BOOTSTRAP`, so nothing else puts
 the module is loaded always gets `false`, resolves nothing, and looks wired
 while doing it.
 
-The second argument is the **committed default**: what this repository resolves
-to with nothing else active, and it is committed to the repository rather than
-supplied by a tool. A binary is a Hex requirement. A keyword list carrying
-`:github` is committed git coordinates, and a dependency with no Hex release
-needs that form — otherwise a fresh clone, and any consumer of the published
-package, has nowhere to resolve it from. The seam has no catalog, so the
-committed default is how a repository states its own answer.
+The argument is the **ordinary committed Mix dependency tuple**: what this
+repository resolves to with nothing else active. With no bootstrap, the wrapper
+returns it unchanged. A binary second element is a Hex requirement. A keyword
+list carrying `:github` holds committed git coordinates, and a dependency with
+no Hex release needs that form — otherwise a fresh clone, and any consumer of
+the published package, has nowhere to resolve it from. The seam has no catalog,
+so the committed tuple is how a repository states its own answer.
 
-The third argument carries the dependency's own Mix options, and both branches
-carry them. `only:`, `optional:`, `runtime:` and `targets:` decide whether a
-dependency exists at this call site at all, which is `mix.exs`'s to say, so they
-travel with the call and are not dropped when no overlay is active. `override:`
-is a resolution fact and comes from the catalog on the overlay path.
+The tuple also carries the dependency's own Mix options. `only:`, `optional:`,
+`runtime:` and `targets:` decide whether a dependency exists at this call site
+at all, which is `mix.exs`'s to say. The bootstrap separates those options from
+git source coordinates only when it substitutes an overlay source. `override:`
+is normally a resolution fact and comes from the catalog on that path.
 
 With an overlay carrying the application, the overlay row decides instead, and
 the row states which of `local`, `github` or `hex` the operator's resolution
@@ -216,23 +205,44 @@ same-repository source identities, external revisions/content, lock state, and
 the toolchain. A cache-aware delegated runner consumes that digest as one opaque
 cache component without parsing an overlay or the portfolio registry.
 
-The context digest is a path-independent cache identity. Execution identity adds
-the target HEAD, target source digest, Mix environment and Mix target. Neither
-identity is a writable directory: each activation adds a random invocation id
-and allocates a private run root beneath operator state.
+The source context combines with the exact lock, target HEAD/source state,
+bound checkout path, toolchain, Mix environment and target to select stable
+external dependency and build paths. The paths are reused in place for the same
+exact local execution context. Different contexts coexist, and Mix's own
+dependency/build path locks coordinate only identical work.
 
-Managed activation gives that invocation unique Home, Mix, copied archives,
-dependencies, build, Hex, Rebar, temporary, config, and lockfile paths.
-Delegated activation omits only dependency/build/lock ownership; it retains the
-unique Home/Mix/Hex credential shield while the launched runner owns its child
-build state. Both modes carry the same source/bootstrap contract. Installed Mix
-archives are copied per invocation, and unsafe archive symlinks are refused.
+Both project and repository units receive those stable `MIX_DEPS_PATH` and
+exact `MIX_BUILD_PATH` values. Invocation-specific state is limited to private
+Home, configuration, temporary files, leases, reports and an operational lock.
+Hex's XDG cache, Rebar downloads and toolchain-scoped Mix archives are shared;
+`HEX_HOME` and publication credentials are removed so configuration and
+credentials are not shared with them. Child BEAM scheduler counts are divided
+by the fan-out worker budget and both values appear in the binding report.
 
-The checkout lockfile is copied before execution. Finalization records both
-digests and rejects a mutation unless the invocation explicitly permits it.
-`state list` exposes durable run records and lease status; `state gc` considers
-only marked MWO state, rechecks live leases, and leaves immutable overlays and
-bootstraps alone.
+Locked Hex bytes are retained under their verified outer checksum. Each exact
+dependency context receives its own extracted source, because standard and
+custom dependency compilers may write there. For ordinary managed work, the
+bootstrap prepends a narrow exact-Hex SCM. It accepts only Hex-shaped tuples for
+applications named by the verified manifest, so Mix selects retained paths for
+direct and transitive dependencies while preserving Mix's declared-version
+requirement checks; local and Git sources pass through. Reports preserve the
+logical Hex tuple and publication resolution is unchanged. Git remotes have one
+remote-scoped bare mirror; per-context checkouts remain ordinary Mix Git SCM
+checkouts, with process-local URL rewriting to the mirror. Consumed commits are
+pinned under MWO-owned refs, separate from refreshable upstream refs, so a
+force-push and prune cannot remove them.
+
+The committed source lock is preserved unchanged. Mix receives a deterministic
+operational projection with path-backed entries omitted, and finalization
+compares canonical lock terms so formatting alone is not a mutation. `state
+list` exposes runs, reusable contexts and lease status. `state gc` locks the
+exact context and rechecks live leases before removal, leaving overlays,
+bootstraps and network-object caches alone.
+
+The run record calls a mutable context `present` when it already contains work;
+that is deliberately not called a cache hit. Exact object hit/miss status comes
+from checksum or commit verification, and build reuse is accepted only from an
+instrumented warm command that performs no compilation.
 
 ## Semantic plans and execution bindings
 
@@ -245,10 +255,11 @@ provider repository and project-relative path; it never names a checkout.
 
 `mix_workspace_ops.binding/v1` is produced only while running. It binds the plan
 digest to checkout directories, exact `Blitz.Command` translations, generated
-overlay/runtime paths, explicit environment values and removals, execution
+overlay/runtime paths, explicit non-secret environment values, execution
 limits, timestamps, and final lock audits. It is machine-local and is not a
-portable artifact. Publication credentials appear only as removals with null
-values; inherited values are never serialized.
+portable artifact. Publication credentials are removed from the child
+environment and omitted entirely from the serialized binding; inherited names
+and values are never recorded.
 
 Planning executes no requested command. Replay loads the bounded strict shape,
 verifies the self-digest and portability again, rebuilds current semantics, and

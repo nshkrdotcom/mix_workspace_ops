@@ -60,7 +60,8 @@ defmodule MixWorkspaceOps.ContractExamplesTest do
 
     refute File.exists?(Path.join(consumer, "deps"))
     refute File.exists?(Path.join(consumer, "_build"))
-    assert File.dir?(Path.join(runner_state, "children"))
+    assert File.dir?(Path.join(runner_state, "receipts"))
+    refute File.exists?(Path.join(runner_state, "children"))
   end
 
   defp run_example(project, state_root, environment) do
@@ -82,22 +83,13 @@ defmodule MixWorkspaceOps.ContractExamplesTest do
       use Mix.Project
 
       def project do
-        [app: :consumer, version: "0.1.0", deps: [workspace_dep(:core, ">= 0.0.0")]] ++
-          workspace_project_options()
+        [app: :consumer, version: "0.1.0", deps: [workspace_dep({:core, ">= 0.0.0"})]]
       end
 
-      defp workspace_dep(app, requirement) do
-        case Code.ensure_loaded(MixWorkspaceOpsBootstrap) do
-          {:module, module} -> apply(module, :dep, [app, requirement, __DIR__, []])
-          _other -> {app, requirement}
-        end
-      end
-
-      defp workspace_project_options do
-        case Code.ensure_loaded(MixWorkspaceOpsBootstrap) do
-          {:module, module} -> apply(module, :project_options, [__DIR__])
-          _other -> []
-        end
+      defp workspace_dep(committed) do
+        if function_exported?(MixWorkspaceOpsBootstrap, :dep, 2),
+          do: apply(MixWorkspaceOpsBootstrap, :dep, [committed, __DIR__]),
+          else: committed
       end
     end
     """

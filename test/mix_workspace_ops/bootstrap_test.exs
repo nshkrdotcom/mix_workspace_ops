@@ -3,11 +3,20 @@ defmodule MixWorkspaceOps.BootstrapTest do
 
   import ExUnit.CaptureIO
 
+  alias Mix.Dep.Loader, as: DependencyLoader
   alias MixWorkspaceOps.{Bootstrap, Overlay, Project, Resolution}
+  alias MixWorkspaceOpsBootstrap.ExactHexSCM
+
+  defmodule ProjectFixture do
+    def project do
+      [app: :exact_projection_fixture, version: "0.1.0", deps: Process.get(:exact_hex_deps)]
+    end
+  end
 
   setup do
     previous = System.get_env("MIX_WORKSPACE_OPS_OVERLAY")
     previous_lock = System.get_env("MIX_WORKSPACE_OPS_LOCKFILE")
+    previous_exact_hex = System.get_env("MIX_WORKSPACE_OPS_EXACT_HEX")
     argv = System.argv()
 
     on_exit(fn ->
@@ -20,9 +29,14 @@ defmodule MixWorkspaceOps.BootstrapTest do
       if previous_lock,
         do: System.put_env("MIX_WORKSPACE_OPS_LOCKFILE", previous_lock),
         else: System.delete_env("MIX_WORKSPACE_OPS_LOCKFILE")
+
+      if previous_exact_hex,
+        do: System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", previous_exact_hex),
+        else: System.delete_env("MIX_WORKSPACE_OPS_EXACT_HEX")
     end)
 
     System.delete_env("MIX_WORKSPACE_OPS_OVERLAY")
+    System.delete_env("MIX_WORKSPACE_OPS_EXACT_HEX")
     :ok
   end
 
@@ -42,10 +56,10 @@ defmodule MixWorkspaceOps.BootstrapTest do
     test "a binary is a Hex requirement", context do
       root = temporary_directory!(context)
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
                {:example_core, "~> 1.0"}
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root, runtime: false) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0", runtime: false}, root) ==
                {:example_core, "~> 1.0", [runtime: false]}
     end
 
@@ -53,30 +67,151 @@ defmodule MixWorkspaceOps.BootstrapTest do
       root = temporary_directory!(context)
 
       assert MixWorkspaceOpsBootstrap.dep(
-               :example_core,
-               [github: "example-org/example_core", branch: "main"],
+               {:example_core, [github: "example-org/example_core", branch: "main"]},
                root
              ) == {:example_core, [github: "example-org/example_core", branch: "main"]}
 
       assert MixWorkspaceOpsBootstrap.dep(
-               :example_core,
-               [github: "example-org/example_core", branch: "main"],
-               root,
-               override: true
+               {:example_core,
+                [github: "example-org/example_core", branch: "main", override: true]},
+               root
              ) ==
                {:example_core,
                 [github: "example-org/example_core", branch: "main", override: true]}
     end
 
-    test "a committed default that is neither is refused by name", context do
+    test "the inactive seam leaves Mix to validate an ordinary tuple", context do
       root = temporary_directory!(context)
 
-      assert_raise RuntimeError, ~r/must be a Hex requirement or git coordinates/, fn ->
-        MixWorkspaceOpsBootstrap.dep(:example_core, :whatever, root)
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, :whatever}, root) ==
+               {:example_core, :whatever}
+
+      assert MixWorkspaceOpsBootstrap.dep(
+               {:example_core, git: "https://example.invalid/core.git", depth: 1},
+               root
+             ) == {:example_core, git: "https://example.invalid/core.git", depth: 1}
+
+      assert_raise RuntimeError, ~r/ordinary Mix dependency tuple/, fn ->
+        MixWorkspaceOpsBootstrap.dep(:not_a_tuple, root)
+      end
+    end
+
+    test "an active overlay removes arbitrary committed source coordinates only", context do
+      root = temporary_directory!(context)
+
+      overlay =
+        write_overlay!(root, ["example_core\thex\t~> 2.0\t-"], publish: false, mode: "auto")
+
+      System.put_env("MIX_WORKSPACE_OPS_OVERLAY", overlay)
+
+      assert MixWorkspaceOpsBootstrap.dep(
+               {:example_core,
+                git: "https://example.invalid/core.git",
+                ref: "abc",
+                depth: 1,
+                only: :test,
+                runtime: false},
+               root
+             ) == {:example_core, "~> 2.0", [only: :test, runtime: false]}
+    end
+  end
+
+  describe "an exact retained Hex object" do
+    test "is consumed centrally as a path while reporting the committed Hex source", context do
+      root = temporary_directory!(context)
+      dependency = exact_hex_dependency!(root, "example_core")
+      transitive = exact_hex_dependency!(root, "transitive_core")
+
+      manifest =
+        write_exact_hex!(root, %{
+          "example_core" => dependency,
+          "transitive_core" => transitive
+        })
+
+      System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", manifest)
+
+      assert MixWorkspaceOpsBootstrap.dep(
+               {:example_core, "~> 1.0", hex: :renamed_package, runtime: false},
+               root
+             ) == {:example_core, "~> 1.0", [hex: :renamed_package, runtime: false]}
+
+      assert MixWorkspaceOpsBootstrap.recorded_sources(root) == [
+               %{app: :example_core, source: "hex", location: "hex", version: "~> 1.0"}
+             ]
+
+      dependencies =
+        exact_dependency_records!([
+          {:example_core, "~> 1.0", hex: :renamed_package, runtime: false},
+          {:git_core, github: "example/git_core", ref: "abc"}
+        ])
+
+      assert [exact_record, git_record] = dependencies
+      assert exact_record.app == :example_core
+      assert exact_record.scm == ExactHexSCM
+      assert exact_record.opts[:dest] == dependency
+      assert exact_record.opts[:runtime] == false
+      assert git_record.app == :git_core
+      assert git_record.scm == Mix.SCM.Git
+      refute Enum.any?(dependencies, &(&1.app == :transitive_core))
+    end
+
+    test "does not replace git, a selected local source, or publication coordinates", context do
+      root = temporary_directory!(context)
+      exact = exact_hex_dependency!(root, "example_core")
+      local = initialize_repository!(Path.join(root, "local_core"))
+      manifest = write_exact_hex!(root, %{"example_core" => exact})
+      System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", manifest)
+
+      assert MixWorkspaceOpsBootstrap.dep(
+               {:example_core, [github: "example-org/example_core", ref: "abc"]},
+               root
+             ) == {:example_core, [github: "example-org/example_core", ref: "abc"]}
+
+      overlay = write_overlay!(root, ["example_core\tlocal\t#{local}\trevision\tsource\t-"])
+      System.put_env("MIX_WORKSPACE_OPS_OVERLAY", overlay)
+
+      capture_io(fn ->
+        assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
+                 {:example_core, [path: local]}
+      end)
+
+      publish_overlay =
+        write_overlay!(root, ["example_core\thex\t~> 2.0\t-"], publish: true, mode: "hex")
+
+      System.put_env("MIX_WORKSPACE_OPS_OVERLAY", publish_overlay)
+      System.argv(["hex.build"])
+
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
+               {:example_core, "~> 2.0"}
+
+      assert ExactHexSCM.accepts_options(:example_core, []) == nil
+    end
+
+    test "refuses malformed, relative and missing materializations", context do
+      root = temporary_directory!(context)
+      relative = Path.join("relative", "exact_hex.tsv")
+      System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", relative)
+
+      assert_raise RuntimeError, ~r/must contain an absolute path/, fn ->
+        exact_dependency_records!([])
       end
 
-      assert_raise RuntimeError, ~r/must be a keyword list carrying :github/, fn ->
-        MixWorkspaceOpsBootstrap.dep(:example_core, [branch: "main"], root)
+      malformed = Path.join(root, "malformed.tsv")
+      File.write!(malformed, "not-the-schema\n")
+      System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", malformed)
+
+      assert_raise RuntimeError, ~r/invalid Mix Workspace Ops exact Hex manifest/, fn ->
+        exact_dependency_records!([])
+      end
+
+      missing = Path.join(root, "missing")
+      encoded = Base.url_encode64(missing, padding: false)
+      invalid = Path.join(root, "invalid-row.tsv")
+      File.write!(invalid, "mix_workspace_ops.exact_hex/v2\nexample_core\t1.0.0\t#{encoded}\n")
+      System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", invalid)
+
+      assert_raise RuntimeError, ~r/invalid Mix Workspace Ops exact Hex row/, fn ->
+        exact_dependency_records!([])
       end
     end
   end
@@ -93,7 +228,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
       assert capture_io(fn ->
-               assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+               assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
                         {:example_core, [path: dependency]}
              end) =~ "local path source in use for: example_core"
     end
@@ -111,7 +246,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
       capture_io(fn ->
-        assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+        assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
                  {:example_core, [path: dependency, override: true]}
       end)
     end
@@ -126,7 +261,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
 
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
                {:example_core,
                 [
                   github: "example-org/example_core",
@@ -141,7 +276,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       path = write_overlay!(root, ["example_core\tgithub\texample-org/example_core\t-\t-\t-\t-"])
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
                {:example_core, [github: "example-org/example_core"]}
     end
 
@@ -157,13 +292,13 @@ defmodule MixWorkspaceOps.BootstrapTest do
 
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
                {:example_core, "~> 2.0"}
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_edge, "~> 1.0", root) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_edge, "~> 1.0"}, root) ==
                {:example_edge, "~> 0.8.2", [only: [:dev, :test], runtime: false]}
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_shape, "~> 1.0", root) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_shape, "~> 1.0"}, root) ==
                {:example_shape, "~> 3.0", [hex: :shape_fork]}
     end
 
@@ -172,7 +307,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       path = write_overlay!(root, ["example_core\thex\t~> 2.0\truntime=false"])
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root, runtime: true) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0", runtime: true}, root) ==
                {:example_core, "~> 2.0", [runtime: true]}
     end
 
@@ -182,8 +317,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
       assert MixWorkspaceOpsBootstrap.dep(
-               :example_edge,
-               [github: "example-org/example_edge", branch: "main"],
+               {:example_edge, [github: "example-org/example_edge", branch: "main"]},
                root
              ) == {:example_edge, [github: "example-org/example_edge", branch: "main"]}
     end
@@ -200,15 +334,21 @@ defmodule MixWorkspaceOps.BootstrapTest do
       first = Path.join(root, "first")
       second = Path.join(root, "second")
 
-      assert capture_io(fn -> MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", first) end) =~
+      assert capture_io(fn ->
+               MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, first)
+             end) =~
                "local path source in use for: example_core"
 
-      assert capture_io(fn -> MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", first) end) ==
+      assert capture_io(fn ->
+               MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, first)
+             end) ==
                ""
 
       System.argv(["run", "-e", ":ok"])
 
-      assert capture_io(fn -> MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", second) end) ==
+      assert capture_io(fn ->
+               MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, second)
+             end) ==
                ""
     end
 
@@ -217,7 +357,9 @@ defmodule MixWorkspaceOps.BootstrapTest do
       path = write_overlay!(root, ["example_core\thex\t~> 2.0\t-"])
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
-      assert capture_io(fn -> MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) end) ==
+      assert capture_io(fn ->
+               MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root)
+             end) ==
                ""
     end
   end
@@ -230,7 +372,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.argv(["hex.publish"])
 
       assert_raise RuntimeError, ~r/decided for development/, fn ->
-        MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root)
+        MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root)
       end
     end
 
@@ -248,7 +390,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
       System.argv(["hex.publish"])
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
                {:example_core, [github: "example-org/example_core", branch: "main"]}
     end
 
@@ -258,7 +400,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
       System.argv(["run", "--arg", "hex.publish"])
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
                {:example_core, "~> 2.0"}
     end
   end
@@ -269,19 +411,19 @@ defmodule MixWorkspaceOps.BootstrapTest do
       path = write_overlay!(root, ["example_core\thex\t~> 2.0\t-"])
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
                {:example_core, "~> 2.0"}
 
       File.rm!(path)
 
-      assert MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root) ==
+      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
                {:example_core, "~> 2.0"}
 
       assert {:ok, bootstrap} = Bootstrap.materialize(Path.join(root, "operator-state"))
 
       expression = """
       Code.require_file(#{inspect(bootstrap)})
-      MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", #{inspect(root)})
+      MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, #{inspect(root)})
       """
 
       assert {output, exit_code} =
@@ -304,7 +446,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", "relative.tsv")
 
       assert_raise RuntimeError, ~r/must contain an absolute path/, fn ->
-        MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root)
+        MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root)
       end
     end
 
@@ -315,7 +457,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
       assert_raise RuntimeError, ~r/digest mismatch/, fn ->
-        MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root)
+        MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root)
       end
     end
 
@@ -325,7 +467,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
       assert_raise RuntimeError, ~r/unknown Mix Workspace Ops dependency option/, fn ->
-        MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root)
+        MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root)
       end
 
       names = 1..9 |> Enum.map_join("|", &"env_#{&1}")
@@ -333,7 +475,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", long)
 
       assert_raise RuntimeError, ~r/invalid Mix Workspace Ops option only/, fn ->
-        MixWorkspaceOpsBootstrap.dep(:example_core, "~> 1.0", root)
+        MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root)
       end
     end
   end
@@ -413,9 +555,9 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", overlay)
 
       for app <- [:example_core, :example_edge, :example_shape],
-          do: MixWorkspaceOpsBootstrap.dep(app, "~> 0.1.0", root)
+          do: MixWorkspaceOpsBootstrap.dep({app, "~> 0.1.0"}, root)
 
-      MixWorkspaceOpsBootstrap.dep(:example_committed, "~> 9.9", root)
+      MixWorkspaceOpsBootstrap.dep({:example_committed, "~> 9.9"}, root)
 
       assert MixWorkspaceOpsBootstrap.recorded_sources(root) == [
                %{
@@ -489,20 +631,23 @@ defmodule MixWorkspaceOps.BootstrapTest do
     end
   end
 
-  test "supplies only an explicit absolute operator lockfile", context do
+  test "installs only an explicit absolute operator lockfile into pending Mix config", context do
     root = temporary_directory!(context)
     lockfile = Path.join(root, "state/mix.lock")
     File.mkdir_p!(Path.dirname(lockfile))
     File.write!(lockfile, "%{}\n")
 
-    assert MixWorkspaceOpsBootstrap.project_options(root) == []
+    assert MixWorkspaceOpsBootstrap.install_project_options!() == :ok
+    assert Mix.ProjectStack.pop_post_config(:lockfile) == nil
+
     System.put_env("MIX_WORKSPACE_OPS_LOCKFILE", lockfile)
-    assert MixWorkspaceOpsBootstrap.project_options(root) == [lockfile: lockfile]
+    assert MixWorkspaceOpsBootstrap.install_project_options!() == :ok
+    assert Mix.ProjectStack.pop_post_config(:lockfile) == lockfile
 
     System.put_env("MIX_WORKSPACE_OPS_LOCKFILE", "relative.lock")
 
     assert_raise RuntimeError, ~r/must contain an absolute path/, fn ->
-      MixWorkspaceOpsBootstrap.project_options(root)
+      MixWorkspaceOpsBootstrap.install_project_options!()
     end
   end
 
@@ -533,5 +678,46 @@ defmodule MixWorkspaceOps.BootstrapTest do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, contents)
     path
+  end
+
+  defp exact_hex_dependency!(root, app) do
+    path = Path.join(root, "exact_#{app}")
+    File.mkdir_p!(path)
+    File.write!(Path.join(path, "mix.exs"), "defmodule Exact.MixProject, do: use(Mix.Project)\n")
+    File.write!(Path.join(path, ".hex"), "verified fixture\n")
+    path
+  end
+
+  defp write_exact_hex!(root, entries) do
+    rows =
+      entries
+      |> Enum.sort()
+      |> Enum.map(fn {app, path} ->
+        "#{app}\t1.0.0\t#{Base.url_encode64(path, padding: false)}"
+      end)
+
+    path = Path.join(root, "exact_hex_#{System.unique_integer([:positive])}.tsv")
+    File.write!(path, Enum.join(["mix_workspace_ops.exact_hex/v2" | rows], "\n") <> "\n")
+    path
+  end
+
+  defp exact_dependency_records!(dependencies) do
+    Mix.ProjectStack.on_clean_slate(fn ->
+      Process.put(:exact_hex_deps, dependencies)
+
+      try do
+        :ok =
+          Mix.Project.push(
+            ProjectFixture,
+            "exact_projection_fixture.exs",
+            :exact_projection_fixture
+          )
+
+        :ok = MixWorkspaceOpsBootstrap.install_exact_dependencies!()
+        DependencyLoader.children(false)
+      after
+        Process.delete(:exact_hex_deps)
+      end
+    end)
   end
 end

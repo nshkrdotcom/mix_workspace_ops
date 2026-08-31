@@ -23,6 +23,7 @@ defmodule MixWorkspaceOps.Fanout do
     started_at = System.system_time(:millisecond)
 
     with {:ok, execution} <- execution_options(opts),
+         execution <- binding_budget(plan, execution),
          :ok <- verify_all_units(plan, registry),
          {:ok, bound} <- bind_all(plan, registry, execution) do
       execute_and_finalize(plan, bound, execution, started_at)
@@ -37,6 +38,10 @@ defmodule MixWorkspaceOps.Fanout do
 
   defp execution_options(opts) do
     max_concurrency = Keyword.get(opts, :max_concurrency, System.schedulers_online())
+
+    beam_schedulers =
+      Keyword.get_lazy(opts, :beam_schedulers, fn -> child_scheduler_budget(max_concurrency) end)
+
     timeout = Keyword.get(opts, :timeout, :infinity)
 
     with true <-
@@ -45,11 +50,15 @@ defmodule MixWorkspaceOps.Fanout do
          true <-
            (timeout == :infinity or (is_integer(timeout) and timeout > 0)) ||
              {:error, {:invalid_timeout, timeout}},
+         true <-
+           (is_integer(beam_schedulers) and beam_schedulers > 0) ||
+             {:error, {:invalid_beam_schedulers, beam_schedulers}},
          {:ok, state_root} <- Keyword.fetch(opts, :state_root),
          true <- is_binary(state_root) || {:error, {:invalid_state_root, state_root}} do
       {:ok,
        %{
          max_concurrency: max_concurrency,
+         beam_schedulers: beam_schedulers,
          timeout: timeout,
          state_root: state_root,
          allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
@@ -122,16 +131,25 @@ defmodule MixWorkspaceOps.Fanout do
   end
 
   defp bind_all(plan, registry, execution) do
-    plan
-    |> field(:units)
-    |> Enum.reduce_while({:ok, []}, fn unit, {:ok, bound} ->
-      case safe_bind_unit(plan, unit, registry, execution) do
-        {:ok, nil} -> {:cont, {:ok, bound}}
-        {:ok, item} -> {:cont, {:ok, [item | bound]}}
-        {:error, reason} -> {:halt, {:error, {:binding_failed, reason, Enum.reverse(bound)}}}
-      end
-    end)
-    |> reverse_ok()
+    results =
+      plan
+      |> field(:units)
+      |> Task.async_stream(&safe_bind_unit(plan, &1, registry, execution),
+        max_concurrency: execution.binding_concurrency,
+        ordered: true,
+        timeout: :infinity
+      )
+      |> Enum.map(fn
+        {:ok, result} -> result
+        {:exit, reason} -> {:error, {:binding_task_exit, reason}}
+      end)
+
+    bound = for {:ok, item} <- results, not is_nil(item), do: item
+
+    case Enum.find(results, &match?({:error, _reason}, &1)) do
+      nil -> {:ok, bound}
+      {:error, reason} -> {:error, {:binding_failed, reason, bound}}
+    end
   end
 
   defp safe_bind_unit(plan, unit, registry, execution) do
@@ -171,6 +189,8 @@ defmodule MixWorkspaceOps.Fanout do
       mix_env: field(policy, :mix_env),
       mix_target: field(policy, :mix_target),
       allow_lock_mutation: execution.allow_lock_mutation,
+      prepare_objects: true,
+      cache_concurrency: execution.cache_concurrency,
       mix_state: :managed,
       probe_memo: execution.probe_memo,
       state_root: execution.state_root
@@ -182,8 +202,19 @@ defmodule MixWorkspaceOps.Fanout do
       result =
         try do
           case verify_project_activation(unit, activation, root, registry) do
-            :ok -> {:ok, bound_item(plan, unit, root, activation.env, activation, :overlay)}
-            {:error, reason} -> {:error, reason}
+            :ok ->
+              {:ok,
+               bound_item(
+                 plan,
+                 unit,
+                 root,
+                 scheduler_environment(activation.env, execution),
+                 activation,
+                 :overlay
+               )}
+
+            {:error, reason} ->
+              {:error, reason}
           end
         catch
           kind, reason ->
@@ -213,13 +244,16 @@ defmodule MixWorkspaceOps.Fanout do
          {:ok, runtime} <-
            Runtime.prepare(
              execution.state_root,
-             runtime_cache_identity(plan, unit),
+             runtime_cache_identity(unit),
              lock_bytes,
              ownership: :delegated,
              target_head: field(expected, :head),
              target_source_digest: field(expected, :source_digest),
+             binding_root: root,
              mix_env: field(policy, :mix_env),
              mix_target: field(policy, :mix_target),
+             prepare_objects: true,
+             cache_concurrency: execution.cache_concurrency,
              allow_lock_mutation: execution.allow_lock_mutation
            ) do
       env =
@@ -232,7 +266,15 @@ defmodule MixWorkspaceOps.Fanout do
       activation = %{runtime_handle: runtime.handle, report: %{runtime: runtime.report}}
 
       try do
-        {:ok, bound_item(plan, unit, root, env, activation, :runtime)}
+        {:ok,
+         bound_item(
+           plan,
+           unit,
+           root,
+           scheduler_environment(env, execution),
+           activation,
+           :runtime
+         )}
       catch
         kind, reason ->
           finalize(%{activation_kind: :runtime, activation: activation})
@@ -625,6 +667,10 @@ defmodule MixWorkspaceOps.Fanout do
       schema: @binding_schema,
       plan_digest: field(plan, :digest),
       max_concurrency: execution.max_concurrency,
+      binding_concurrency: execution.binding_concurrency,
+      cache_concurrency: execution.cache_concurrency,
+      beam_schedulers: execution.beam_schedulers,
+      scheduler_budget: System.schedulers_online(),
       timeout: execution.timeout,
       started_at: started_at,
       finished_at: finished_at,
@@ -641,10 +687,17 @@ defmodule MixWorkspaceOps.Fanout do
     finalized = finalize_all(bound)
     finished_at = System.system_time(:millisecond)
 
-    execution = %{
-      max_concurrency: Keyword.get(opts, :max_concurrency, System.schedulers_online()),
-      timeout: Keyword.get(opts, :timeout, :infinity)
-    }
+    max_concurrency = Keyword.get(opts, :max_concurrency, System.schedulers_online())
+
+    execution =
+      binding_budget(plan, %{
+        max_concurrency: max_concurrency,
+        beam_schedulers:
+          Keyword.get_lazy(opts, :beam_schedulers, fn ->
+            child_scheduler_budget(max_concurrency)
+          end),
+        timeout: Keyword.get(opts, :timeout, :infinity)
+      })
 
     binding = binding_report(plan, finalized, execution, started_at, finished_at)
 
@@ -672,7 +725,7 @@ defmodule MixWorkspaceOps.Fanout do
       executable: command.command,
       args: command.args,
       cd: command.cd,
-      env: Enum.map(command.env, fn {name, value} -> %{name: name, value: value} end)
+      env: for({name, value} <- command.env, not is_nil(value), do: %{name: name, value: value})
     }
   end
 
@@ -684,8 +737,12 @@ defmodule MixWorkspaceOps.Fanout do
     end
   end
 
-  defp runtime_cache_identity(plan, unit) do
-    %{plan: field(plan, :digest), unit: field(unit, :id), kind: field(unit, :kind)}
+  defp runtime_cache_identity(unit) do
+    %{
+      unit: field(unit, :id),
+      kind: field(unit, :kind),
+      repository: field(unit, :repository)
+    }
     |> Report.encode()
     |> sha256()
   end
@@ -702,8 +759,35 @@ defmodule MixWorkspaceOps.Fanout do
 
   defp field(map, key), do: OperationPlan.field(map, key)
 
-  defp reverse_ok({:ok, values}), do: {:ok, Enum.reverse(values)}
-  defp reverse_ok(error), do: error
-
   defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+  defp binding_budget(plan, execution) do
+    present =
+      plan
+      |> field(:units)
+      |> Enum.count(&(field(&1, :status) in [:planned, "planned"]))
+
+    binding_concurrency = max(1, min(execution.max_concurrency, present))
+    cache_concurrency = max(1, div(execution.max_concurrency, binding_concurrency))
+
+    Map.merge(execution, %{
+      binding_concurrency: binding_concurrency,
+      cache_concurrency: cache_concurrency
+    })
+  end
+
+  defp scheduler_environment(env, execution) do
+    current = Map.new(env)["ERL_AFLAGS"] || System.get_env("ERL_AFLAGS", "")
+    scheduler_flag = "+S #{execution.beam_schedulers}:#{execution.beam_schedulers}"
+    flags = String.trim(current <> " " <> scheduler_flag)
+
+    env
+    |> Map.new()
+    |> Map.put("ERL_AFLAGS", flags)
+    |> Enum.sort_by(&elem(&1, 0))
+  end
+
+  defp child_scheduler_budget(max_concurrency) do
+    max(div(System.schedulers_online(), max_concurrency), 1)
+  end
 end

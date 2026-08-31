@@ -9,7 +9,7 @@ defmodule MixWorkspaceOps.Examples.DelegatedRunner do
     if File.regular?(receipt) do
       IO.puts("REUSED #{command_digest}")
     else
-      run!(project, state_root, command_digest, executable, arguments)
+      run!(project, executable, arguments)
       File.mkdir_p!(Path.dirname(receipt))
       File.write!(receipt, "ok\n", [:sync])
       IO.puts("EXECUTED #{command_digest}")
@@ -20,18 +20,9 @@ defmodule MixWorkspaceOps.Examples.DelegatedRunner do
     raise "usage: elixir delegated_runner.exs PROJECT STATE_ROOT EXECUTABLE [ARG ...]"
   end
 
-  defp run!(project, state_root, command_digest, executable, arguments) do
-    child_root = Path.join([state_root, "children", command_digest])
-
-    environment = [
-      {"MIX_DEPS_PATH", Path.join(child_root, "deps")},
-      {"MIX_BUILD_PATH", Path.join(child_root, "_build")},
-      {"HEX_HOME", Path.join(child_root, "hex")}
-    ]
-
+  defp run!(project, executable, arguments) do
     case System.cmd(executable, arguments,
            cd: project,
-           env: environment,
            stderr_to_stdout: true,
            into: IO.stream()
          ) do

@@ -18,8 +18,9 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {"MIX_WORKSPACE_OPS_CONTEXT_DIGEST", activation.report.context_digest} in activation.env
 
     assert {"MIX_DEPS_PATH", activation.report.runtime.deps_path} in activation.env
-    assert {"MIX_BUILD_ROOT", activation.report.runtime.build_root} in activation.env
-    assert {"HEX_HOME", activation.report.runtime.hex_home} in activation.env
+    assert {"MIX_BUILD_PATH", activation.report.runtime.build_path} in activation.env
+    assert {"XDG_CACHE_HOME", activation.report.runtime.xdg_cache_home} in activation.env
+    assert {"HEX_HOME", nil} in activation.env
 
     assert {"MIX_WORKSPACE_OPS_LOCKFILE", activation.report.runtime.lockfile} in activation.env
 
@@ -41,7 +42,7 @@ defmodule MixWorkspaceOps.OverlayTest do
     refute File.exists?(Path.join(root, "consumer/.mix_workspace_ops"))
   end
 
-  test "delegated execution carries source context but allocates no child Mix state", context do
+  test "delegated execution carries source context and external reusable Mix state", context do
     root = temporary_directory!(context)
     state_root = Path.join(root, "operator-state")
     initialize_repository!(Path.join(root, "core"))
@@ -59,11 +60,34 @@ defmodule MixWorkspaceOps.OverlayTest do
 
     assert {"MIX_WORKSPACE_OPS_CONTEXT_DIGEST", activation.report.context_digest} in activation.env
 
-    assert {"HEX_HOME", activation.report.runtime.hex_home} in activation.env
+    assert {"HEX_HOME", nil} in activation.env
+    assert {"MIX_DEPS_PATH", activation.report.runtime.deps_path} in activation.env
+    assert {"MIX_BUILD_PATH", activation.report.runtime.build_path} in activation.env
+    assert {"MIX_WORKSPACE_OPS_LOCKFILE", activation.report.runtime.lockfile} in activation.env
+  end
 
-    refute Enum.any?(activation.env, fn {key, _value} ->
-             key in ~w(MIX_DEPS_PATH MIX_BUILD_ROOT MIX_WORKSPACE_OPS_LOCKFILE)
-           end)
+  test "a local overlay never prepares the committed Hex object", context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    initialize_repository!(Path.join(root, "core"))
+    consumer = initialize_repository!(Path.join(root, "consumer"), ~s([{:core, "~> 1.0"}]))
+
+    checksum = String.duplicate("f", 64)
+
+    File.write!(
+      Path.join(consumer, "mix.lock"),
+      ~s|%{"core" => {:hex, :core, "1.0.0", "#{checksum}", [:mix], [], "hexpm", "#{checksum}"}}\n|
+    )
+
+    assert {:ok, activation} =
+             Overlay.activate(registry(root), "consumer",
+               state_root: state_root,
+               prepare_objects: true
+             )
+
+    assert activation.report.runtime.cache_objects.hex == []
+    assert activation.report.runtime.cache_objects.git == []
+    refute File.exists?(Path.join([state_root, "cache", "hex", "objects", checksum]))
   end
 
   test "semantic context is independent of checkout paths", context do
@@ -111,6 +135,8 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {:ok, first} = Overlay.activate(registry, "consumer", state_root: state_root)
     assert {:ok, second} = Overlay.activate(registry, "consumer", state_root: state_root)
     assert first.path == second.path
+    assert first.report.runtime.deps_path == second.report.runtime.deps_path
+    assert first.report.runtime.build_path == second.report.runtime.build_path
 
     File.write!(Path.join(root, "consumer/target-change.txt"), "owned by target impact logic\n")
     assert {:ok, target_changed} = Overlay.activate(registry, "consumer", state_root: state_root)
@@ -121,6 +147,9 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {:ok, dirty} = Overlay.activate(registry, "consumer", state_root: state_root)
     refute dirty.path == first.path
     refute dirty.report.context_digest == first.report.context_digest
+    refute dirty.report.runtime.deps_path == first.report.runtime.deps_path
+    refute dirty.report.runtime.build_path == first.report.runtime.build_path
+    assert dirty.report.runtime.cache_objects == %{git: [], hex: []}
 
     assert {:ok, git} = Overlay.activate(registry, "consumer", mode: :git, state_root: state_root)
     refute git.path == first.path
@@ -161,7 +190,7 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {:ok, _report} = Overlay.deactivate(second)
   end
 
-  test "concurrent identical activations share no writable path", context do
+  test "concurrent identical activations share contexts and isolate transient state", context do
     root = temporary_directory!(context)
     state_root = Path.join(root, "operator-state")
     initialize_repository!(Path.join(root, "core"))
@@ -180,6 +209,9 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert first_runtime.cache_identity == second_runtime.cache_identity
     assert first_runtime.execution_identity == second_runtime.execution_identity
     refute first_runtime.invocation_id == second_runtime.invocation_id
+    assert first_runtime.deps_path == second_runtime.deps_path
+    assert first_runtime.build_path == second_runtime.build_path
+    assert first_runtime.xdg_cache_home == second_runtime.xdg_cache_home
 
     assert MapSet.disjoint?(
              MapSet.new(runtime_writable_paths(first_runtime)),
@@ -290,7 +322,7 @@ defmodule MixWorkspaceOps.OverlayTest do
 
     expression = """
     Code.require_file(#{inspect(activation.report.bootstrap_path)})
-    IO.inspect(MixWorkspaceOpsBootstrap.dep(:core, "~> 1.0", #{inspect(Path.join(root, "consumer"))}, []))
+    IO.inspect(MixWorkspaceOpsBootstrap.dep({:core, "~> 1.0"}, #{inspect(Path.join(root, "consumer"))}))
     """
 
     assert {bootstrap_output, 0} =
@@ -389,26 +421,17 @@ defmodule MixWorkspaceOps.OverlayTest do
       use Mix.Project
 
       def project do
-        [app: :consumer, version: "0.1.0", deps: deps()] ++
-          workspace_project_options()
+        [app: :consumer, version: "0.1.0", deps: deps()]
       end
 
       defp deps do
-        [workspace_dep(:core, ">= 0.0.0")]
+        [workspace_dep({:core, ">= 0.0.0"})]
       end
 
-      defp workspace_dep(app, requirement) do
-        case Code.ensure_loaded(MixWorkspaceOpsBootstrap) do
-          {:module, module} -> apply(module, :dep, [app, requirement, __DIR__, []])
-          _other -> {app, requirement}
-        end
-      end
-
-      defp workspace_project_options do
-        case Code.ensure_loaded(MixWorkspaceOpsBootstrap) do
-          {:module, module} -> apply(module, :project_options, [__DIR__])
-          _other -> []
-        end
+      defp workspace_dep(committed) do
+        if function_exported?(MixWorkspaceOpsBootstrap, :dep, 2),
+          do: apply(MixWorkspaceOpsBootstrap, :dep, [committed, __DIR__]),
+          else: committed
       end
     end
     """)
@@ -428,7 +451,7 @@ defmodule MixWorkspaceOps.OverlayTest do
     refute File.exists?(Path.join(consumer, "_build"))
     assert File.dir?(activation.report.runtime.deps_path)
     assert File.dir?(activation.report.runtime.build_root)
-    assert File.dir?(activation.report.runtime.hex_home)
+    assert File.dir?(activation.report.runtime.hex_cache)
     assert File.read!(activation.report.runtime.lockfile) == "%{}\n"
   end
 
@@ -459,7 +482,7 @@ defmodule MixWorkspaceOps.OverlayTest do
   end
 
   defp runtime_writable_paths(report) do
-    ~w(root home mix_home archives hex_home rebar_cache tmp config_home deps_path build_root lockfile)a
+    ~w(root home tmp config_home lockfile source_lock)a
     |> Enum.map(&Map.fetch!(report, &1))
   end
 end

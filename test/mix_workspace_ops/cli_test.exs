@@ -483,6 +483,45 @@ defmodule MixWorkspaceOps.CLITest do
              {:usage_error, "--plan cannot be combined with a command"}
   end
 
+  test "a project-scoped plan replays without inventing a view", context do
+    %{root: root, catalog: catalog, state_root: state_root} = workspace!(context)
+    plan_path = Path.join(root, "project-plan.json")
+
+    assert {:ok, plan} =
+             CLI.dispatch([
+               "plan",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--project",
+               "alpha",
+               "--output",
+               plan_path,
+               "--",
+               "true"
+             ])
+
+    assert plan.view == nil
+    assert plan.policy.project == "alpha"
+
+    assert {:ok, report} =
+             CLI.dispatch([
+               "run",
+               "--plan",
+               plan_path,
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--state-root",
+               state_root
+             ])
+
+    assert report.plan.digest == plan.digest
+    assert [%{id: "alpha", status: :passed}] = report.results
+  end
+
   test "replay refuses changed source state before launching the child", context do
     %{root: root, catalog: catalog, view: view, state_root: state_root} = workspace!(context)
     plan_path = Path.join(root, "drift-plan.json")
@@ -572,9 +611,9 @@ defmodule MixWorkspaceOps.CLITest do
     assert report.schema == "mix_workspace_ops.seam/v1"
 
     assert report.lines == [
-             ~s|workspace_dep(:core, "~> 1.0", only: [:dev, :test], runtime: false)|,
-             ~s|workspace_dep(:third_party, [github: "example-org/third-party", | <>
-               ~s|branch: "main", subdir: "core"])|
+             ~s|workspace_dep({:core, "~> 1.0", only: [:dev, :test], runtime: false})|,
+             ~s|workspace_dep({:third_party, [github: "example-org/third-party", | <>
+               ~s|branch: "main", subdir: "core"]})|
            ]
 
     assert String.split(report.report, "\n") == [
@@ -605,9 +644,7 @@ defmodule MixWorkspaceOps.CLITest do
 
     source = """
     defmodule #{inspect(module)} do
-      def workspace_dep(app, default), do: {app, default}
-      def workspace_dep(app, default, opts) when is_binary(default), do: {app, default, opts}
-      def workspace_dep(app, default, opts), do: {app, Keyword.merge(default, opts)}
+      def workspace_dep(committed), do: committed
       #{String.replace(report.report, "defp deps", "def deps")}
     end
     """
@@ -1005,6 +1042,9 @@ defmodule MixWorkspaceOps.CLITest do
 
     assert CLI.dispatch(base ++ ["--dirty-policy", "nonsense", "--", "pwd"]) ==
              {:usage_error, "invalid dirty policy \"nonsense\""}
+
+    assert CLI.dispatch(base ++ ["--beam-schedulers", "0", "--", "pwd"]) ==
+             {:usage_error, "--beam-schedulers expects a positive integer"}
   end
 
   test "run requires a command after the separator" do
