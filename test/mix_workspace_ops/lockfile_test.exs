@@ -33,6 +33,19 @@ defmodule MixWorkspaceOps.LockfileTest do
     assert {:ok, ^bytes} = Lockfile.project_path_apps(bytes, [])
   end
 
+  test "projected string keys use map arrows rather than quoted keyword syntax" do
+    bytes =
+      inspect(%{
+        "alpha" => {:hex, :alpha, "1.0.0"},
+        "beta" => {:hex, :beta, "2.0.0"}
+      }) <> "\n"
+
+    assert {:ok, projected} = Lockfile.project_path_apps(bytes, ["beta"])
+    assert projected =~ ~s("alpha" =>)
+    refute projected =~ ~s("alpha":)
+    assert {:ok, %{"alpha" => {:hex, :alpha, "1.0.0"}}} = Lockfile.parse_map(projected)
+  end
+
   test "digests the exact validated private lock bytes" do
     bytes = "%{}\n"
     expected = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)

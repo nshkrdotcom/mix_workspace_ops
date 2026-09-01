@@ -55,13 +55,26 @@ defmodule MixWorkspaceOps.Lockfile do
 
   def digest(value), do: {:error, {:lock_bytes, value}}
 
+  defp render(lock) when map_size(lock) == 0, do: "%{}\n"
+
   defp render(lock) do
-    inspect(lock,
-      pretty: true,
-      limit: :infinity,
-      printable_limit: :infinity,
-      width: 98
-    ) <> "\n"
+    entries =
+      lock
+      |> Enum.sort_by(fn {key, _value} -> inspect(key) end)
+      |> Enum.map_join(",\n", fn {key, value} ->
+        rendered_value =
+          inspect(value,
+            pretty: true,
+            limit: :infinity,
+            printable_limit: :infinity,
+            width: 94
+          )
+          |> String.replace("\n", "\n  ")
+
+        "  #{inspect(key)} => #{rendered_value}"
+      end)
+
+    "%{\n#{entries}\n}\n"
   end
 
   defp project_lock(lock, dropped) do
