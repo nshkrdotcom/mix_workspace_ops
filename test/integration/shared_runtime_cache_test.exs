@@ -83,6 +83,97 @@ defmodule MixWorkspaceOps.Integration.SharedRuntimeCacheTest do
     assert :ok = Runtime.release(runtime.handle)
   end
 
+  test "an allowed deps.get lock update is reused by the next managed command", context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "state")
+    source = Path.join(root, "git_source")
+    origin = Path.join(root, "git_origin.git")
+    consumer = Path.join(root, "consumer")
+
+    File.mkdir_p!(Path.join(source, "lib"))
+    File.write!(Path.join(source, "mix.exs"), project_file("git_dep", "[]"))
+
+    File.write!(
+      Path.join(source, "lib/git_dep.ex"),
+      "defmodule GitDep, do: def(value, do: :git)\n"
+    )
+
+    git!(source, ["init", "--quiet", "--initial-branch=main"])
+    git!(source, ["config", "user.name", "MWO Test"])
+    git!(source, ["config", "user.email", "mwo@example.invalid"])
+    git!(source, ["add", "."])
+    git!(source, ["commit", "--quiet", "-m", "git dependency"])
+    commit = git!(source, ["rev-parse", "HEAD"]) |> String.trim()
+    git!(root, ["clone", "--quiet", "--bare", source, origin])
+
+    File.mkdir_p!(Path.join(consumer, "lib"))
+
+    File.write!(
+      Path.join(consumer, "mix.exs"),
+      """
+      if bootstrap = System.get_env("MIX_WORKSPACE_OPS_BOOTSTRAP"), do: Code.require_file(bootstrap)
+
+      defmodule LockReuseConsumer.MixProject do
+        use Mix.Project
+
+        def project do
+          [
+            app: :lock_reuse_consumer,
+            version: "0.1.0",
+            deps: [{:git_dep, git: #{inspect(origin)}, ref: #{inspect(commit)}}]
+          ]
+        end
+      end
+      """
+    )
+
+    File.write!(
+      Path.join(consumer, "lib/lock_reuse_consumer.ex"),
+      "defmodule LockReuseConsumer, do: def(value, do: GitDep.value())\n"
+    )
+
+    source_lock = "%{}\n"
+    File.write!(Path.join(consumer, "mix.lock"), source_lock)
+    {:ok, bootstrap} = Bootstrap.materialize(state_root)
+
+    assert {:ok, first} =
+             Runtime.prepare(
+               state_root,
+               digest("lock-reuse-consumer"),
+               source_lock,
+               runtime_opts(consumer,
+                 project_identity: "lock_reuse_consumer",
+                 allow_lock_mutation: true
+               )
+             )
+
+    first_env = [{"MIX_WORKSPACE_OPS_BOOTSTRAP", bootstrap}, {"ERL_AFLAGS", "+S 2:2"} | first.env]
+    assert mix!(consumer, ["deps.get"], first_env) =~ "* Getting git_dep"
+    assert {:ok, %{lock_mutated: true}} = Runtime.finish(first.handle)
+    assert :ok = Runtime.release(first.handle)
+    assert File.read!(Path.join(consumer, "mix.lock")) == source_lock
+
+    assert {:ok, second} =
+             Runtime.prepare(
+               state_root,
+               digest("lock-reuse-consumer"),
+               source_lock,
+               runtime_opts(consumer, project_identity: "lock_reuse_consumer")
+             )
+
+    assert second.report.dependency_identity == first.report.dependency_identity
+    assert second.report.context_lock_status == :hit
+    assert File.read!(second.report.lockfile) =~ commit
+
+    second_env =
+      [{"MIX_WORKSPACE_OPS_BOOTSTRAP", bootstrap}, {"ERL_AFLAGS", "+S 2:2"} | second.env]
+
+    assert mix!(consumer, ["compile"], second_env) =~ "Generated lock_reuse_consumer app"
+    assert {:ok, %{lock_mutated: false}} = Runtime.finish(second.handle)
+    assert :ok = Runtime.release(second.handle)
+    assert File.read!(Path.join(consumer, "mix.lock")) == source_lock
+  end
+
   test "ordinary Mix remains standalone when no MWO environment is present", context do
     root = temporary_directory!(context)
     dependency = Path.join(root, "standalone_dep")

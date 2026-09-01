@@ -1227,12 +1227,13 @@ defmodule MixWorkspaceOps.CLITest do
     %{root: root, catalog: catalog, state_root: state_root} = workspace!(context)
     project_lock = Path.join(root, "alpha/mix.lock")
     File.write!(project_lock, "%{}\n")
+    changed_lock = inspect(%{changed: {:hex, :changed, "1.0.0"}}) <> "\n"
 
     command = [
       "--",
       "elixir",
       "-e",
-      ~s|File.write!(System.fetch_env!("MIX_WORKSPACE_OPS_LOCKFILE"), "changed\\n")|
+      ~s|File.write!(System.fetch_env!("MIX_WORKSPACE_OPS_LOCKFILE"), #{inspect(changed_lock)})|
     ]
 
     options = [

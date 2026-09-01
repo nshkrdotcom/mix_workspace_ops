@@ -5,6 +5,7 @@ defmodule MixWorkspaceOps.RuntimeTest do
 
   @cache_identity String.duplicate("a", 64)
   @lock ~S|%{"alpha" => {:hex, :alpha, "1.0.0"}}| <> "\n"
+  @changed_lock ~S|%{"alpha" => {:hex, :alpha, "2.0.0"}}| <> "\n"
 
   test "concurrent identical invocations share reusable contexts but not transient state",
        context do
@@ -84,7 +85,8 @@ defmodule MixWorkspaceOps.RuntimeTest do
     state_root = temporary_directory!(context)
 
     assert {:ok, refused} = Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts())
-    File.write!(refused.report.lockfile, "changed\n")
+    assert refused.report.context_lock_status == :initialized
+    File.write!(refused.report.lockfile, @changed_lock)
 
     assert {:error, {:lock_mutation_not_allowed, refused_id, initial, final}} =
              Runtime.finish(refused.handle)
@@ -101,7 +103,9 @@ defmodule MixWorkspaceOps.RuntimeTest do
                runtime_opts(allow_lock_mutation: true)
              )
 
-    File.write!(allowed.report.lockfile, "changed\n")
+    assert allowed.report.context_lock_status == :hit
+    assert File.read!(allowed.report.lockfile) == @lock
+    File.write!(allowed.report.lockfile, @changed_lock)
     assert {:ok, final_report} = Runtime.finish(allowed.handle)
     assert final_report.lock_mutated
     assert final_report.status == "complete"
@@ -110,6 +114,63 @@ defmodule MixWorkspaceOps.RuntimeTest do
 
     assert File.read!(refused.report.source_lock) == @lock
     assert File.read!(allowed.report.source_lock) == @lock
+    assert File.read!(allowed.report.context_lockfile) == @changed_lock
+
+    assert {:ok, reused} = Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts())
+    assert reused.report.dependency_identity == allowed.report.dependency_identity
+    assert reused.report.context_lock_status == :hit
+    assert File.read!(reused.report.lockfile) == @changed_lock
+    finish_and_release(reused.handle)
+  end
+
+  test "a malformed persistent operational lock is quarantined and rebuilt", context do
+    state_root = temporary_directory!(context)
+    assert {:ok, first} = Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts())
+    context_lockfile = first.report.context_lockfile
+    finish_and_release(first.handle)
+
+    File.write!(context_lockfile, "not a literal lock\n")
+
+    assert {:ok, recovered} = Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts())
+    assert recovered.report.context_lock_status == :recovered
+    assert File.read!(recovered.report.lockfile) == @lock
+    assert File.read!(context_lockfile) == @lock
+
+    quarantined =
+      context_lockfile
+      |> Path.dirname()
+      |> File.ls!()
+      |> Enum.filter(&String.starts_with?(&1, Path.basename(context_lockfile) <> ".invalid-"))
+
+    assert [_quarantined] = quarantined
+    finish_and_release(recovered.handle)
+  end
+
+  test "concurrent operational lock updates cannot overwrite a different completed update",
+       context do
+    state_root = temporary_directory!(context)
+    opts = runtime_opts(allow_lock_mutation: true)
+    assert {:ok, first} = Runtime.prepare(state_root, @cache_identity, @lock, opts)
+    assert {:ok, second} = Runtime.prepare(state_root, @cache_identity, @lock, opts)
+
+    first_lock = ~S|%{"alpha" => {:hex, :alpha, "2.0.0"}}| <> "\n"
+    second_lock = ~S|%{"alpha" => {:hex, :alpha, "3.0.0"}}| <> "\n"
+    File.write!(first.report.lockfile, first_lock)
+    File.write!(second.report.lockfile, second_lock)
+
+    assert {:ok, _report} = Runtime.finish(first.handle)
+
+    assert {:error,
+            {:context_lock_conflict, context_lockfile, initial_digest, current_digest,
+             final_digest}} = Runtime.finish(second.handle)
+
+    assert context_lockfile == first.report.context_lockfile
+    assert initial_digest == second.report.operational_lock_digest
+    refute current_digest == initial_digest
+    refute final_digest in [initial_digest, current_digest]
+    assert File.read!(context_lockfile) == first_lock
+    assert :ok = Runtime.release(first.handle)
+    assert :ok = Runtime.release(second.handle)
   end
 
   test "a path-backed overlay projects only its top-level lock entry", context do

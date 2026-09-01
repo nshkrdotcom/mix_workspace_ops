@@ -115,8 +115,11 @@ Git dependency checkouts.
 
 The source checkout's `mix.lock` is never modified. `Lockfile` safely parses only
 a literal top-level lock map, removes entries for dependencies actively replaced
-by local paths when required by Mix, and computes audit digests. It does not
-interpret/fetch package objects.
+by local paths when required by Mix, and computes audit digests. One operational
+lock is retained with each dependency context; invocations work on private
+copies, and explicitly allowed mutations are atomically promoted after a
+compare-and-swap check. Malformed retained locks are quarantined and rebuilt.
+`Lockfile` does not interpret or fetch package objects.
 
 External lockfile redirection uses Mix's non-public post-config facility. That
 dependency is isolated in the bootstrap's single `LockfileCompat` seam and fails
@@ -150,14 +153,16 @@ its compilation step. A concurrent compile therefore cannot replace artifacts
 while another test or run still uses that context.
 
 Dependency context identity includes only compatibility-relevant inputs such as
-Mix env/target, toolchain, private lock identity, and source-resolution identity.
+Mix env/target, toolchain, projected source-lock identity, and source-resolution identity.
 It excludes absolute checkout roots and ordinary target source HEAD/dirt.
 
 Build context identity is project-specific and includes the dependency context,
 Mix env/target, and toolchain. It remains stable across normal source edits so
 Mix incremental compilation can do its job.
 
-Per-invocation HOME/config/private-lock/report state remains private. `TMPDIR`
+Per-invocation HOME/config/working-lock/report state remains private. The
+accepted operational lock is retained inside the matching dependency context so
+`deps.get` and a later compile/test command form one normal managed workflow. `TMPDIR`
 is operator-private but shared by managed operations because Mix derives its
 cross-process lock namespace from the system temporary directory; separate
 temporary roots would silently disable coordination for identical paths.

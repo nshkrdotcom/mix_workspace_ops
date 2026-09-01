@@ -17,10 +17,11 @@ defmodule MixWorkspaceOps.Runtime do
   alias MixWorkspaceOps.{GitCache, Lockfile, Report}
 
   @state_marker "mix_workspace_ops.state/v1\n"
-  @runtime_schema "mix_workspace_ops.runtime/v4"
+  @runtime_schema "mix_workspace_ops.runtime/v5"
   @list_schema "mix_workspace_ops.state_list/v3"
   @gc_schema "mix_workspace_ops.state_gc/v3"
   @access_marker ".mwo-access"
+  @context_lockfile ".mix_workspace_ops.mix.lock"
   @metadata_atom_keys %{
     "created_at" => :created_at,
     "finished_at" => :finished_at,
@@ -30,6 +31,7 @@ defmodule MixWorkspaceOps.Runtime do
     "deps_present" => :deps_present,
     "build_present" => :build_present,
     "cache_objects" => :cache_objects,
+    "context_lock_status" => :context_lock_status,
     "final_lock_digest" => :final_lock_digest,
     "lock_mutated" => :lock_mutated
   }
@@ -49,7 +51,8 @@ defmodule MixWorkspaceOps.Runtime do
     "build_root" => :build_root,
     "build_path" => :build_path,
     "mix_exs" => :mix_exs,
-    "lockfile" => :lockfile
+    "lockfile" => :lockfile,
+    "context_lockfile" => :context_lockfile
   }
   @publication_credentials ~w(
     GH_TOKEN
@@ -85,6 +88,8 @@ defmodule MixWorkspaceOps.Runtime do
     :metadata_path,
     :source_lock_digest,
     :operational_lock_digest,
+    :context_lockfile,
+    :context_lock_status,
     :allow_lock_mutation,
     :created_at
   ]
@@ -101,6 +106,8 @@ defmodule MixWorkspaceOps.Runtime do
     :metadata_path,
     :source_lock_digest,
     :operational_lock_digest,
+    :context_lockfile,
+    :context_lock_status,
     :lockfile,
     :allow_lock_mutation,
     :created_at
@@ -119,6 +126,8 @@ defmodule MixWorkspaceOps.Runtime do
           metadata_path: String.t(),
           source_lock_digest: String.t(),
           operational_lock_digest: String.t(),
+          context_lockfile: String.t(),
+          context_lock_status: :hit | :initialized | :recovered,
           lockfile: String.t() | nil,
           allow_lock_mutation: boolean(),
           created_at: non_neg_integer()
@@ -136,11 +145,13 @@ defmodule MixWorkspaceOps.Runtime do
          :ok <- valid_identity(:cache_identity, cache_identity),
          {:ok, execution_inputs} <-
            execution_inputs(Keyword.put_new(opts, :project_identity, cache_identity)),
-         {:ok, operational_lock} <- operational_lock(lock_bytes, opts),
+         {:ok, projected_lock} <- operational_lock(lock_bytes, opts),
          dependency_identity <-
-           dependency_identity(cache_identity, operational_lock, execution_inputs),
+           dependency_identity(cache_identity, projected_lock, execution_inputs),
          execution_identity <- execution_identity(dependency_identity, execution_inputs),
          :ok <- ensure_state_root(state_root),
+         {:ok, context_lock} <-
+           prepare_context_lock(state_root, dependency_identity, projected_lock),
          {:ok, root, run_id} <- create_run_root(state_root, execution_identity),
          identities <- %{
            cache: cache_identity,
@@ -153,7 +164,7 @@ defmodule MixWorkspaceOps.Runtime do
              state_root,
              identities,
              lock_bytes,
-             operational_lock,
+             context_lock,
              %{
                run_id: run_id,
                binding_root: execution_inputs.binding_root,
@@ -162,17 +173,18 @@ defmodule MixWorkspaceOps.Runtime do
                created_at: created_at
              }
            ) do
-      prepare_run(handle, lock_bytes, operational_lock, execution_inputs, opts)
+      prepare_run(handle, lock_bytes, context_lock.bytes, execution_inputs, opts)
     end
   end
 
   @doc "Finalizes the lock audit and durable run record. Safe to call before releasing the lease."
   @spec finish(t()) :: {:ok, map()} | {:error, term()}
   def finish(%__MODULE__{} = handle) do
-    with {:ok, final_lock_digest} <- final_lock_digest(handle),
+    with {:ok, final_lock, final_lock_digest} <- final_lock(handle),
          lock_mutated = final_lock_digest != handle.operational_lock_digest,
+         decision <- finish_decision(handle, final_lock, final_lock_digest, lock_mutated),
          finished_at = System.system_time(:second),
-         status = finish_status(lock_mutated, handle.allow_lock_mutation),
+         status = finish_status(decision),
          {:ok, metadata} <- read_metadata(handle.metadata_path),
          final =
            metadata
@@ -183,12 +195,9 @@ defmodule MixWorkspaceOps.Runtime do
          :ok <- write_report_private(handle.metadata_path, final) do
       report = runtime_report(handle, final)
 
-      if status == "rejected" do
-        {:error,
-         {:lock_mutation_not_allowed, handle.run_id, handle.operational_lock_digest,
-          final_lock_digest}}
-      else
-        {:ok, report}
+      case decision do
+        :complete -> {:ok, report}
+        {:rejected, reason} -> {:error, reason}
       end
     end
   end
@@ -322,7 +331,7 @@ defmodule MixWorkspaceOps.Runtime do
     end
   end
 
-  defp handle(root, state_root, identities, lock_bytes, operational_lock, invocation) do
+  defp handle(root, state_root, identities, lock_bytes, context_lock, invocation) do
     %__MODULE__{
       root: root,
       state_root: state_root,
@@ -335,7 +344,9 @@ defmodule MixWorkspaceOps.Runtime do
       lease_path: Path.join(root, "lease.json"),
       metadata_path: Path.join(root, "runtime.json"),
       source_lock_digest: lock_digest(lock_bytes),
-      operational_lock_digest: lock_digest(operational_lock),
+      operational_lock_digest: lock_digest(context_lock.bytes),
+      context_lockfile: context_lock.path,
+      context_lock_status: context_lock.status,
       allow_lock_mutation: invocation.allow_lock_mutation,
       created_at: invocation.created_at
     }
@@ -380,7 +391,7 @@ defmodule MixWorkspaceOps.Runtime do
 
   defp dependency_identity(cache_identity, operational_lock, inputs) do
     Report.encode(%{
-      version: 4,
+      version: 5,
       source_fingerprint: cache_identity,
       operational_lock_digest: lock_digest(operational_lock),
       mix_env: inputs.mix_env,
@@ -392,7 +403,7 @@ defmodule MixWorkspaceOps.Runtime do
 
   defp execution_identity(dependency_identity, inputs) do
     Report.encode(%{
-      version: 4,
+      version: 5,
       project_identity: inputs.project_identity,
       dependency_identity: dependency_identity,
       mix_env: inputs.mix_env,
@@ -547,12 +558,64 @@ defmodule MixWorkspaceOps.Runtime do
     end)
   end
 
+  defp prepare_context_lock(state_root, dependency_identity, initial_lock) do
+    context = Path.join([state_root, "contexts", "deps", dependency_identity])
+    path = Path.join(context, @context_lockfile)
+
+    SyncLock.with_lock(context_lock(context), fn ->
+      with :ok <- mkdir_private(context),
+           {:ok, bytes, status} <- read_or_initialize_context_lock(path, initial_lock) do
+        {:ok, %{path: path, bytes: bytes, status: status}}
+      end
+    end)
+  end
+
+  defp read_or_initialize_context_lock(path, initial_lock) do
+    case File.lstat(path) do
+      {:error, :enoent} ->
+        with :ok <- write_private(path, initial_lock),
+             do: {:ok, initial_lock, :initialized}
+
+      {:ok, %{type: :regular}} ->
+        with {:ok, bytes} <- File.read(path),
+             {:ok, _digest} <- Lockfile.digest(bytes) do
+          {:ok, bytes, :hit}
+        else
+          {:error, reason} -> recover_context_lock(path, initial_lock, reason)
+        end
+
+      {:ok, stat} ->
+        recover_context_lock(path, initial_lock, {:non_regular, stat.type})
+
+      {:error, reason} ->
+        {:error, {:context_lock_read, path, reason}}
+    end
+  end
+
+  defp recover_context_lock(path, initial_lock, reason) do
+    quarantine =
+      path <>
+        ".invalid-" <>
+        Integer.to_string(System.unique_integer([:positive, :monotonic]))
+
+    with :ok <- File.rename(path, quarantine),
+         :ok <- write_private(path, initial_lock) do
+      {:ok, initial_lock, :recovered}
+    else
+      {:error, recovery_reason} ->
+        {:error, {:context_lock_recovery, path, reason, recovery_reason}}
+    end
+  end
+
   defp populated_directory?(path) do
     case File.ls(path) do
-      {:ok, names} -> Enum.any?(names, &(&1 != @access_marker))
+      {:ok, names} -> Enum.any?(names, &(not context_metadata?(&1)))
       _empty_or_unreadable -> false
     end
   end
+
+  defp context_metadata?(@access_marker), do: true
+  defp context_metadata?(name), do: String.starts_with?(name, @context_lockfile)
 
   defp touch_context(path, timestamp) do
     marker = Path.join(path, @access_marker)
@@ -827,6 +890,7 @@ defmodule MixWorkspaceOps.Runtime do
       deps_present: paths.deps_present,
       build_present: paths.build_present,
       cache_objects: Map.drop(cache_objects, [:git_env]),
+      context_lock_status: handle.context_lock_status,
       source_lock_digest: handle.source_lock_digest,
       operational_lock_digest: handle.operational_lock_digest,
       final_lock_digest: nil,
@@ -848,6 +912,7 @@ defmodule MixWorkspaceOps.Runtime do
       tmp: paths.tmp,
       config_home: paths.config,
       source_lock: Path.join(handle.root, "source.mix.lock"),
+      context_lockfile: handle.context_lockfile,
       deps_path: paths.deps,
       build_root: paths.build,
       build_path: paths.build,
@@ -878,6 +943,7 @@ defmodule MixWorkspaceOps.Runtime do
       deps_present: value(metadata, "deps_present"),
       build_present: value(metadata, "build_present"),
       cache_objects: value(metadata, "cache_objects"),
+      context_lock_status: handle.context_lock_status,
       source_lock_digest: handle.source_lock_digest,
       operational_lock_digest: handle.operational_lock_digest,
       final_lock_digest: value(metadata, "final_lock_digest"),
@@ -894,17 +960,70 @@ defmodule MixWorkspaceOps.Runtime do
   defp path_key(key) when is_atom(key), do: key
   defp path_key(key) when is_binary(key), do: Map.fetch!(@report_path_keys, key)
 
-  defp final_lock_digest(%{lockfile: nil, operational_lock_digest: digest}), do: {:ok, digest}
+  defp final_lock(%{lockfile: nil, operational_lock_digest: digest}),
+    do: {:ok, nil, digest}
 
-  defp final_lock_digest(%{lockfile: path}) do
+  defp final_lock(%{lockfile: path}) do
     case File.read(path) do
-      {:ok, bytes} -> {:ok, lock_digest(bytes)}
-      {:error, reason} -> {:error, {:runtime_final_lock, reason}}
+      {:ok, bytes} -> {:ok, bytes, lock_digest(bytes)}
+      {:error, reason} -> {:error, {:runtime_final_lock, path, reason}}
     end
   end
 
-  defp finish_status(true, false), do: "rejected"
-  defp finish_status(_mutated, _allowed), do: "complete"
+  defp finish_decision(_handle, _final_lock, _final_digest, false), do: :complete
+
+  defp finish_decision(handle, _final_lock, final_digest, true)
+       when not handle.allow_lock_mutation do
+    {:rejected,
+     {:lock_mutation_not_allowed, handle.run_id, handle.operational_lock_digest, final_digest}}
+  end
+
+  defp finish_decision(handle, final_lock, final_digest, true) do
+    case Lockfile.digest(final_lock) do
+      {:ok, ^final_digest} ->
+        case persist_context_lock(handle, final_lock, final_digest) do
+          :ok -> :complete
+          {:error, reason} -> {:rejected, reason}
+        end
+
+      {:error, reason} ->
+        {:rejected, {:runtime_final_lock, handle.lockfile, reason}}
+    end
+  end
+
+  defp persist_context_lock(handle, final_lock, final_digest) do
+    context = Path.dirname(handle.context_lockfile)
+
+    SyncLock.with_lock(context_lock(context), fn ->
+      with {:ok, current} <- read_valid_context_lock(handle.context_lockfile),
+           {:ok, current_digest} <- Lockfile.digest(current) do
+        persist_context_lock(handle, final_lock, final_digest, current_digest)
+      end
+    end)
+  end
+
+  defp persist_context_lock(_handle, _final_lock, final_digest, final_digest), do: :ok
+
+  defp persist_context_lock(handle, final_lock, _final_digest, current_digest)
+       when current_digest == handle.operational_lock_digest,
+       do: replace_private(handle.context_lockfile, final_lock)
+
+  defp persist_context_lock(handle, _final_lock, final_digest, current_digest) do
+    {:error,
+     {:context_lock_conflict, handle.context_lockfile, handle.operational_lock_digest,
+      current_digest, final_digest}}
+  end
+
+  defp read_valid_context_lock(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :regular}} -> File.read(path)
+      {:ok, stat} -> {:error, {:context_lock_invalid, path, {:non_regular, stat.type}}}
+      {:error, reason} -> {:error, {:context_lock_read, path, reason}}
+    end
+  end
+
+  defp finish_status(:complete), do: "complete"
+  defp finish_status({:rejected, _reason}), do: "rejected"
 
   defp readable_state_root(state_root) do
     marker = Path.join(state_root, ".mix_workspace_ops_state")
@@ -1258,6 +1377,22 @@ defmodule MixWorkspaceOps.Runtime do
 
   defp write_private(path, bytes) do
     with :ok <- File.write(path, bytes, [:exclusive, :sync]), do: File.chmod(path, 0o600)
+  end
+
+  defp replace_private(path, bytes) do
+    temporary =
+      path <>
+        ".tmp-" <>
+        Integer.to_string(System.unique_integer([:positive, :monotonic]))
+
+    result =
+      case write_private(temporary, bytes) do
+        :ok -> File.rename(temporary, path)
+        {:error, _reason} = error -> error
+      end
+
+    if result != :ok, do: File.rm(temporary)
+    result
   end
 
   defp write_report_private(path, value) do

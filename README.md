@@ -274,9 +274,10 @@ MWO keeps generated state outside managed repositories:
 
 - stable external dependency contexts;
 - project-specific stable external build contexts;
+- one persistent operational lock per dependency context;
 - one operator-private temporary root so Mix processes share their lock namespace;
 - invocation-private HOME/config/report/lease state;
-- a private operational `mix.lock` copy;
+- an invocation-private working copy of the context lock;
 - content-addressed source overlays/bootstrap state;
 - credential-free shared Hex/Rebar/archive caches;
 - Git mirrors.
@@ -288,9 +289,13 @@ Incompatible dependency/source/lock contexts still select different dependency
 state.
 
 The checkout's committed `mix.lock` is never mutated. If local path substitution
-requires it, MWO projects only the corresponding top-level lock entries from the
-private operational copy. The lock parser accepts literal data only and does not
-interpret package objects.
+requires it, MWO projects only the corresponding top-level lock entries into the
+dependency context's operational lock. Each invocation receives a private
+working copy. A command allowed to mutate the lock promotes a valid result
+atomically, so a later managed command reuses it; disallowed or conflicting
+changes are not promoted. Malformed retained locks are quarantined and rebuilt
+from the source projection. The lock parser accepts literal data only and does
+not interpret package objects.
 
 Runtime GC is lease-aware:
 

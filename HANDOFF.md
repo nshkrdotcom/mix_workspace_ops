@@ -28,8 +28,11 @@ repository or needed to continue.
   context hold Mix's cross-process lock for the complete child command, preventing
   a later compile from replacing artifacts while an earlier test/run still uses
   them.
-- HOME, configuration, operational lockfile, lease, and report state remain
-  invocation-private. Publication credentials are removed from ordinary child
+- HOME, configuration, working lockfile, lease, and report state remain
+  invocation-private. Each dependency context retains its accepted operational
+  lock so separate managed commands compose; allowed changes are atomically
+  promoted, conflicting changes are rejected, and malformed state is
+  quarantined. Publication credentials are removed from ordinary child
   environments. The checkout's `mix.lock` is never implicitly written.
 - Dependency declarations observed from the actual Mix project under effective
   env/target are fingerprinted into dependency-context identity. This prevents
@@ -67,6 +70,10 @@ fixed these concrete defects:
    remain parallel.
 8. Unreachable/unused public surface and strict Credo/Dialyzer findings.
 9. The original handoff's false overlay-artifact and private-API claims.
+10. P9 rollout exposed that a successful `deps.get` discarded its private lock
+    update, so the following managed test could report a fetched Git dependency
+    as unlocked. Operational locks now persist with the exact dependency
+    context while every invocation still uses a private working copy.
 
 ## Executable evidence
 
@@ -75,7 +82,7 @@ Validated with Elixir 1.20.3, OTP 29.0.5, and Mix 1.20.3:
 ```text
 mix format --check-formatted          PASS
 mix compile --warnings-as-errors      PASS
-mix test --warnings-as-errors         PASS — 372 passed, 1 skipped
+mix test --warnings-as-errors         PASS — 376 passed, 1 skipped
 mix credo --strict                    PASS — 0 issues
 mix dialyzer                          PASS — 0 errors/skips
 mix docs                              PASS
@@ -88,6 +95,7 @@ git diff --check                      PASS
 Acceptance tests include real Mix subprocesses for:
 
 - warm Git-mirror reuse without the origin;
+- reuse of an allowed `deps.get` lock update by a later managed compile;
 - standalone unmanaged Mix behavior;
 - dependency/build reuse across checkout relocation and source edits;
 - incompatible dependency declarations selecting different contexts;
