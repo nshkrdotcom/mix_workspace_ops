@@ -1,7 +1,7 @@
 defmodule MixWorkspaceOps.WorkspaceMembershipTest do
   use MixWorkspaceOps.WorkspaceCase, async: true
 
-  alias MixWorkspaceOps.{Graph, Registry}
+  alias MixWorkspaceOps.{Graph, Registry, Resolution}
 
   defp workspace_catalog(root, workspace, projects) do
     write_catalog!(root, [
@@ -156,7 +156,7 @@ defmodule MixWorkspaceOps.WorkspaceMembershipTest do
     assert Enum.map(members, & &1.id) == ["plane.core"]
   end
 
-  test "a workspace graph seeds exactly the derived selected members", context do
+  test "a workspace graph walks the target after its derived selected members", context do
     root = temporary_directory!(context)
     initialize_repository!(Path.join(root, "plane"))
 
@@ -190,11 +190,12 @@ defmodule MixWorkspaceOps.WorkspaceMembershipTest do
     end
 
     assert {:ok, resolution} = Graph.resolve(registry, "plane", dependency_reader: reader)
-    assert Enum.map(resolution.projects, & &1.id) == ~w(plane.alpha plane.beta plane.gamma)
+    assert Enum.map(resolution.projects, & &1.id) == ~w(plane.alpha plane.beta plane.gamma plane)
 
     assert_received {:seed, "plane.alpha"}
     assert_received {:seed, "plane.beta"}
     assert_received {:seed, "plane.gamma"}
+    assert_received {:seed, "plane"}
     refute_received {:seed, _other}
 
     selected =
@@ -207,6 +208,54 @@ defmodule MixWorkspaceOps.WorkspaceMembershipTest do
     assert {:ok, selected_resolution} =
              Graph.resolve(selected, "plane", dependency_reader: fn _project -> {:ok, []} end)
 
-    assert Enum.map(selected_resolution.projects, & &1.id) == ~w(plane.alpha plane.gamma)
+    assert Enum.map(selected_resolution.projects, & &1.id) == ~w(plane.alpha plane.gamma plane)
+  end
+
+  test "a workspace root contributes dependencies that no member declares", context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "plane"))
+    initialize_repository!(Path.join(root, "support"))
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("plane",
+          workspace: %{"kind" => "umbrella"},
+          dependency_sources: %{"support" => %{"hex" => "~> 0.1"}},
+          projects: [
+            catalog_project("plane", app: nil, kind: "workspace_root"),
+            catalog_project("plane.core", app: "plane_core", path: "apps/core", kind: "package")
+          ]
+        ),
+        catalog_repository("support", projects: [catalog_project("support")])
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    reader = fn
+      %{id: "plane"} -> {:ok, ["support"]}
+      _project -> {:ok, []}
+    end
+
+    assert {:ok, resolution} = Graph.resolve(registry, "plane", dependency_reader: reader)
+
+    assert Enum.map(resolution.projects, & &1.id) == ~w(plane.core support plane)
+    assert resolution.edges == [{"plane", "support"}]
+
+    assert resolution.dependency_applications == [
+             %{
+               application: "support",
+               candidates: [],
+               classification: :managed,
+               consumer: "plane",
+               provider: "support"
+             }
+           ]
+
+    assert {:ok, report} =
+             Resolution.resolve(registry, "plane", dependency_reader: reader)
+
+    assert [%{application: "support", source: "local"}] =
+             Enum.map(Resolution.sources(report), &Map.take(&1, [:application, :source]))
   end
 end

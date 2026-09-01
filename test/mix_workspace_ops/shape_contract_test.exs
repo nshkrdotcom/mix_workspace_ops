@@ -38,7 +38,7 @@ defmodule MixWorkspaceOps.ShapeContractTest do
              Overlay.activate(registry, "umbrella", state_root: state_root)
 
     assert MapSet.new(activation.report.projects) ==
-             MapSet.new(["umbrella.core", "umbrella.web"])
+             MapSet.new(["umbrella", "umbrella.core", "umbrella.web"])
 
     assert activation.report.runtime.ownership == :managed
 

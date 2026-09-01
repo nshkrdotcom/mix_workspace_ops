@@ -105,7 +105,14 @@ defmodule MixWorkspaceOps.Graph do
     if project.kind == "workspace_root" do
       case Registry.workspace_members(registry, project.repository) do
         {:ok, members} ->
-          {:ok, Enum.filter(members, &Registry.selected?(registry, &1.id))}
+          members = Enum.filter(members, &Registry.selected?(registry, &1.id))
+
+          # The root is not a workspace *member*, but it is still the operation
+          # target. Its own Mix project may declare dependencies that no member
+          # uses, so the graph must walk it once as well. Keep it last to retain
+          # the established member traversal order, and do not duplicate roots
+          # explicitly included by a workspace definition.
+          {:ok, include_target(members, project)}
 
         error ->
           error
@@ -113,6 +120,10 @@ defmodule MixWorkspaceOps.Graph do
     else
       {:ok, [project]}
     end
+  end
+
+  defp include_target(members, project) do
+    if Enum.any?(members, &(&1.id == project.id)), do: members, else: members ++ [project]
   end
 
   defp visit_seeds(registry, seeds, reader, state) do
