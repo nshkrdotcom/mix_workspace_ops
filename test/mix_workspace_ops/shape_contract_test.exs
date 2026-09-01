@@ -13,18 +13,23 @@ defmodule MixWorkspaceOps.ShapeContractTest do
 
     registry =
       root
-      |> write_registry!([
-        repository("umbrella", [
-          project("umbrella", nil, kind: "workspace_root", app: nil),
-          project("umbrella.core", "umbrella_core",
-            path: "apps/umbrella_core",
-            kind: "package"
-          ),
-          project("umbrella.web", "umbrella_web",
-            path: "apps/umbrella_web",
-            kind: "package"
-          )
-        ])
+      |> write_catalog!([
+        catalog_repository("umbrella",
+          workspace: %{"kind" => "umbrella"},
+          projects: [
+            catalog_project("umbrella", kind: "workspace_root", app: nil),
+            catalog_project("umbrella.core",
+              app: "umbrella_core",
+              path: "apps/umbrella_core",
+              kind: "package"
+            ),
+            catalog_project("umbrella.web",
+              app: "umbrella_web",
+              path: "apps/umbrella_web",
+              kind: "package"
+            )
+          ]
+        )
       ])
       |> Registry.load!()
       |> bind!(root)
@@ -33,7 +38,7 @@ defmodule MixWorkspaceOps.ShapeContractTest do
              Overlay.activate(registry, "umbrella", state_root: state_root)
 
     assert MapSet.new(activation.report.projects) ==
-             MapSet.new(["umbrella", "umbrella.core", "umbrella.web"])
+             MapSet.new(["umbrella.core", "umbrella.web"])
 
     assert activation.report.runtime.ownership == :managed
 

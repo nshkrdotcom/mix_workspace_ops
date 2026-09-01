@@ -30,7 +30,8 @@ defmodule MixWorkspaceOps.Overlay do
   reads one.
   """
 
-  alias MixWorkspaceOps.{Bootstrap, Git, Graph, MixInputs, Registry, Resolution, Runtime}
+  alias MixWorkspaceOps.{Bootstrap, Git, Graph, MixInputs, Project, Registry, Resolution, Runtime}
+  alias MixWorkspaceOps.Project.ProbeMemo
 
   @env "MIX_WORKSPACE_OPS_OVERLAY"
   @context_env "MIX_WORKSPACE_OPS_CONTEXT_DIGEST"
@@ -74,7 +75,7 @@ defmodule MixWorkspaceOps.Overlay do
     state_root = Keyword.get_lazy(opts, :state_root, &default_state_root/0)
 
     with {:ok, inputs} <- MixInputs.normalize(opts),
-         opts = MixInputs.put(opts, inputs),
+         opts = opts |> MixInputs.put(inputs) |> Keyword.put_new(:probe_memo, ProbeMemo.new()),
          :ok <- known_mode(mode),
          {:ok, resolution} <- Graph.resolve(registry, target, opts),
          {:ok, decided} <- decide(registry, target, resolution, mode, opts),
@@ -83,10 +84,18 @@ defmodule MixWorkspaceOps.Overlay do
          :ok <- printable(rows),
          target_project <- Registry.project!(registry, target),
          target_root <- Registry.project_root(registry, target_project),
+         {:ok, target_metadata} <- Project.metadata(registry, target_project, opts),
          {:ok, lock_bytes} <- source_lock(target_root),
          target_head <- Git.head!(target_root),
          target_source_digest <- Git.source_digest(target_root),
-         context <- context_contents(registry, decided, target_project, attributed),
+         context <-
+           context_contents(
+             registry,
+             decided,
+             target_project,
+             target_metadata.dependency_fingerprint,
+             attributed
+           ),
          context_digest <- digest(context),
          target_state <- %{
            head: target_head,
@@ -347,11 +356,18 @@ defmodule MixWorkspaceOps.Overlay do
     |> Kernel.<>("\n")
   end
 
-  defp context_contents(registry, decided, target_project, attributed) do
+  defp context_contents(
+         registry,
+         decided,
+         target_project,
+         dependency_fingerprint,
+         attributed
+       ) do
     metadata = [
       @context_header,
       "mix_env\t#{decided.mix_env}",
       "mix_target\t#{decided.mix_target}",
+      "dependency_declarations\t#{dependency_fingerprint}",
       "toolchain\telixir-#{System.version()}-otp-#{:erlang.system_info(:otp_release)}"
     ]
 

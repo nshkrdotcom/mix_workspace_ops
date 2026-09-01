@@ -80,7 +80,12 @@ defmodule MixWorkspaceOps.Doctor do
         check(:git_root, git_root?(root), root),
         check(:remote, remote_matches?(root, repository.github, catalogued), repository.github),
         check(:clean, Git.clean?(root), root, :warning),
-        check(:branch, Git.branch!(root) == repository.default_branch, repository.default_branch, :warning)
+        check(
+          :branch,
+          Git.branch!(root) == repository.default_branch,
+          repository.default_branch,
+          :warning
+        )
       ] ++ Enum.flat_map(projects, & &1.checks)
 
     %{

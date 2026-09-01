@@ -3,12 +3,13 @@ defmodule MixWorkspaceOps.Integration.PreparedArtifactOwnerTest do
 
   @moduletag timeout: 600_000
 
-  alias MixWorkspaceOps.Release.{LocalAdapter, PreparedArtifact, Receipt, Transaction}
-
   @source_environment "MWO_PREPARED_ARTIFACT_SOURCE"
-  @manifest "test/fixtures/library_bundle/packaging/weld/fixture_bundle.exs"
 
   if System.get_env(@source_environment) do
+    alias MixWorkspaceOps.Release.{LocalAdapter, PreparedArtifact, Receipt, Transaction}
+
+    @manifest "test/fixtures/library_bundle/packaging/weld/fixture_bundle.exs"
+
     test "rebuilds a real owner projection and completes through a fake registry", context do
       root = temporary_directory!(context)
       upstream = System.fetch_env!(@source_environment) |> Path.expand()
@@ -203,63 +204,63 @@ defmodule MixWorkspaceOps.Integration.PreparedArtifactOwnerTest do
                "refs/tags/fixture_bundle-v0.1.0"
              ]) =~ "refs/tags/fixture_bundle-v0.1.0"
     end
+
+    defp run!(executable, arguments, cwd, timeout \\ 120_000) do
+      task =
+        Task.async(fn -> System.cmd(executable, arguments, cd: cwd, stderr_to_stdout: true) end)
+
+      case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+        {:ok, {output, 0}} -> output
+        {:ok, {output, status}} -> flunk("#{executable} exited #{status}:\n#{output}")
+        nil -> flunk("#{executable} timed out")
+      end
+    end
+
+    defp git!(repository, arguments) do
+      {output, 0} = System.cmd("git", arguments, cd: repository, stderr_to_stdout: true)
+      String.trim(output)
+    end
+
+    defp sha256_file(path) do
+      path
+      |> File.read!()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+    end
+
+    defp succeeded_evidence(events, transition) do
+      events
+      |> Enum.find(&(&1["transition"] == transition and &1["status"] == "succeeded"))
+      |> Map.fetch!("evidence")
+    end
+
+    defp prepared_tree_diff(expected, rebuilt) do
+      expected_files = tree_files(expected)
+      rebuilt_files = tree_files(rebuilt)
+
+      expected_files
+      |> Map.keys()
+      |> Enum.concat(Map.keys(rebuilt_files))
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.filter(&(Map.get(expected_files, &1) != Map.get(rebuilt_files, &1)))
+      |> Enum.map_join("\n", fn path ->
+        "#{path}: expected=#{inspect(Map.get(expected_files, path))} " <>
+          "rebuilt=#{inspect(Map.get(rebuilt_files, path))}"
+      end)
+    end
+
+    defp tree_files(root) do
+      root
+      |> Path.join("**/*")
+      |> Path.wildcard(match_dot: true)
+      |> Enum.filter(&File.regular?/1)
+      |> Map.new(fn path -> {Path.relative_to(path, root), sha256_file(path)} end)
+    end
+
+    defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
   else
     @tag skip: "set #{@source_environment} to run the cross-repository projection proof"
     test "prepared-artifact owner integration source is explicitly supplied", do: :ok
   end
-
-  defp run!(executable, arguments, cwd, timeout \\ 120_000) do
-    task =
-      Task.async(fn -> System.cmd(executable, arguments, cd: cwd, stderr_to_stdout: true) end)
-
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {output, 0}} -> output
-      {:ok, {output, status}} -> flunk("#{executable} exited #{status}:\n#{output}")
-      nil -> flunk("#{executable} timed out")
-    end
-  end
-
-  defp git!(repository, arguments) do
-    {output, 0} = System.cmd("git", arguments, cd: repository, stderr_to_stdout: true)
-    String.trim(output)
-  end
-
-  defp sha256_file(path) do
-    path
-    |> File.read!()
-    |> then(&:crypto.hash(:sha256, &1))
-    |> Base.encode16(case: :lower)
-  end
-
-  defp succeeded_evidence(events, transition) do
-    events
-    |> Enum.find(&(&1["transition"] == transition and &1["status"] == "succeeded"))
-    |> Map.fetch!("evidence")
-  end
-
-  defp prepared_tree_diff(expected, rebuilt) do
-    expected_files = tree_files(expected)
-    rebuilt_files = tree_files(rebuilt)
-
-    expected_files
-    |> Map.keys()
-    |> Enum.concat(Map.keys(rebuilt_files))
-    |> Enum.uniq()
-    |> Enum.sort()
-    |> Enum.filter(&(Map.get(expected_files, &1) != Map.get(rebuilt_files, &1)))
-    |> Enum.map_join("\n", fn path ->
-      "#{path}: expected=#{inspect(Map.get(expected_files, path))} " <>
-        "rebuilt=#{inspect(Map.get(rebuilt_files, path))}"
-    end)
-  end
-
-  defp tree_files(root) do
-    root
-    |> Path.join("**/*")
-    |> Path.wildcard(match_dot: true)
-    |> Enum.filter(&File.regular?/1)
-    |> Map.new(fn path -> {Path.relative_to(path, root), sha256_file(path)} end)
-  end
-
-  defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
 end

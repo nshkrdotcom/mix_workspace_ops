@@ -102,5 +102,4 @@ defmodule MixWorkspaceOps.CatalogViewTest do
 
     assert {:error, {:unknown_view_selector_keys, ["group_any"]}} = View.load(path)
   end
-
 end

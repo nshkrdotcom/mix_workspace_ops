@@ -11,7 +11,7 @@ defmodule MixWorkspaceOps.SourcePreferencesTest do
     assert {:ok, ^path} = SourcePreferences.put(path, "consumer", "other", "hex")
     assert {:ok, preferences} = SourcePreferences.load(path)
     assert preferences == %{"consumer" => %{"core" => "git", "other" => "hex"}}
-    assert SourcePreferences.get(preferences, "consumer", "core") == "git"
+    assert SourcePreferences.project(preferences, "consumer")["core"] == "git"
 
     {:ok, stat} = File.stat(path)
     assert Bitwise.band(stat.mode, 0o777) == 0o600
@@ -45,7 +45,11 @@ defmodule MixWorkspaceOps.SourcePreferencesTest do
     assert {:error, {:invalid_source_preference, "github"}} =
              SourcePreferences.normalize_mode("github")
 
-    File.write!(path, ~s({"schema":"mix_workspace_ops.source_preferences/v1","projects":{"consumer":{"core":"path"}}}))
+    File.write!(
+      path,
+      ~s({"schema":"mix_workspace_ops.source_preferences/v1","projects":{"consumer":{"core":"path"}}})
+    )
+
     assert {:error, {:source_preferences, ^path, _reason}} = SourcePreferences.load(path)
   end
 

@@ -37,21 +37,67 @@ defmodule MixWorkspaceOps.Project do
   active = fn opts ->
     active_for.(opts, :only, mix_env) and active_for.(opts, :targets, mix_target)
   end
+  dependency_options = fn
+    {_app, opts} when is_list(opts) -> opts
+    {_app, _requirement, opts} when is_list(opts) -> opts
+    _dependency -> []
+  end
+  declared_dependencies = Keyword.get(config, :deps, [])
+  active_dependencies =
+    Enum.filter(declared_dependencies, fn dependency ->
+      active.(dependency_options.(dependency))
+    end)
   dependencies =
-    config
-    |> Keyword.get(:deps, [])
+    active_dependencies
     |> Enum.flat_map(fn
-      {dep, opts} when is_atom(dep) and is_list(opts) ->
-        if active.(opts), do: [Atom.to_string(dep)], else: []
       {dep, _value} when is_atom(dep) ->
         [Atom.to_string(dep)]
-      {dep, _requirement, opts} when is_atom(dep) and is_list(opts) ->
-        if active.(opts), do: [Atom.to_string(dep)], else: []
+      {dep, _requirement, _opts} when is_atom(dep) ->
+        [Atom.to_string(dep)]
+      dep when is_atom(dep) ->
+        [Atom.to_string(dep)]
       _other -> []
     end)
     |> Enum.uniq()
     |> Enum.sort()
-  IO.puts("#{@marker}" <> app <> "\t" <> version <> "\t" <> Enum.join(dependencies, ","))
+  project_root = File.cwd!()
+  probe_root = System.fetch_env!("MIX_WORKSPACE_OPS_PROBE_ROOT")
+  normalize_path = fn path ->
+    cond do
+      Path.type(path) == :relative ->
+        {:relative, Path.relative_to(Path.expand(path, "/project"), "/project")}
+      path == probe_root or String.starts_with?(path, probe_root <> "/") ->
+        {:staged, Path.relative_to(path, project_root)}
+      true ->
+        {:absolute, path}
+    end
+  end
+  normalize = fn normalize, value ->
+    cond do
+      match?({:path, path} when is_binary(path), value) ->
+        {:path, normalize_path.(elem(value, 1))}
+      is_map(value) ->
+        value
+        |> Enum.map(fn {key, item} -> {normalize.(normalize, key), normalize.(normalize, item)} end)
+        |> Enum.sort()
+      is_tuple(value) ->
+        value |> Tuple.to_list() |> Enum.map(&normalize.(normalize, &1)) |> List.to_tuple()
+      is_list(value) ->
+        Enum.map(value, &normalize.(normalize, &1))
+      true ->
+        value
+    end
+  end
+  dependency_fingerprint =
+    active_dependencies
+    |> then(&normalize.(normalize, &1))
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  IO.puts(
+    "#{@marker}" <> app <> "\t" <> version <> "\t" <> Enum.join(dependencies, ",") <>
+      "\t" <> dependency_fingerprint
+  )
   """
 
   @type probe_options :: [
@@ -154,14 +200,14 @@ defmodule MixWorkspaceOps.Project do
            ],
            cd: stage.project_root,
            replace_env: true,
-           env: probe_environment(mix_env, mix_target, home, mix_home, hex_home, temporary)
+           env: probe_environment(mix_env, mix_target, home, mix_home, hex_home, temporary, stage)
          ) do
       {:ok, result} -> parse(result.output)
       {:error, result} -> {:error, {:command_failed, result.exit_code, result.output}}
     end
   end
 
-  defp probe_environment(mix_env, mix_target, home, mix_home, hex_home, temporary) do
+  defp probe_environment(mix_env, mix_target, home, mix_home, hex_home, temporary, stage) do
     [
       {"PATH", System.get_env("PATH") || "/usr/bin:/bin"},
       {"LANG", System.get_env("LANG") || "C"},
@@ -173,7 +219,8 @@ defmodule MixWorkspaceOps.Project do
       {"TMPDIR", temporary},
       {"MIX_ENV", mix_env},
       {"MIX_TARGET", mix_target},
-      {"MIX_WORKSPACE_OPS_PROBE", "1"}
+      {"MIX_WORKSPACE_OPS_PROBE", "1"},
+      {"MIX_WORKSPACE_OPS_PROBE_ROOT", stage.root}
     ]
   end
 
@@ -294,12 +341,13 @@ defmodule MixWorkspaceOps.Project do
     end
   end
 
-  defp parse_metadata([app, version, dependencies]) do
+  defp parse_metadata([app, version, dependencies, dependency_fingerprint]) do
     {:ok,
      %{
        app: if(app == "", do: nil, else: app),
        version: version,
-       dependencies: if(dependencies == "", do: [], else: String.split(dependencies, ","))
+       dependencies: if(dependencies == "", do: [], else: String.split(dependencies, ",")),
+       dependency_fingerprint: dependency_fingerprint
      }}
   end
 

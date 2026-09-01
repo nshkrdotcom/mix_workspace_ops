@@ -8,7 +8,19 @@ defmodule MixWorkspaceOps.OperationPlan do
   rebuilds from the recorded intent and reports named drift.
   """
 
-  alias MixWorkspaceOps.{Binding, Command, DependencyIndex, Git, Project, Registry, Report, Resolution, Selection, StrictJSON}
+  alias MixWorkspaceOps.{
+    Binding,
+    Command,
+    DependencyIndex,
+    Git,
+    Project,
+    Registry,
+    Report,
+    Resolution,
+    Selection,
+    StrictJSON
+  }
+
   alias MixWorkspaceOps.Project.ProbeMemo
 
   @schema "mix_workspace_ops.plan/v2"
@@ -161,6 +173,7 @@ defmodule MixWorkspaceOps.OperationPlan do
         with {:ok, index} <- DependencyIndex.build(registry, index_opts),
              {:ok, selection} <- Selection.affected(registry, index, target) do
           portable_index = DependencyIndex.portable(index)
+
           portable_coverage = %{
             complete: portable_index.complete,
             selected_project_count: length(portable_index.selected_projects),
@@ -243,7 +256,8 @@ defmodule MixWorkspaceOps.OperationPlan do
       else: {:error, :affected_project_outside_view}
   end
 
-  defp selected_projects(registry, %{project: nil}), do: {:ok, Registry.selected_projects(registry)}
+  defp selected_projects(registry, %{project: nil}),
+    do: {:ok, Registry.selected_projects(registry)}
 
   defp selected_projects(registry, %{project: project_id}) do
     project = Registry.project!(registry, project_id)
@@ -648,13 +662,18 @@ defmodule MixWorkspaceOps.OperationPlan do
   defp validate_materialized_set(_set), do: {:error, :invalid_operation_plan_sets}
 
   defp validate_scope(scope) when is_map(scope) do
-    required = ~w(kind requested_target target base_projects selected_projects impact_complete fallback_to_full_scope fallback_reason coverage dependency_index_digest)
+    required =
+      ~w(kind requested_target target base_projects selected_projects impact_complete fallback_to_full_scope fallback_reason coverage dependency_index_digest)
 
     with :ok <- exact_keys(scope, required),
-         true <- scope["kind"] in ~w(affected project selection view) || {:error, :invalid_operation_plan_scope},
+         true <-
+           scope["kind"] in ~w(affected project selection view) ||
+             {:error, :invalid_operation_plan_scope},
          true <- string_list?(scope["base_projects"]) || {:error, :invalid_operation_plan_scope},
-         true <- string_list?(scope["selected_projects"]) || {:error, :invalid_operation_plan_scope},
-         true <- is_boolean(scope["fallback_to_full_scope"]) || {:error, :invalid_operation_plan_scope} do
+         true <-
+           string_list?(scope["selected_projects"]) || {:error, :invalid_operation_plan_scope},
+         true <-
+           is_boolean(scope["fallback_to_full_scope"]) || {:error, :invalid_operation_plan_scope} do
       :ok
     end
   end
@@ -664,17 +683,28 @@ defmodule MixWorkspaceOps.OperationPlan do
   defp validate_dependency_index(nil), do: :ok
 
   defp validate_dependency_index(index) when is_map(index) do
-    required = ~w(mix_env mix_target selected_projects probed_projects absent_projects failed_projects edges complete digest)
+    required =
+      ~w(mix_env mix_target selected_projects probed_projects absent_projects failed_projects edges complete digest)
 
     with :ok <- exact_keys(index, required),
-         true <- is_binary(index["mix_env"]) and is_binary(index["mix_target"]) || {:error, :invalid_operation_plan_dependency_index},
-         true <- string_list?(index["selected_projects"]) || {:error, :invalid_operation_plan_dependency_index},
-         true <- string_list?(index["probed_projects"]) || {:error, :invalid_operation_plan_dependency_index},
-         true <- string_list?(index["absent_projects"]) || {:error, :invalid_operation_plan_dependency_index},
-         true <- is_list(index["failed_projects"]) and is_list(index["edges"]) || {:error, :invalid_operation_plan_dependency_index},
-         true <- is_boolean(index["complete"]) || {:error, :invalid_operation_plan_dependency_index},
-         :ok <- digest_value(index["digest"], :invalid_operation_plan_dependency_index) do
-      :ok
+         true <-
+           (is_binary(index["mix_env"]) and is_binary(index["mix_target"])) ||
+             {:error, :invalid_operation_plan_dependency_index},
+         true <-
+           string_list?(index["selected_projects"]) ||
+             {:error, :invalid_operation_plan_dependency_index},
+         true <-
+           string_list?(index["probed_projects"]) ||
+             {:error, :invalid_operation_plan_dependency_index},
+         true <-
+           string_list?(index["absent_projects"]) ||
+             {:error, :invalid_operation_plan_dependency_index},
+         true <-
+           (is_list(index["failed_projects"]) and is_list(index["edges"])) ||
+             {:error, :invalid_operation_plan_dependency_index},
+         true <-
+           is_boolean(index["complete"]) || {:error, :invalid_operation_plan_dependency_index} do
+      digest_value(index["digest"], :invalid_operation_plan_dependency_index)
     end
   end
 

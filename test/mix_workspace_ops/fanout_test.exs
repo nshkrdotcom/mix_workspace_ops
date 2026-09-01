@@ -190,6 +190,45 @@ defmodule MixWorkspaceOps.FanoutTest do
     assert second_runtime.build_present
   end
 
+  test "separate runs serialize complete commands that share a build context", context do
+    fixture = project_fixture(context)
+    entered = Path.join(fixture.root, "first-entered")
+    critical = Path.join(fixture.root, "critical")
+
+    first_script =
+      ~s|mkdir "#{critical}" && touch "#{entered}" && sleep 2 && rmdir "#{critical}"|
+
+    second_script = ~s|mkdir "#{critical}" && rmdir "#{critical}"|
+
+    assert {:ok, first_plan} =
+             OperationPlan.build(fixture.registry, fixture.view, ["sh", "-c", first_script],
+               project_ids: ["alpha"]
+             )
+
+    assert {:ok, second_plan} =
+             OperationPlan.build(fixture.registry, fixture.view, ["sh", "-c", second_script],
+               project_ids: ["alpha"]
+             )
+
+    first =
+      Task.async(fn ->
+        Fanout.run(first_plan, fixture.registry, state_root: fixture.state_root)
+      end)
+
+    wait_for_file!(entered)
+
+    assert {:ok, second} =
+             Fanout.run(second_plan, fixture.registry, state_root: fixture.state_root)
+
+    assert {:ok, first_report} = Task.await(first, 10_000)
+    assert first_report.status == :passed
+    assert second.status == :passed
+
+    [first_runtime] = first_report.binding.units
+    [second_runtime] = second.binding.units
+    assert first_runtime.runtime.build_path == second_runtime.runtime.build_path
+  end
+
   test "binding records local paths but no removed credential names or values", context do
     fixture = project_fixture(context)
     previous = System.get_env("HEX_API_KEY")
@@ -291,6 +330,19 @@ defmodule MixWorkspaceOps.FanoutTest do
   defp strings(value) when is_list(value), do: Enum.flat_map(value, &strings/1)
   defp strings(value) when is_map(value), do: value |> Map.values() |> Enum.flat_map(&strings/1)
   defp strings(_value), do: []
+
+  defp wait_for_file!(path, attempts \\ 200)
+
+  defp wait_for_file!(path, attempts) when attempts > 0 do
+    if File.exists?(path) do
+      :ok
+    else
+      Process.sleep(25)
+      wait_for_file!(path, attempts - 1)
+    end
+  end
+
+  defp wait_for_file!(path, 0), do: flunk("timed out waiting for #{path}")
 
   defp git!(root, args) do
     {output, 0} = System.cmd("git", args, cd: root, stderr_to_stdout: true)

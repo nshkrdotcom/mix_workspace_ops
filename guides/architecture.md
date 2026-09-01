@@ -93,6 +93,22 @@ The managed repository integration is only the conditional bootstrap load and
 dependency wrapper. The bootstrap parses a generated process-scoped overlay and
 substitutes source options when active.
 
+```elixir
+if bootstrap = System.get_env("MIX_WORKSPACE_OPS_BOOTSTRAP"), do: Code.require_file(bootstrap)
+
+defp deps do
+  [
+    workspace_dep({:example_core, "~> 1.0"})
+  ]
+end
+
+defp workspace_dep(committed) do
+  if function_exported?(MixWorkspaceOpsBootstrap, :dep, 2),
+    do: apply(MixWorkspaceOpsBootstrap, :dep, [committed, __DIR__]),
+    else: committed
+end
+```
+
 MWO does not implement package materialization. Standard Mix/Hex resolves Hex
 dependencies. Git mirrors are only transport rewrites; Mix still creates and owns
 Git dependency checkouts.
@@ -102,10 +118,13 @@ a literal top-level lock map, removes entries for dependencies actively replaced
 by local paths when required by Mix, and computes audit digests. It does not
 interpret/fetch package objects.
 
-If external lockfile redirection requires Mix's non-public post-config facility,
-that dependency is isolated in the bootstrap's single `LockfileCompat` seam and
-must fail clearly if unsupported. No other private Mix/Hex API is part of the
-architecture.
+External lockfile redirection uses Mix's non-public post-config facility. That
+dependency is isolated in the bootstrap's single `LockfileCompat` seam and fails
+clearly if unsupported. Runtime and Git-mirror coordination deliberately use
+Mix's non-public synchronization-lock implementation so MWO and Mix share the
+same proven cross-process locking behavior. These two Mix compatibility surfaces
+must be exercised on every supported Elixir/Mix version. MWO uses no private Hex
+API.
 
 ## Plans and execution
 
@@ -125,6 +144,11 @@ out of order. A failed fan-out still emits the complete known report.
 
 Runtime state is operator-owned and external to managed repositories.
 
+Different build contexts execute concurrently. Operations that share a build
+context hold Mix's cross-process lock for the complete child command, not only
+its compilation step. A concurrent compile therefore cannot replace artifacts
+while another test or run still uses that context.
+
 Dependency context identity includes only compatibility-relevant inputs such as
 Mix env/target, toolchain, private lock identity, and source-resolution identity.
 It excludes absolute checkout roots and ordinary target source HEAD/dirt.
@@ -133,7 +157,10 @@ Build context identity is project-specific and includes the dependency context,
 Mix env/target, and toolchain. It remains stable across normal source edits so
 Mix incremental compilation can do its job.
 
-Per-invocation HOME/config/temp/private-lock/report state remains private.
+Per-invocation HOME/config/private-lock/report state remains private. `TMPDIR`
+is operator-private but shared by managed operations because Mix derives its
+cross-process lock namespace from the system temporary directory; separate
+temporary roots would silently disable coordination for identical paths.
 Credential-free download/archive caches and Git mirrors may be shared. Runtime
 leases prevent GC from deleting live contexts.
 

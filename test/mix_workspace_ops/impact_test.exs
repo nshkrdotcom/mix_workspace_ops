@@ -24,9 +24,15 @@ defmodule MixWorkspaceOps.ImpactTest do
     assert File.dir?(root)
   end
 
-  test "affected selection widens to the complete base scope when coverage is incomplete", context do
+  test "affected selection widens to the complete base scope when coverage is incomplete",
+       context do
     {registry, _root} = registry(context)
-    registry = %{registry | absent_checkouts: %{"leaf" => "/absent/leaf"}, bindings: Map.delete(registry.bindings, "leaf")}
+
+    registry = %{
+      registry
+      | absent_checkouts: %{"leaf" => "/absent/leaf"},
+        bindings: Map.delete(registry.bindings, "leaf")
+    }
 
     reader = fn
       %{id: "middle"}, _opts -> {:ok, ["core"]}

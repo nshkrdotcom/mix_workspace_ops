@@ -18,7 +18,12 @@ defmodule MixWorkspaceOps.CatalogSchemaTest do
       assert Registry.schemas() == ["portfolio_registry.registry/v2"]
 
       legacy = Path.join(root, "legacy.json")
-      File.write!(legacy, :json.encode(%{"schema" => "mix_workspace_ops.registry/v1", "repositories" => []}))
+
+      File.write!(
+        legacy,
+        :json.encode(%{"schema" => "mix_workspace_ops.registry/v1", "repositories" => []})
+      )
+
       assert {:error, :unsupported_registry_schema} = Registry.load(legacy)
     end
 

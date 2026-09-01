@@ -173,10 +173,13 @@ defmodule MixWorkspaceOps.DriftTest do
              absent_catalog: 0,
              discovered: 0,
              dispositioned: 1,
+             errors: 0,
              failed: 0,
              ignored: 0,
+             info: 1,
              not_a_repository: 0,
-             total: 1
+             total: 1,
+             warnings: 0
            }
 
     assert [%{"path" => ^alpha, "source" => "ledger_binding", "status" => "dispositioned"}] =

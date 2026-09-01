@@ -78,28 +78,26 @@ defmodule MixWorkspaceOps.Impact do
         {:error, {:ambiguous_impact_target, target, kinds}}
 
       true ->
-        groups = Enum.group_by(matches, &Enum.sort(&1.seed_projects))
-
-        case Map.to_list(groups) do
-          [{_seeds, equivalent}] ->
-            chosen =
-              Enum.min_by(equivalent, fn match ->
-                case match.kind do
-                  :project -> 0
-                  :application -> 1
-                  :repository -> 2
-                end
-              end)
-
-            aliases = equivalent |> Enum.map(& &1.kind) |> Enum.uniq() |> Enum.sort()
-            {:ok, Map.put(chosen, :matched_kinds, aliases)}
-
-          _different_seed_sets ->
-            kinds = matches |> Enum.map(& &1.kind) |> Enum.sort()
-            {:error, {:ambiguous_impact_target, target, kinds}}
-        end
+        equivalent_seed_target(matches, target)
     end
   end
+
+  defp equivalent_seed_target(matches, target) do
+    case matches |> Enum.group_by(&Enum.sort(&1.seed_projects)) |> Map.values() do
+      [equivalent] ->
+        chosen = Enum.min_by(equivalent, &target_priority(&1.kind))
+        aliases = equivalent |> Enum.map(& &1.kind) |> Enum.uniq() |> Enum.sort()
+        {:ok, Map.put(chosen, :matched_kinds, aliases)}
+
+      _different_seed_sets ->
+        kinds = matches |> Enum.map(& &1.kind) |> Enum.sort()
+        {:error, {:ambiguous_impact_target, target, kinds}}
+    end
+  end
+
+  defp target_priority(:project), do: 0
+  defp target_priority(:application), do: 1
+  defp target_priority(:repository), do: 2
 
   defp maybe_project(matches, registry, target) do
     case Map.fetch(registry.projects, target) do
@@ -138,10 +136,26 @@ defmodule MixWorkspaceOps.Impact do
             [%{kind: :application, id: target, seed_projects: [project_id]} | matches]
 
           {:known_unselected, candidates} ->
-            [%{kind: :application, id: target, ambiguous_providers: candidates, seed_projects: []} | matches]
+            [
+              %{
+                kind: :application,
+                id: target,
+                ambiguous_providers: candidates,
+                seed_projects: []
+              }
+              | matches
+            ]
 
           {:error, {:ambiguous_application, _app, candidates}} ->
-            [%{kind: :application, id: target, ambiguous_providers: candidates, seed_projects: []} | matches]
+            [
+              %{
+                kind: :application,
+                id: target,
+                ambiguous_providers: candidates,
+                seed_projects: []
+              }
+              | matches
+            ]
 
           {:error, _reason} ->
             matches
@@ -169,7 +183,9 @@ defmodule MixWorkspaceOps.Impact do
         end)
       end)
     end)
-    |> Map.new(fn {provider, consumers} -> {provider, consumers |> Enum.uniq() |> Enum.sort()} end)
+    |> Map.new(fn {provider, consumers} ->
+      {provider, consumers |> Enum.uniq() |> Enum.sort()}
+    end)
   end
 
   defp traverse([], _reverse), do: {:error, :impact_target_has_no_projects}

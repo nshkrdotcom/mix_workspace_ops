@@ -14,6 +14,7 @@ defmodule MixWorkspaceOps.ProjectTest do
     assert {:ok, metadata} = Project.metadata_at(repository)
     assert metadata.app == "alpha"
     assert metadata.version == "0.1.0"
+    assert metadata.dependency_fingerprint =~ ~r/^[0-9a-f]{64}$/
   end
 
   test "loads dependency metadata from a non-application umbrella root", context do

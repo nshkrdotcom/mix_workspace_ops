@@ -743,6 +743,56 @@ defmodule MixWorkspaceOps.CLITest do
     assert %{status: :absent} = Enum.find(plan.units, &(&1.id == "missing"))
   end
 
+  test "affected plan replay refuses dependency-index and scope drift", context do
+    %{root: root, catalog: catalog, view: view} = affected_workspace!(context)
+    plan_path = Path.join(root, "affected-plan.json")
+
+    assert {:ok, _plan} =
+             CLI.dispatch([
+               "plan",
+               "--affected",
+               "core",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--view",
+               view,
+               "--output",
+               plan_path,
+               "--",
+               "true"
+             ])
+
+    alpha = Path.join(root, "alpha")
+
+    File.write!(Path.join(alpha, "mix.exs"), """
+    defmodule Alpha.MixProject do
+      use Mix.Project
+      def project, do: [app: :alpha, version: "0.1.0", deps: []]
+    end
+    """)
+
+    {_, 0} = System.cmd("git", ["add", "mix.exs"], cd: alpha)
+    {_, 0} = System.cmd("git", ["commit", "--quiet", "-m", "remove dependency"], cd: alpha)
+
+    assert {:error, {:plan_drift, drifts}} =
+             CLI.dispatch([
+               "run",
+               "--plan",
+               plan_path,
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--view",
+               view
+             ])
+
+    assert Enum.any?(drifts, &(&1.field == :dependency_index))
+    assert Enum.any?(drifts, &(&1.field == :scope))
+  end
+
   test "affected scope requires a view and conflicts with an explicit project" do
     assert CLI.dispatch(["plan", "--affected", "core", "--", "true"]) ==
              {:usage_error, "--affected requires --view PATH"}
@@ -789,6 +839,7 @@ defmodule MixWorkspaceOps.CLITest do
     assert use_report.path == expected_preferences
 
     decoded = expected_preferences |> File.read!() |> :json.decode()
+
     assert decoded == %{
              "schema" => "mix_workspace_ops.source_preferences/v1",
              "projects" => %{"alpha" => %{"core" => "git"}}
@@ -838,17 +889,21 @@ defmodule MixWorkspaceOps.CLITest do
     assert [%{application: "core", source: "local"}] = sources.sources
   end
 
-  test "use stores only XDG source preferences and leaves the consumer checkout unchanged", context do
+  test "use stores only XDG source preferences and leaves the consumer checkout unchanged",
+       context do
     %{root: root, catalog: catalog} = sibling_workspace!(context)
     xdg = Path.join(root, "xdg-config")
     previous = System.get_env("XDG_CONFIG_HOME")
     System.put_env("XDG_CONFIG_HOME", xdg)
 
     on_exit(fn ->
-      if previous, do: System.put_env("XDG_CONFIG_HOME", previous), else: System.delete_env("XDG_CONFIG_HOME")
+      if previous,
+        do: System.put_env("XDG_CONFIG_HOME", previous),
+        else: System.delete_env("XDG_CONFIG_HOME")
     end)
 
-    {before_status, 0} = System.cmd("git", ["status", "--porcelain"], cd: Path.join(root, "alpha"))
+    {before_status, 0} =
+      System.cmd("git", ["status", "--porcelain"], cd: Path.join(root, "alpha"))
 
     assert {:ok, report} =
              CLI.dispatch([
@@ -865,7 +920,7 @@ defmodule MixWorkspaceOps.CLITest do
 
     assert report.path == SourcePreferences.default_path()
     assert {:ok, preferences} = SourcePreferences.load(report.path)
-    assert SourcePreferences.get(preferences, "alpha", "core") == "local"
+    assert SourcePreferences.project(preferences, "alpha")["core"] == "local"
 
     {after_status, 0} = System.cmd("git", ["status", "--porcelain"], cd: Path.join(root, "alpha"))
     assert after_status == before_status
@@ -878,7 +933,9 @@ defmodule MixWorkspaceOps.CLITest do
     System.put_env("XDG_CONFIG_HOME", xdg)
 
     on_exit(fn ->
-      if previous, do: System.put_env("XDG_CONFIG_HOME", previous), else: System.delete_env("XDG_CONFIG_HOME")
+      if previous,
+        do: System.put_env("XDG_CONFIG_HOME", previous),
+        else: System.delete_env("XDG_CONFIG_HOME")
     end)
 
     assert {:error, {:undeclared_source_preference, "alpha", "unknown_app"}} =

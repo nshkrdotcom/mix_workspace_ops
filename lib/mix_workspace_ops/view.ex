@@ -58,9 +58,6 @@ defmodule MixWorkspaceOps.View do
   @spec schema() :: String.t()
   def schema, do: @v2
 
-  @spec schemas() :: [String.t()]
-  def schemas, do: [@v2]
-
   @spec load(String.t()) :: {:ok, t()} | {:error, term()}
   def load(path) do
     path = Path.expand(path)

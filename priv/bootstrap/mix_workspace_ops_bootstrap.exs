@@ -206,7 +206,7 @@ defmodule MixWorkspaceOpsBootstrap do
   def install_project_options! do
     case System.get_env(@lockfile_env) do
       value when value in [nil, ""] -> :ok
-      path -> path |> validate_lockfile!() |> LockfileCompat.install!()
+      path -> path |> validate_lockfile!() |> __MODULE__.LockfileCompat.install!()
     end
   end
 
@@ -374,7 +374,9 @@ defmodule MixWorkspaceOpsBootstrap do
   end
 
   defp absolute_overlay_path!(path) do
-    absolute_path!(@overlay_env, path)
+    if Path.type(path) == :absolute,
+      do: path,
+      else: raise("#{@overlay_env} must contain an absolute path")
   end
 
   defp validate_overlay_path!(path) do
@@ -613,7 +615,7 @@ defmodule MixWorkspaceOpsBootstrap do
   end
 end
 
-MixWorkspaceOpsBootstrap.install_project_options!()
+if Process.whereis(Mix.ProjectStack), do: MixWorkspaceOpsBootstrap.install_project_options!()
 
 # The Mix task the file this seam replaces defined, at zero cost in repository
 # files: this bootstrap is already loaded into the Mix process by path, so the

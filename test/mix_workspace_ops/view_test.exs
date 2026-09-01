@@ -20,12 +20,17 @@ defmodule MixWorkspaceOps.ViewTest do
     assert {:ok, [%{id: "alpha"}]} = View.select(registry, view)
 
     legacy = Path.join(root, "legacy-view.json")
-    File.write!(legacy, :json.encode(%{
-      "schema" => "mix_workspace_ops.view/v1",
-      "id" => "legacy",
-      "description" => "unsupported",
-      "selector" => %{}
-    }))
+
+    File.write!(
+      legacy,
+      :json.encode(%{
+        "schema" => "mix_workspace_ops.view/v1",
+        "id" => "legacy",
+        "description" => "unsupported",
+        "selector" => %{}
+      })
+    )
+
     assert {:error, :unsupported_view_schema} = View.load(legacy)
   end
 end

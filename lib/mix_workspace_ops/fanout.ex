@@ -534,13 +534,17 @@ defmodule MixWorkspaceOps.Fanout do
   end
 
   defp execute_continue(bound, execution) do
-    commands = Enum.map(bound, & &1.blitz)
-
     results =
-      case Blitz.run(commands, blitz_options(execution)) do
-        {:ok, passed} -> passed
-        {:error, %Blitz.Error{results: all}} -> all
-      end
+      bound
+      |> Task.async_stream(&execute_item(&1, execution),
+        max_concurrency: execution.max_concurrency,
+        ordered: true,
+        timeout: :infinity
+      )
+      |> Enum.map(fn
+        {:ok, result} -> result
+        {:exit, reason} -> exit({:operation_task_exit, reason})
+      end)
 
     {MapSet.new(Enum.map(bound, & &1.id)), results}
   end
@@ -548,10 +552,19 @@ defmodule MixWorkspaceOps.Fanout do
   defp execute_fail_fast(bound, execution) do
     Enum.reduce_while(bound, {MapSet.new(), []}, fn item, {launched, results} ->
       launched = MapSet.put(launched, item.id)
+      result = execute_item(item, execution)
 
+      if Blitz.Result.failed?(result),
+        do: {:halt, {launched, results ++ [result]}},
+        else: {:cont, {launched, results ++ [result]}}
+    end)
+  end
+
+  defp execute_item(item, execution) do
+    Runtime.with_operation_lock(item.activation.runtime_handle, fn ->
       case Blitz.run([item.blitz], blitz_options(execution)) do
-        {:ok, [result]} -> {:cont, {launched, results ++ [result]}}
-        {:error, %Blitz.Error{results: [result]}} -> {:halt, {launched, results ++ [result]}}
+        {:ok, [result]} -> result
+        {:error, %Blitz.Error{results: [result]}} -> result
       end
     end)
   end

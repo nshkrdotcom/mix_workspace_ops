@@ -1041,11 +1041,15 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
+  defp use_preference(_registry, _project, clear?, positional),
+    do: {:usage_error, "invalid use arguments with clear=#{clear?}: #{inspect(positional)}"}
+
   defp validate_source_preference(registry, project, application, mode) do
     with {:ok, declaration} <- declared_source_row(registry, project, application),
          source = SourcePreferences.resolution_mode(mode),
-         true <- eligible_preference_source?(registry, application, declaration, source) ||
-                   {:error, {:ineligible_source_preference, project, application, mode}} do
+         true <-
+           eligible_preference_source?(registry, application, declaration, source) ||
+             {:error, {:ineligible_source_preference, project, application, mode}} do
       :ok
     end
   end
@@ -1076,9 +1080,6 @@ defmodule MixWorkspaceOps.CLI do
       {:ok, Map.fetch!(paths, :source_preferences)}
     end
   end
-
-  defp use_preference(_registry, _project, clear?, positional),
-    do: {:usage_error, "invalid use arguments with clear=#{clear?}: #{inspect(positional)}"}
 
   defp source_name("local"), do: {:ok, "local"}
   defp source_name("git"), do: {:ok, "github"}

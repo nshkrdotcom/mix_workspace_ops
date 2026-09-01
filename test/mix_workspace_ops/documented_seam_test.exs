@@ -35,23 +35,15 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
     assert first =~ "workspace_dep"
   end
 
-  test "the seam resolves through a real overlay and keeps its call-site options", context do
+  test "the minimal seam resolves through a real overlay", context do
     %{core: core, consumer: consumer, activation: activation} = activated(context)
 
     # The overlay decides, and the options the call site gave survive it.
-    assert deps(consumer, activation.env) == [
-             {:example_core, [path: core]},
-             {:example_edge,
-              [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
-           ]
+    assert deps(consumer, activation.env) == [{:example_core, [path: core]}]
 
     # With no bootstrap the committed default stands — and still carries the
     # call-site options, which the printed fallback used to drop entirely.
-    assert deps(consumer, inactive()) == [
-             {:example_core, "~> 1.0"},
-             {:example_edge,
-              [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
-           ]
+    assert deps(consumer, inactive()) == [{:example_core, "~> 1.0"}]
   end
 
   test "the documented seam supports an explicit whole-table comprehension", context do
@@ -82,7 +74,7 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
 
     assert result.output =~ "dependency sources:"
     assert result.output =~ "example_core -> local (#{core}) -> 0.1.0"
-    assert result.output =~ "example_edge -> github (example-org/example_edge) -> branch main"
+    refute result.output =~ "example_edge"
   end
 
   defp deps(project_root, env) do

@@ -260,7 +260,8 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
   end
 
   defp release_topology(
-         %{plan: %{registry: %Registry{} = registry, release_prerequisites: prerequisites}} = context,
+         %{plan: %{registry: %Registry{} = registry, release_prerequisites: prerequisites}} =
+           context,
          project
        )
        when is_map(prerequisites) do

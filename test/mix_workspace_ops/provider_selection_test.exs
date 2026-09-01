@@ -551,7 +551,8 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
     fn project -> {:ok, if(project.id == "alpha", do: ["shared"], else: [])} end
   end
 
-  test "a v1 document refuses two projects providing one application", context do
+  test "a v2 document permits multiple providers and leaves an unresolved choice visible",
+       context do
     root = temporary_directory!(context)
 
     path =
@@ -560,10 +561,15 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
         repository("beta", [project("beta"), project("beta.shared", "shared")])
       ])
 
-    assert {:error, {:duplicate_entries, "application", ["shared"]}} = Registry.load(path)
+    assert {:ok, registry} = Registry.load(path)
+
+    assert {:error, {:ambiguous_application, "shared", candidates}} =
+             Registry.resolve_dependency(registry, "shared")
+
+    assert Enum.map(candidates, & &1.project) == ["alpha.shared", "beta.shared"]
   end
 
-  test "a v1 document with one provider per application still loads", context do
+  test "a v2 document with one provider per application resolves directly", context do
     root = temporary_directory!(context)
 
     registry =

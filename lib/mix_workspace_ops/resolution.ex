@@ -726,9 +726,17 @@ defmodule MixWorkspaceOps.Resolution do
 
       true ->
         case availability(registry, app, declaration, source, opts) do
-          :available -> {:ok, {source, reason, chosen(source)}}
-          {:error, error} -> {:error, error}
-          outcome -> {:error, {:unavailable_source, app, source, {reason, outcome}}}
+          :available ->
+            {:ok, {source, reason, chosen(source)}}
+
+          {:known_unselected, project} ->
+            {:error, {:known_unselected_local, app, [project.id]}}
+
+          {:error, error} ->
+            {:error, error}
+
+          outcome ->
+            {:error, {:unavailable_source, app, source, {reason, outcome}}}
         end
     end
   end
@@ -765,10 +773,18 @@ defmodule MixWorkspaceOps.Resolution do
 
   defp preferences(project_id, opts) do
     case Keyword.fetch(opts, :preferences) do
-      {:ok, preferences} when is_map(preferences) -> normalize_preferences(preferences)
-      {:ok, other} -> {:error, {:invalid_source_preferences, other}}
+      {:ok, preferences} when is_map(preferences) ->
+        normalize_preferences(preferences)
+
+      {:ok, other} ->
+        {:error, {:invalid_source_preferences, other}}
+
       :error ->
-        with {:ok, paths} <- OperatorPaths.resolve(%{source_preferences: Keyword.get(opts, :source_preferences)}, [:source_preferences]),
+        with {:ok, paths} <-
+               OperatorPaths.resolve(
+                 %{source_preferences: Keyword.get(opts, :source_preferences)},
+                 [:source_preferences]
+               ),
              path <- Map.get(paths, :source_preferences, SourcePreferences.default_path()),
              {:ok, all} <- SourcePreferences.load(path) do
           all |> SourcePreferences.project(project_id) |> normalize_preferences()
@@ -795,12 +811,7 @@ defmodule MixWorkspaceOps.Resolution do
 
       {:ok, preferences} when is_map(preferences) ->
         preferences
-        |> Enum.reduce_while({:ok, %{}}, fn {app, source}, {:ok, acc} ->
-          case normalize_decide_preference(source) do
-            {:ok, normalized} -> {:cont, {:ok, Map.put(acc, app, normalized)}}
-            {:error, reason} -> {:halt, {:error, {:source_preference, app, reason}}}
-          end
-        end)
+        |> Enum.reduce_while({:ok, %{}}, &normalize_decide_preference_entry/2)
         |> case do
           {:ok, normalized} -> {:ok, Keyword.put(opts, :preferences, normalized)}
           error -> error
@@ -808,6 +819,13 @@ defmodule MixWorkspaceOps.Resolution do
 
       {:ok, other} ->
         {:error, {:invalid_source_preferences, other}}
+    end
+  end
+
+  defp normalize_decide_preference_entry({app, source}, {:ok, preferences}) do
+    case normalize_decide_preference(source) do
+      {:ok, normalized} -> {:cont, {:ok, Map.put(preferences, app, normalized)}}
+      {:error, reason} -> {:halt, {:error, {:source_preference, app, reason}}}
     end
   end
 
@@ -857,7 +875,7 @@ defmodule MixWorkspaceOps.Resolution do
   defp availability(registry, app, declaration, @local, opts) do
     case local_source(registry, app, declaration, opts) do
       {:ok, _path, _provider} -> :available
-      {:known_unselected, _project} -> :known_unselected
+      {:known_unselected, project} -> {:known_unselected, project}
       {:error, error} -> {:error, error}
       outcome -> outcome
     end
@@ -1190,6 +1208,8 @@ defmodule MixWorkspaceOps.Resolution do
     unavailable =
       Enum.flat_map(errors, fn
         {:unavailable_source, app, ^mode, :run_mode} -> [app]
+        {:unavailable_source, app, ^mode, {:run_mode, _detail}} -> [app]
+        {:ineligible_source, app, ^mode, :run_mode} -> [app]
         _other -> []
       end)
 

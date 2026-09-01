@@ -37,12 +37,7 @@ defmodule MixWorkspaceOps.Lockfile do
       with {:ok, _lock} <- parse_map(bytes), do: {:ok, bytes}
     else
       with {:ok, lock} <- parse_map(bytes) do
-        projected =
-          Map.reject(lock, fn {application, _entry} ->
-            MapSet.member?(dropped, to_string(application))
-          end)
-
-        {:ok, render(projected)}
+        {:ok, project_lock(lock, dropped)}
       end
     end
   end
@@ -54,7 +49,7 @@ defmodule MixWorkspaceOps.Lockfile do
   @spec digest(binary()) :: {:ok, String.t()} | {:error, term()}
   def digest(bytes) when is_binary(bytes) do
     with {:ok, _lock} <- parse_map(bytes) do
-      {:ok, bytes |> :crypto.hash(:sha256) |> Base.encode16(case: :lower)}
+      {:ok, :sha256 |> :crypto.hash(bytes) |> Base.encode16(case: :lower)}
     end
   end
 
@@ -69,9 +64,15 @@ defmodule MixWorkspaceOps.Lockfile do
     ) <> "\n"
   end
 
-  defp line_number(metadata) when is_list(metadata), do: Keyword.get(metadata, :line)
-  defp line_number(line) when is_integer(line), do: line
-  defp line_number(_metadata), do: nil
+  defp project_lock(lock, dropped) do
+    lock
+    |> Map.reject(fn {application, _entry} ->
+      MapSet.member?(dropped, to_string(application))
+    end)
+    |> render()
+  end
+
+  defp line_number(metadata), do: Keyword.get(metadata, :line)
 
   defp literal(value)
        when is_atom(value) or is_binary(value) or is_integer(value) or is_float(value),

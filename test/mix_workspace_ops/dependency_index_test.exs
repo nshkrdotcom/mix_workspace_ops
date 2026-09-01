@@ -5,12 +5,15 @@ defmodule MixWorkspaceOps.DependencyIndexTest do
 
   test "dependency truth comes from Mix dependency reader, never registry source rows", context do
     root = temporary_directory!(context)
-    for id <- ~w(core consumer), do: File.mkdir_p!(Path.join(root, id))
+    for id <- ~w(core consumer declared_but_unused), do: File.mkdir_p!(Path.join(root, id))
 
     registry =
       root
       |> write_catalog!([
         catalog_repository("core", projects: [catalog_project("core")]),
+        catalog_repository("declared_but_unused",
+          projects: [catalog_project("declared_but_unused")]
+        ),
         catalog_repository("consumer",
           projects: [catalog_project("consumer")],
           dependency_sources: %{
@@ -20,7 +23,16 @@ defmodule MixWorkspaceOps.DependencyIndexTest do
         )
       ])
       |> Registry.load!()
-      |> then(&%{&1 | bindings: %{"core" => Path.join(root, "core"), "consumer" => Path.join(root, "consumer")}})
+      |> then(
+        &%{
+          &1
+          | bindings: %{
+              "core" => Path.join(root, "core"),
+              "consumer" => Path.join(root, "consumer"),
+              "declared_but_unused" => Path.join(root, "declared_but_unused")
+            }
+        }
+      )
 
     reader = fn
       %{id: "consumer"}, _opts -> {:ok, ["core", "external_dep"]}
@@ -50,10 +62,18 @@ defmodule MixWorkspaceOps.DependencyIndexTest do
         catalog_repository("consumer", projects: [catalog_project("consumer")])
       ])
       |> Registry.load!()
-      |> then(&%{&1 | bindings: %{"consumer" => Path.join(root, "consumer")}, absent_checkouts: %{"core" => Path.join(root, "core")}})
+      |> then(
+        &%{
+          &1
+          | bindings: %{"consumer" => Path.join(root, "consumer")},
+            absent_checkouts: %{"core" => Path.join(root, "core")}
+        }
+      )
 
     assert {:ok, index} =
-             DependencyIndex.build(registry, dependency_reader: fn _project, _opts -> {:ok, []} end)
+             DependencyIndex.build(registry,
+               dependency_reader: fn _project, _opts -> {:ok, []} end
+             )
 
     refute index.complete
     assert index.absent_projects == ["core"]

@@ -66,11 +66,15 @@ defmodule MixWorkspaceOps.DependencyIndex do
           excluded_projects: excluded,
           edges: edges,
           external_dependencies:
-            for(edge <- edges, edge.classification == :external,
+            for(
+              edge <- edges,
+              edge.classification == :external,
               do: %{consumer: edge.consumer, application: edge.application}
             ),
           known_unselected:
-            for(edge <- edges, edge.classification == :known_unselected,
+            for(
+              edge <- edges,
+              edge.classification == :known_unselected,
               do: %{
                 consumer: edge.consumer,
                 application: edge.application,
@@ -85,10 +89,7 @@ defmodule MixWorkspaceOps.DependencyIndex do
     end
   end
 
-  @doc "Classifies one dependency application observed by Mix for one consumer."
-  @spec classify_dependency(Registry.t(), Registry.project(), String.t()) ::
-          {:ok, edge()} | {:error, term()}
-  def classify_dependency(registry, project, application) do
+  defp classify_dependency(registry, project, application) do
     provider = Registry.declared_provider(registry, project, application)
 
     case Registry.resolve_dependency(registry, application, provider, project.repository) do
@@ -152,33 +153,40 @@ defmodule MixWorkspaceOps.DependencyIndex do
         })
 
       {:bound, _root} ->
-        case read_dependencies(registry, project, opts) do
-          {:ok, dependencies} ->
-            case classify_all(registry, project, dependencies) do
-              {:ok, edges} ->
-                scan_projects(registry, rest, opts, %{
-                  state
-                  | probed: [project.id | state.probed],
-                    edges: edges ++ state.edges
-                })
+        scan_bound_project(registry, project, rest, opts, state)
+    end
+  end
 
-              {:error, reason} ->
-                # Provider ambiguity is a dependency-fact failure. Keep the index
-                # inspectable/incomplete so affected execution can conservatively
-                # widen instead of under-testing.
-                scan_projects(registry, rest, opts, %{
-                  state
-                  | probed: [project.id | state.probed],
-                    failed: [%{project: project.id, reason: reason} | state.failed]
-                })
-            end
+  defp scan_bound_project(registry, project, rest, opts, state) do
+    case read_dependencies(registry, project, opts) do
+      {:ok, dependencies} ->
+        record_dependencies(registry, project, dependencies, rest, opts, state)
 
-          {:error, reason} ->
-            scan_projects(registry, rest, opts, %{
-              state
-              | failed: [%{project: project.id, reason: reason} | state.failed]
-            })
-        end
+      {:error, reason} ->
+        scan_projects(registry, rest, opts, %{
+          state
+          | failed: [%{project: project.id, reason: reason} | state.failed]
+        })
+    end
+  end
+
+  defp record_dependencies(registry, project, dependencies, rest, opts, state) do
+    case classify_all(registry, project, dependencies) do
+      {:ok, edges} ->
+        scan_projects(registry, rest, opts, %{
+          state
+          | probed: [project.id | state.probed],
+            edges: edges ++ state.edges
+        })
+
+      {:error, reason} ->
+        # Provider ambiguity is a dependency-fact failure. Keep the index
+        # inspectable/incomplete so affected execution widens instead of under-testing.
+        scan_projects(registry, rest, opts, %{
+          state
+          | probed: [project.id | state.probed],
+            failed: [%{project: project.id, reason: reason} | state.failed]
+        })
     end
   end
 

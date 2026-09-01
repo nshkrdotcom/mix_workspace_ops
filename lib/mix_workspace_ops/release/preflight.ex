@@ -38,10 +38,12 @@ defmodule MixWorkspaceOps.Release.Preflight do
     with {:ok, consumer} <- provider(registry, package),
          {:ok, metadata} <- read_metadata(project_root, probe_opts, opts),
          true <- metadata.app == package || {:error, {:wrong_package, metadata.app}},
-         {:ok, classified} <- classify_publish_dependencies(registry, consumer, metadata.dependencies),
+         {:ok, classified} <-
+           classify_publish_dependencies(registry, consumer, metadata.dependencies),
          declared <- prerequisite_closure(prerequisites, package),
          report <- topology_report(package, classified, declared),
-         true <- report.missing_prerequisites == [] || {:error, {:release_topology_mismatch, report}} do
+         true <-
+           report.missing_prerequisites == [] || {:error, {:release_topology_mismatch, report}} do
       {:ok, report}
     else
       {:error, _reason} = error -> error
@@ -61,32 +63,10 @@ defmodule MixWorkspaceOps.Release.Preflight do
     |> Enum.map(&to_string/1)
     |> Enum.uniq()
     |> Enum.sort()
-    |> Enum.reduce_while({:ok, %{observed: [], ignored: []}}, fn app, {:ok, acc} ->
-      provider_hint = Registry.declared_provider(registry, consumer, app)
-
-      case Registry.resolve_dependency(registry, app, provider_hint, consumer.repository) do
-        {:ok, provider_project} ->
-          case publish_dependency(registry, consumer, app, provider_project, train) do
-            {:required, row} ->
-              {:cont, {:ok, %{acc | observed: [row | acc.observed]}}}
-
-            {:ignored, row} ->
-              {:cont, {:ok, %{acc | ignored: [row | acc.ignored]}}}
-
-            {:error, reason} ->
-              {:halt, {:error, reason}}
-          end
-
-        {:known_unselected, project_ids} ->
-          {:halt, {:error, {:release_dependency_unselected, app, project_ids}}}
-
-        {:error, reason} ->
-          {:halt, {:error, {:release_dependency_provider, app, reason}}}
-
-        :unknown ->
-          {:cont, {:ok, acc}}
-      end
-    end)
+    |> Enum.reduce_while(
+      {:ok, %{observed: [], ignored: []}},
+      &classify_publish_dependency(registry, consumer, train, &1, &2)
+    )
     |> case do
       {:ok, result} ->
         {:ok,
@@ -100,19 +80,45 @@ defmodule MixWorkspaceOps.Release.Preflight do
     end
   end
 
+  defp classify_publish_dependency(registry, consumer, train, app, {:ok, acc}) do
+    provider_hint = Registry.declared_provider(registry, consumer, app)
+
+    case Registry.resolve_dependency(registry, app, provider_hint, consumer.repository) do
+      {:ok, provider_project} ->
+        registry
+        |> publish_dependency(consumer, app, provider_project, train)
+        |> record_publish_dependency(acc)
+
+      {:known_unselected, project_ids} ->
+        {:halt, {:error, {:release_dependency_unselected, app, project_ids}}}
+
+      {:error, reason} ->
+        {:halt, {:error, {:release_dependency_provider, app, reason}}}
+
+      :unknown ->
+        {:cont, {:ok, acc}}
+    end
+  end
+
+  defp record_publish_dependency({:required, row}, acc),
+    do: {:cont, {:ok, %{acc | observed: [row | acc.observed]}}}
+
+  defp record_publish_dependency({:ignored, row}, acc),
+    do: {:cont, {:ok, %{acc | ignored: [row | acc.ignored]}}}
+
+  defp record_publish_dependency({:error, reason}, _acc), do: {:halt, {:error, reason}}
+
   defp publish_dependency(registry, consumer, app, provider_project, train) do
     packages = publish_packages_for_provider(registry, provider_project, train)
     declaration = Map.get(Registry.dependency_sources(registry, consumer), app)
 
     cond do
       packages == [] ->
-        {:ignored,
-         dependency_row(app, provider_project, nil, :provider_not_in_release_train)}
+        {:ignored, dependency_row(app, provider_project, nil, :provider_not_in_release_train)}
 
       declaration && not Source.reaches_while_publishing?(declaration, "hex") ->
         with {:ok, package} <- publish_package(app, packages) do
-          {:ignored,
-           dependency_row(app, provider_project, package, :non_hex_publish_strategy)}
+          {:ignored, dependency_row(app, provider_project, package, :non_hex_publish_strategy)}
         end
 
       true ->
@@ -173,20 +179,25 @@ defmodule MixWorkspaceOps.Release.Preflight do
   end
 
   defp prerequisite_closure(prerequisites, package) do
-    walk_prerequisites(prerequisites, [package], MapSet.new())
-    |> MapSet.delete(package)
-    |> MapSet.to_list()
+    walk_prerequisites(prerequisites, [package], %{})
+    |> Map.delete(package)
+    |> Map.keys()
     |> Enum.sort()
   end
 
   defp walk_prerequisites(_prerequisites, [], seen), do: seen
 
   defp walk_prerequisites(prerequisites, [package | rest], seen) do
-    if MapSet.member?(seen, package) do
+    if Map.has_key?(seen, package) do
       walk_prerequisites(prerequisites, rest, seen)
     else
       direct = Map.get(prerequisites, package, Map.get(prerequisites, to_string(package), []))
-      walk_prerequisites(prerequisites, Enum.map(direct, &to_string/1) ++ rest, MapSet.put(seen, package))
+
+      walk_prerequisites(
+        prerequisites,
+        Enum.map(direct, &to_string/1) ++ rest,
+        Map.put(seen, package, true)
+      )
     end
   end
 

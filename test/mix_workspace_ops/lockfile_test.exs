@@ -15,7 +15,7 @@ defmodule MixWorkspaceOps.LockfileTest do
     assert Map.has_key?(lock, :beta)
 
     assert {:error, {:lock_literal, _expression}} =
-             Lockfile.parse_map("%{alpha: System.cmd(\"sh\", [\"-c\", \"false\"])}\n")
+             Lockfile.parse_map(~S|%{alpha: System.cmd("sh", ["-c", "false"])}| <> "\n")
   end
 
   test "projects only named top-level path applications" do

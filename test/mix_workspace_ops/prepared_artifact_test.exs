@@ -59,7 +59,6 @@ defmodule MixWorkspaceOps.PreparedArtifactTest do
     }}
     """)
 
-    assert {:error, {:prepared_artifact, ^path, :invalid}} = PreparedArtifact.load(path)
+    assert {:error, :invalid_prepared_artifact_handoff} = PreparedArtifact.load(path)
   end
-
 end

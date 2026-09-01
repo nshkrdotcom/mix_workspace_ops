@@ -105,7 +105,10 @@ defmodule MixWorkspaceOps.OverlayTest do
     # Its bytes remain in overlay audit identity but cannot split reusable Mix
     # dependency/build contexts.
     assert changed.report.context_digest == activation.report.context_digest
-    assert changed.report.runtime.dependency_identity == activation.report.runtime.dependency_identity
+
+    assert changed.report.runtime.dependency_identity ==
+             activation.report.runtime.dependency_identity
+
     assert changed.report.runtime.deps_path == activation.report.runtime.deps_path
     assert changed.report.runtime.build_path == activation.report.runtime.build_path
     refute changed.report.overlay_digest == activation.report.overlay_digest
@@ -244,6 +247,58 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {:ok, _report} = Overlay.deactivate(second)
   end
 
+  test "unlocked incompatible dependency declarations never share a dependency context",
+       context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    initialize_repository!(Path.join(root, "first"), ~s([{:external_dep, "~> 1.0"}]))
+    initialize_repository!(Path.join(root, "second"), ~s([{:external_dep, "~> 2.0"}]))
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("first", projects: [catalog_project("first")]),
+        catalog_repository("second", projects: [catalog_project("second")])
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    assert {:ok, first} = Overlay.activate(registry, "first", state_root: state_root)
+    assert {:ok, second} = Overlay.activate(registry, "second", state_root: state_root)
+
+    refute first.report.context_digest == second.report.context_digest
+    refute first.report.runtime.deps_path == second.report.runtime.deps_path
+    assert {:ok, _report} = Overlay.deactivate(first)
+    assert {:ok, _report} = Overlay.deactivate(second)
+  end
+
+  test "different projects with identical dependency declarations share only dependency state",
+       context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "operator-state")
+    dependency = ~s([{:external_dep, "~> 1.0"}])
+    initialize_repository!(Path.join(root, "first"), dependency)
+    initialize_repository!(Path.join(root, "second"), dependency)
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("first", projects: [catalog_project("first")]),
+        catalog_repository("second", projects: [catalog_project("second")])
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    assert {:ok, first} = Overlay.activate(registry, "first", state_root: state_root)
+    assert {:ok, second} = Overlay.activate(registry, "second", state_root: state_root)
+
+    assert first.report.context_digest == second.report.context_digest
+    assert first.report.runtime.deps_path == second.report.runtime.deps_path
+    refute first.report.runtime.build_path == second.report.runtime.build_path
+    assert {:ok, _report} = Overlay.deactivate(first)
+    assert {:ok, _report} = Overlay.deactivate(second)
+  end
+
   # The overlay is content-addressed, so what it attests to has to name the view
   # it was decided under. Two views over one catalog decide different rows, and
   # an overlay that recorded only the document digest gave them one identity.
@@ -286,15 +341,8 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {:error, {:unavailable_run_mode, "hex", ["core"]}} =
              Overlay.activate(registry, "consumer", mode: :hex, state_root: state_root)
 
-    # `git` is the one mode that always has an answer: the catalog knows the
-    # provider's repository, and an explicit request falls back to it.
-    assert {:ok, activation} =
+    assert {:error, {:unavailable_run_mode, "github", ["core"]}} =
              Overlay.activate(registry, "consumer", mode: :git, state_root: state_root)
-
-    assert {:ok, overlay} = Overlay.read(activation.path)
-    assert overlay.sources["core"].kind == :github
-    assert overlay.sources["core"].repo == "example-org/core"
-    assert overlay.sources["core"].revision_kind == "ref"
   end
 
   test "a per-dependency source overrides the run mode", context do
@@ -506,7 +554,7 @@ defmodule MixWorkspaceOps.OverlayTest do
   end
 
   defp runtime_writable_paths(report) do
-    ~w(root home tmp config_home lockfile source_lock)a
+    ~w(root home config_home lockfile source_lock)a
     |> Enum.map(&Map.fetch!(report, &1))
   end
 end

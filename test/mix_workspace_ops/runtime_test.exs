@@ -32,6 +32,7 @@ defmodule MixWorkspaceOps.RuntimeTest do
     assert first.report.xdg_cache_home == second.report.xdg_cache_home
     assert first.report.mix_home == second.report.mix_home
     assert first.report.rebar_cache == second.report.rebar_cache
+    assert first.report.tmp == second.report.tmp
 
     first_paths = transient_paths(first.report)
     second_paths = transient_paths(second.report)
@@ -141,6 +142,7 @@ defmodule MixWorkspaceOps.RuntimeTest do
     state_root = temporary_directory!(context)
 
     assert {:ok, base} = Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts())
+
     assert {:ok, moved} =
              Runtime.prepare(
                state_root,
@@ -153,9 +155,15 @@ defmodule MixWorkspaceOps.RuntimeTest do
              Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts(mix_env: "test"))
 
     assert {:ok, other_target} =
-             Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts(mix_target: "other"))
+             Runtime.prepare(
+               state_root,
+               @cache_identity,
+               @lock,
+               runtime_opts(mix_target: "other")
+             )
 
     changed_lock = String.replace(@lock, "1.0.0", "2.0.0")
+
     assert {:ok, changed_deps} =
              Runtime.prepare(state_root, @cache_identity, changed_lock, runtime_opts())
 
@@ -167,6 +175,30 @@ defmodule MixWorkspaceOps.RuntimeTest do
     assert test_env.report.deps_path != base.report.deps_path
     assert other_target.report.deps_path != base.report.deps_path
     assert changed_deps.report.deps_path != base.report.deps_path
+  end
+
+  test "projects may share dependency state but never build state", context do
+    state_root = temporary_directory!(context)
+
+    assert {:ok, first} =
+             Runtime.prepare(
+               state_root,
+               @cache_identity,
+               @lock,
+               runtime_opts(project_identity: "first")
+             )
+
+    assert {:ok, second} =
+             Runtime.prepare(
+               state_root,
+               @cache_identity,
+               @lock,
+               runtime_opts(project_identity: "second")
+             )
+
+    on_exit(fn -> Enum.each([first, second], &finish_and_release(&1.handle)) end)
+    assert first.report.deps_path == second.report.deps_path
+    refute first.report.build_path == second.report.build_path
   end
 
   test "ordinary runtime state hides inherited publication capability", context do
@@ -373,7 +405,7 @@ defmodule MixWorkspaceOps.RuntimeTest do
   end
 
   defp transient_paths(report) do
-    ~w(root home tmp config_home lockfile source_lock)a
+    ~w(root home config_home lockfile source_lock)a
     |> Enum.map(&Map.fetch!(report, &1))
   end
 

@@ -15,7 +15,7 @@ defmodule MixWorkspaceOps.SourcePreferences do
   @project_identifier ~r/^[a-z][a-z0-9_.-]*$/
   @application_identifier ~r/^[a-z][a-z0-9_]*$/
 
-  @type mode :: "local" | "git" | "hex"
+  @type mode :: String.t()
   @type t :: %{String.t() => %{String.t() => mode()}}
 
   @spec schema() :: String.t()
@@ -38,9 +38,8 @@ defmodule MixWorkspaceOps.SourcePreferences do
       {:ok, %{type: :regular} = stat} ->
         with :ok <- bounded(path, stat),
              {:ok, bytes} <- File.read(path),
-             {:ok, decoded} <- StrictJSON.decode(bytes, maximum_bytes: @maximum_bytes),
-             {:ok, projects} <- validate_document(path, decoded) do
-          {:ok, projects}
+             {:ok, decoded} <- StrictJSON.decode(bytes, maximum_bytes: @maximum_bytes) do
+          validate_document(path, decoded)
         end
 
       {:ok, %{type: type}} ->
@@ -54,10 +53,6 @@ defmodule MixWorkspaceOps.SourcePreferences do
   @spec project(t(), String.t()) :: %{String.t() => mode()}
   def project(preferences, project_id) when is_map(preferences) and is_binary(project_id),
     do: Map.get(preferences, project_id, %{})
-
-  @spec get(t(), String.t(), String.t()) :: mode() | nil
-  def get(preferences, project_id, application),
-    do: preferences |> project(project_id) |> Map.get(application)
 
   @spec put(String.t(), String.t(), String.t(), String.t()) ::
           {:ok, String.t()} | {:error, term()}
@@ -86,14 +81,8 @@ defmodule MixWorkspaceOps.SourcePreferences do
          {:ok, preferences} <- load(path) do
       updated =
         case application do
-          nil ->
-            Map.delete(preferences, project_id)
-
-          app ->
-            case Map.get(preferences, project_id) do
-              nil -> preferences
-              project -> put_project(preferences, project_id, Map.delete(project, app))
-            end
+          nil -> Map.delete(preferences, project_id)
+          app -> clear_application(preferences, project_id, app)
         end
 
       write(path, updated)
@@ -114,7 +103,6 @@ defmodule MixWorkspaceOps.SourcePreferences do
 
   defp bounded(_path, %{type: :regular, size: size}) when size <= @maximum_bytes, do: :ok
   defp bounded(path, %{type: :regular}), do: {:error, {:source_preferences_too_large, path}}
-  defp bounded(path, %{type: type}), do: {:error, {:source_preferences_not_regular, path, type}}
 
   defp validate_document(path, %{"schema" => @schema, "projects" => projects} = document)
        when map_size(document) == 2 and is_map(projects) do
@@ -129,7 +117,8 @@ defmodule MixWorkspaceOps.SourcePreferences do
   defp validate_projects(path, projects) do
     Enum.reduce_while(projects, {:ok, %{}}, fn {project_id, dependencies}, {:ok, acc} ->
       with :ok <- identifier(:project, project_id),
-           true <- is_map(dependencies) || {:error, {:invalid_source_preferences_project, project_id}},
+           true <-
+             is_map(dependencies) || {:error, {:invalid_source_preferences_project, project_id}},
            {:ok, normalized} <- validate_dependencies(project_id, dependencies) do
         {:cont, {:ok, Map.put(acc, project_id, normalized)}}
       else
@@ -145,7 +134,8 @@ defmodule MixWorkspaceOps.SourcePreferences do
            true <- source in @modes || {:error, {:invalid_source_preference_mode, source}} do
         {:cont, {:ok, Map.put(acc, application, source)}}
       else
-        {:error, reason} -> {:halt, {:error, {:invalid_source_preference, project_id, application, reason}}}
+        {:error, reason} ->
+          {:halt, {:error, {:invalid_source_preference, project_id, application, reason}}}
       end
     end)
   end
@@ -169,7 +159,15 @@ defmodule MixWorkspaceOps.SourcePreferences do
   defp put_project(preferences, project_id, project) when map_size(project) == 0,
     do: Map.delete(preferences, project_id)
 
-  defp put_project(preferences, project_id, project), do: Map.put(preferences, project_id, project)
+  defp put_project(preferences, project_id, project),
+    do: Map.put(preferences, project_id, project)
+
+  defp clear_application(preferences, project_id, application) do
+    case Map.fetch(preferences, project_id) do
+      :error -> preferences
+      {:ok, project} -> put_project(preferences, project_id, Map.delete(project, application))
+    end
+  end
 
   defp write(path, preferences) do
     directory = Path.dirname(path)
@@ -191,15 +189,13 @@ defmodule MixWorkspaceOps.SourcePreferences do
   end
 
   defp write_sync(io, bytes) do
-    result = IO.binwrite(io, bytes)
-    sync_result = if result == :ok, do: :file.sync(io), else: result
+    :ok = IO.binwrite(io, bytes)
+    sync_result = :file.sync(io)
     close_result = File.close(io)
 
-    cond do
-      result != :ok -> result
-      sync_result != :ok -> sync_result
-      close_result != :ok -> close_result
-      true -> :ok
+    case sync_result do
+      :ok -> close_result
+      {:error, _reason} = error -> error
     end
   end
 

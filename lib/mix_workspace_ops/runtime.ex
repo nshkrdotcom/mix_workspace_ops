@@ -5,8 +5,12 @@ defmodule MixWorkspaceOps.Runtime do
   Large writable state is addressed by exact context rather than invocation:
   dependency sources have one stable external path and a project build has one
   stable external path. Mix supplies the cross-process locks for those exact
-  paths. Each activation allocates only private home, configuration, temporary,
-  lock-audit and report state.
+  paths. All managed operations use one operator-private temporary root so
+  Mix's lock files share a namespace; each activation still allocates private
+  home, configuration, lock-audit and report state. Fanout also holds a lock for
+  the complete child command when the build context is shared, because a Mix
+  compilation lock alone ends before a long-running test or run finishes using
+  those artifacts.
   """
 
   alias Mix.Sync.Lock, as: SyncLock
@@ -130,9 +134,11 @@ defmodule MixWorkspaceOps.Runtime do
 
     with :ok <- valid_ownership(ownership),
          :ok <- valid_identity(:cache_identity, cache_identity),
-         {:ok, execution_inputs} <- execution_inputs(Keyword.put_new(opts, :project_identity, cache_identity)),
+         {:ok, execution_inputs} <-
+           execution_inputs(Keyword.put_new(opts, :project_identity, cache_identity)),
          {:ok, operational_lock} <- operational_lock(lock_bytes, opts),
-         dependency_identity <- dependency_identity(cache_identity, operational_lock, execution_inputs),
+         dependency_identity <-
+           dependency_identity(cache_identity, operational_lock, execution_inputs),
          execution_identity <- execution_identity(dependency_identity, execution_inputs),
          :ok <- ensure_state_root(state_root),
          {:ok, root, run_id} <- create_run_root(state_root, execution_identity),
@@ -195,6 +201,12 @@ defmodule MixWorkspaceOps.Runtime do
       {:error, :enoent} -> :ok
       {:error, reason} -> {:error, {:runtime_lease_release, reason}}
     end
+  end
+
+  @doc "Runs one complete operation under Mix's lock for the stable build context."
+  @spec with_operation_lock(t(), (-> result)) :: result when result: term()
+  def with_operation_lock(%__MODULE__{} = handle, operation) when is_function(operation, 0) do
+    SyncLock.with_lock(operation_lock(handle), operation)
   end
 
   @doc "Lists every durable run and whether its lease is currently live."
@@ -332,20 +344,26 @@ defmodule MixWorkspaceOps.Runtime do
   defp execution_inputs(opts) do
     keys = [:target_head, :target_source_digest, :mix_env, :mix_target, :binding_root]
 
-    with {:ok, inputs} <-
-           Enum.reduce_while(keys, {:ok, %{}}, fn key, {:ok, acc} ->
-             case runtime_input(opts, key) do
-               {:ok, value} -> {:cont, {:ok, Map.put(acc, key, value)}}
-               {:error, _reason} = error -> {:halt, error}
-             end
-           end) do
-      project_identity = Keyword.get(opts, :project_identity)
-
-      if is_binary(project_identity) and project_identity != "",
-        do: {:ok, Map.put(inputs, :project_identity, project_identity)},
-        else: {:error, {:invalid_runtime_input, :project_identity, project_identity}}
+    with {:ok, inputs} <- collect_runtime_inputs(opts, keys) do
+      put_project_identity(inputs, Keyword.get(opts, :project_identity))
     end
   end
+
+  defp collect_runtime_inputs(opts, keys) do
+    Enum.reduce_while(keys, {:ok, %{}}, fn key, {:ok, acc} ->
+      case runtime_input(opts, key) do
+        {:ok, value} -> {:cont, {:ok, Map.put(acc, key, value)}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp put_project_identity(inputs, project_identity)
+       when is_binary(project_identity) and project_identity != "",
+       do: {:ok, Map.put(inputs, :project_identity, project_identity)}
+
+  defp put_project_identity(_inputs, project_identity),
+    do: {:error, {:invalid_runtime_input, :project_identity, project_identity}}
 
   defp runtime_input(opts, key) do
     case Keyword.fetch(opts, key) do
@@ -491,7 +509,7 @@ defmodule MixWorkspaceOps.Runtime do
 
     %{
       home: Path.join(handle.root, "home"),
-      tmp: Path.join(handle.root, "tmp"),
+      tmp: Path.join([handle.state_root, "cache", "tmp"]),
       config: Path.join(handle.root, "config"),
       mix_exs: Path.join(handle.root, "mix.exs"),
       xdg_cache: Path.join([handle.state_root, "cache", "xdg"]),
@@ -1013,7 +1031,11 @@ defmodule MixWorkspaceOps.Runtime do
 
     with {:ok, metadata} <- read_metadata(metadata_path),
          true <-
-           metadata["schema"] in [@runtime_schema, "mix_workspace_ops.runtime/v3", "mix_workspace_ops.runtime/v2"] ||
+           metadata["schema"] in [
+             @runtime_schema,
+             "mix_workspace_ops.runtime/v3",
+             "mix_workspace_ops.runtime/v2"
+           ] ||
              {:error, {:runtime_schema, metadata_path}},
          {:ok, lease} <- lease_status(Path.join(root, "lease.json")) do
       {:ok,
@@ -1266,6 +1288,11 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   defp context_lock(path), do: "mix_workspace_ops:context:" <> Path.expand(path)
+
+  defp operation_lock(handle) do
+    "mix_workspace_ops:operation:" <>
+      Path.join(Path.expand(handle.state_root), handle.execution_identity)
+  end
 
   defp lock_digest(bytes) do
     case Lockfile.digest(bytes) do

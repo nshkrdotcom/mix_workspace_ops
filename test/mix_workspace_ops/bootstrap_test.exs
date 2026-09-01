@@ -565,5 +565,4 @@ defmodule MixWorkspaceOps.BootstrapTest do
     File.write!(path, contents)
     path
   end
-
 end

@@ -511,7 +511,8 @@ defmodule MixWorkspaceOps.ResolutionTest do
       assert decision.reason == :source_preference
     end
 
-    test "resolve loads XDG SourcePreferences and never reads managed-repository override files", context do
+    test "resolve loads XDG SourcePreferences and never reads managed-repository override files",
+         context do
       root = temporary_directory!(context)
       initialize_repository!(Path.join(root, "core"))
       initialize_repository!(Path.join(root, "consumer"))
@@ -567,10 +568,12 @@ defmodule MixWorkspaceOps.ResolutionTest do
       root = temporary_directory!(context)
       initialize_repository!(Path.join(root, "core"))
       initialize_repository!(Path.join(root, "consumer"))
+
       declaration = %{
         "github" => %{"repo" => "example-org/core", "branch" => "stable"},
         "hex" => "~> 1.0"
       }
+
       registry = registry(root, declaration)
 
       assert {:ok, decision} =
@@ -722,7 +725,7 @@ defmodule MixWorkspaceOps.ResolutionTest do
            "hex (the declaration carries no hex requirement). " <>
            "Add a valid `hex` requirement for weld, or remove hex from its order."},
         {{:unavailable_source, "weld", "github", :run_mode},
-         "--mode asked for github for weld, and there is nothing to build it from. " <>
+         "--mode asked for github for weld, and it is unavailable. " <>
            "Add `github: %{}` for weld, or choose a catalogued provider."},
         {{:unavailable_run_mode, "github", ["blitz", "weld"]},
          "--mode git cannot serve blitz, weld. Add that source to each named declaration, " <>

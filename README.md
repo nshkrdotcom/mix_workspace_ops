@@ -264,11 +264,18 @@ Blitz owns bounded concurrency. Continue-on-failure is the default and
 `--fail-fast` is explicit. Structured run output preserves deterministic logical
 unit order and records passed, failed, absent, and not-run outcomes.
 
+Different build contexts execute concurrently. When separate operations select
+the same build context, MWO holds Mix's cross-process lock for the complete child
+command. This prevents a later compile from replacing artifacts while an earlier
+test or run is still using them; the waiting operation then reuses the completed
+work.
+
 MWO keeps generated state outside managed repositories:
 
 - stable external dependency contexts;
 - project-specific stable external build contexts;
-- invocation-private HOME/config/temp/report/lease state;
+- one operator-private temporary root so Mix processes share their lock namespace;
+- invocation-private HOME/config/report/lease state;
 - a private operational `mix.lock` copy;
 - content-addressed source overlays/bootstrap state;
 - credential-free shared Hex/Rebar/archive caches;
