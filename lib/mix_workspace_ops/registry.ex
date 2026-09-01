@@ -9,9 +9,8 @@ defmodule MixWorkspaceOps.Registry do
   Mix. Mix data is an optional per-repository block, so a repository with no Mix
   project is still catalogued, grouped, and selectable.
 
-  Two schemas load. `portfolio_registry.registry/v2` is current;
-  `mix_workspace_ops.registry/v1` still loads and is normalized onto the same
-  records.
+  `portfolio_registry.registry/v2` is the only supported portable registry
+  schema.
 
   ## Selection sits beside the catalog, not in place of it
 

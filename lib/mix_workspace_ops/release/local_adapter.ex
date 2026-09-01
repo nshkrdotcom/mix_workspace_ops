@@ -259,6 +259,16 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
       else: {:error, :active_workspace_state}
   end
 
+  defp release_topology(
+         %{plan: %{registry: %Registry{} = registry, release_prerequisites: prerequisites}} = context,
+         project
+       )
+       when is_map(prerequisites) do
+    Preflight.verify_topology(registry, context.plan.package, project, prerequisites)
+  end
+
+  defp release_topology(_context, _project), do: {:ok, %{}}
+
   defp dependency_preflight(%{plan: %{registry: %Registry{} = registry}} = context, dependencies) do
     lookup = Map.get(context.plan, :registry_lookup, &HexRegistry.lookup/2)
 
@@ -311,7 +321,19 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
   end
 
   defp checkout_project(%{plan: %{prepared_artifact: nil}} = context, checkout) do
-    {:ok, %{project: Path.expand(context.plan.project_path, checkout)}}
+    project = Path.expand(context.plan.project_path, checkout)
+
+    with {:ok, metadata} <- Project.metadata_at(project),
+         true <- metadata.app == context.plan.package || {:error, {:wrong_package, metadata.app}},
+         true <-
+           metadata.version == context.plan.version ||
+             {:error, {:wrong_version, metadata.version}},
+         {:ok, topology} <- release_topology(context, project) do
+      {:ok, %{project: project, release_topology: topology}}
+    else
+      {:error, reason} -> {:error, reason}
+      value -> {:error, {:checkout_package_mismatch, value}}
+    end
   end
 
   defp checkout_project(%{plan: %{prepared_artifact: prepared}} = context, checkout)
@@ -328,7 +350,8 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
          true <-
            metadata.version == context.plan.version ||
              {:error, {:wrong_version, metadata.version}},
-         {:ok, dependencies} <- dependency_preflight(context, metadata.dependencies) do
+         {:ok, dependencies} <- dependency_preflight(context, metadata.dependencies),
+         {:ok, topology} <- release_topology(context, paths.project) do
       {:ok,
        %{
          project: paths.project,
@@ -339,7 +362,8 @@ defmodule MixWorkspaceOps.Release.LocalAdapter do
          project_sha256: prepared_field(rebuilt, :project_sha256),
          source_revision: prepared_field(rebuilt, :source_revision),
          prepared_artifact: rebuilt,
-         dependency_preflight: dependencies
+         dependency_preflight: dependencies,
+         release_topology: topology
        }}
     else
       {:error, reason} -> {:error, reason}

@@ -66,7 +66,7 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {"MIX_WORKSPACE_OPS_LOCKFILE", activation.report.runtime.lockfile} in activation.env
   end
 
-  test "a local overlay never prepares the committed Hex object", context do
+  test "a local path overlay leaves ordinary Hex materialization to Mix", context do
     root = temporary_directory!(context)
     state_root = Path.join(root, "operator-state")
     initialize_repository!(Path.join(root, "core"))
@@ -85,9 +85,30 @@ defmodule MixWorkspaceOps.OverlayTest do
                prepare_objects: true
              )
 
-    assert activation.report.runtime.cache_objects.hex == []
-    assert activation.report.runtime.cache_objects.git == []
-    refute File.exists?(Path.join([state_root, "cache", "hex", "objects", checksum]))
+    assert activation.report.runtime.cache_objects == %{git: []}
+    refute File.exists?(Path.join([state_root, "cache", "hex", "objects"]))
+
+    changed_checksum = String.duplicate("e", 64)
+
+    File.write!(
+      Path.join(consumer, "mix.lock"),
+      ~s|%{"core" => {:hex, :core, "9.9.9", "#{changed_checksum}", [:mix], [], "hexpm", "#{changed_checksum}"}}\n|
+    )
+
+    assert {:ok, changed} =
+             Overlay.activate(registry(root), "consumer",
+               state_root: state_root,
+               prepare_objects: true
+             )
+
+    # The stale source lock row is projected out when `core` is a local path.
+    # Its bytes remain in overlay audit identity but cannot split reusable Mix
+    # dependency/build contexts.
+    assert changed.report.context_digest == activation.report.context_digest
+    assert changed.report.runtime.dependency_identity == activation.report.runtime.dependency_identity
+    assert changed.report.runtime.deps_path == activation.report.runtime.deps_path
+    assert changed.report.runtime.build_path == activation.report.runtime.build_path
+    refute changed.report.overlay_digest == activation.report.overlay_digest
   end
 
   test "semantic context is independent of checkout paths", context do
@@ -146,10 +167,10 @@ defmodule MixWorkspaceOps.OverlayTest do
     File.write!(Path.join(root, "core/uncommitted.txt"), "changed source\n")
     assert {:ok, dirty} = Overlay.activate(registry, "consumer", state_root: state_root)
     refute dirty.path == first.path
-    refute dirty.report.context_digest == first.report.context_digest
-    refute dirty.report.runtime.deps_path == first.report.runtime.deps_path
-    refute dirty.report.runtime.build_path == first.report.runtime.build_path
-    assert dirty.report.runtime.cache_objects == %{git: [], hex: []}
+    assert dirty.report.context_digest == first.report.context_digest
+    assert dirty.report.runtime.deps_path == first.report.runtime.deps_path
+    assert dirty.report.runtime.build_path == first.report.runtime.build_path
+    assert dirty.report.runtime.cache_objects == %{git: []}
 
     assert {:ok, git} = Overlay.activate(registry, "consumer", mode: :git, state_root: state_root)
     refute git.path == first.path
@@ -166,7 +187,7 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert hex_overlay.sources["core"] == %{kind: :hex, requirement: "~> 1.0", opts: []}
   end
 
-  test "target commits change execution identity but not semantic cache identity", context do
+  test "target commits preserve dependency and build context identity", context do
     root = temporary_directory!(context)
     state_root = Path.join(root, "operator-state")
     initialize_repository!(Path.join(root, "core"))
@@ -184,7 +205,8 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert {:ok, second} = Overlay.activate(registry, "consumer", state_root: state_root)
 
     assert first.report.runtime.cache_identity == second.report.runtime.cache_identity
-    refute first.report.runtime.execution_identity == second.report.runtime.execution_identity
+    assert first.report.runtime.dependency_identity == second.report.runtime.dependency_identity
+    assert first.report.runtime.execution_identity == second.report.runtime.execution_identity
     refute first.report.runtime.root == second.report.runtime.root
     assert {:ok, _report} = Overlay.deactivate(first)
     assert {:ok, _report} = Overlay.deactivate(second)
@@ -246,10 +268,12 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert selected.selection_digest == Registry.selection_digest(narrowed)
     assert viewed.report.selection_digest == selected.selection_digest
 
-    # Same catalog, same rows, different view: two identities, not one.
+    # The overlay attests to the view and therefore has different content, but
+    # the reusable Mix context is identical because the actual source semantics
+    # for this project did not change.
     assert Map.keys(unselected.sources) == Map.keys(selected.sources)
     refute whole.path == viewed.path
-    refute whole.report.context_digest == viewed.report.context_digest
+    assert whole.report.context_digest == viewed.report.context_digest
   end
 
   test "a mode naming a source the catalog cannot reach is a typed error", context do

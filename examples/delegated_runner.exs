@@ -3,17 +3,13 @@ defmodule MixWorkspaceOps.Examples.DelegatedRunner do
 
   def main([project, state_root, executable | arguments]) do
     context = System.fetch_env!("MIX_WORKSPACE_OPS_CONTEXT_DIGEST")
-    command_digest = digest([context, project, executable | arguments])
-    receipt = Path.join([state_root, "receipts", command_digest])
+    receipt = Path.join([state_root, "contexts", context])
+    reused? = File.regular?(receipt)
 
-    if File.regular?(receipt) do
-      IO.puts("REUSED #{command_digest}")
-    else
-      run!(project, executable, arguments)
-      File.mkdir_p!(Path.dirname(receipt))
-      File.write!(receipt, "ok\n", [:sync])
-      IO.puts("EXECUTED #{command_digest}")
-    end
+    run!(project, executable, arguments)
+    File.mkdir_p!(Path.dirname(receipt))
+    File.write!(receipt, "seen\n", [:sync])
+    IO.puts(if(reused?, do: "REUSED_CONTEXT #{context}", else: "NEW_CONTEXT #{context}"))
   end
 
   def main(_arguments) do
@@ -31,12 +27,7 @@ defmodule MixWorkspaceOps.Examples.DelegatedRunner do
     end
   end
 
-  defp digest(parts) do
-    parts
-    |> Enum.map_join("\0", &to_string/1)
-    |> then(&:crypto.hash(:sha256, &1))
-    |> Base.encode16(case: :lower)
-  end
+
 end
 
 MixWorkspaceOps.Examples.DelegatedRunner.main(System.argv())

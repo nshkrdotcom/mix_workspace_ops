@@ -36,22 +36,22 @@ defmodule MixWorkspaceOps.Resolution do
   not provide the application. Both say the catalog cannot answer, and answering
   from GitHub instead would answer a question nobody asked.
 
-  ## Overrides
+  ## Operator and command source choices
 
-  An operator switching sources while working needs a gesture, not a config
-  edit. Three exist, and they are tried in this order:
+  An operator switching sources while working needs a gesture, not a repository
+  edit. Command-local choices take precedence over persistent operator state:
 
     1. `:sources` — one application, for this run.
-    2. the operator's `.dependency_sources.local.exs` `source:` — one
-       application, kept across runs.
-    3. `:mode` — the whole closure, for this run.
+    2. `:mode` — the whole closure, for this run.
+    3. XDG `SourcePreferences` — one consumer/application choice, kept across
+       runs.
 
-  All three name a source outright and bypass the declared order entirely; a
+  All three name an eligible declared source outright and bypass the automatic
+  order; a
   source that cannot be built from is a typed error rather than a silent
-  fall-through, because an operator who named a source meant it. The override
-  file also replaces the derived local path, replaces the published
-  requirement, and merges GitHub coordinates, so a checkout outside the
-  conventional root is reachable without touching the catalog.
+  fall-through, because an operator who named a source meant it. Preferences
+  never carry arbitrary checkout paths, Hex requirements, or Git coordinates.
+  Those facts remain owned by verified bindings and the portable registry.
 
   Publishing takes precedence over every other rule. A publishing command
   resolves through `publish_order`, which is `hex` alone unless a declaration
@@ -88,18 +88,12 @@ defmodule MixWorkspaceOps.Resolution do
   disagreement is visible rather than silently resolved.
   """
 
-  alias MixWorkspaceOps.{Git, Graph, LocalOverrides, MixInputs, Project, Registry}
+  alias MixWorkspaceOps.{Graph, MixInputs, OperatorPaths, Project, Registry, SourcePreferences}
   alias MixWorkspaceOps.Registry.Source
 
   @local "local"
   @github "github"
   @hex "hex"
-
-  # The two gestures in which an operator names a source outright for a whole
-  # run or for one dependency. Both override the declaration's intent, which is
-  # what makes falling back to catalogued identity right for them and wrong for
-  # an order walk.
-  @explicit_gestures [:run_mode, :dependency_override]
 
   # The Mix option keys the catalog carries, converted through a fixed table so
   # no catalog content can name an option key that does not already exist.
@@ -130,7 +124,7 @@ defmodule MixWorkspaceOps.Resolution do
           direct_dependencies: [String.t()],
           closure: Graph.resolution(),
           decisions: [decision()],
-          overrides: %{String.t() => LocalOverrides.override()},
+          preferences: %{String.t() => String.t()},
           publish?: boolean(),
           mode: String.t() | nil,
           mix_env: String.t(),
@@ -158,16 +152,13 @@ defmodule MixWorkspaceOps.Resolution do
 
   `:closure` supplies an already-computed `MixWorkspaceOps.Graph` resolution;
   without it the closure is derived here. `:consumer_root` is the Mix project
-  root of the project doing the resolving and defaults to the target's own —
-  its repository checkout joined to its path inside it, which for a project at
-  the repository root is the same directory. The override file is read from
-  there and the Mix `deps/` test is relative to it, because both are facts about
-  the directory a Mix command actually runs in, and ten of the live installs
-  this replaces sit in subprojects. `:publish?` says the command about to
-  run publishes, and defaults to false. `:mode` overrides the source for the
-  whole closure, `:sources` overrides one application, and `:overrides` carries
-  the parsed override file; without `:overrides` the file is read from
-  `:consumer_root`.
+  root of the project doing the resolving and defaults to the target's own; the
+  Mix `deps/` sibling test is relative to it. `:publish?` says the command about
+  to run publishes, and defaults to false. `:mode` overrides the source for the
+  whole closure, `:sources` overrides one application, and `:preferences`
+  supplies an already-loaded project preference map. Without `:preferences`,
+  the project's XDG SourcePreferences are loaded from `:source_preferences` or
+  their conventional default path.
   """
   @spec resolve(Registry.t(), String.t() | atom(), keyword()) ::
           {:ok, report()} | {:error, term()}
@@ -181,11 +172,11 @@ defmodule MixWorkspaceOps.Resolution do
          :ok <- one_identity_per_application(closure),
          {:ok, direct_dependencies} <- direct_dependencies(registry, target, opts),
          {:ok, consumer_root} <- consumer_root(registry, target, opts),
-         {:ok, overrides} <- overrides(consumer_root, opts),
+         {:ok, preferences} <- preferences(target, opts),
          opts =
            opts
            |> Keyword.put(:consumer_root, consumer_root)
-           |> Keyword.put(:overrides, overrides),
+           |> Keyword.put(:preferences, preferences),
          {:ok, decisions} <- decide_all(registry, target, closure, opts) do
       {:ok,
        %{
@@ -194,7 +185,7 @@ defmodule MixWorkspaceOps.Resolution do
          direct_dependencies: direct_dependencies,
          closure: closure,
          decisions: decisions,
-         overrides: overrides,
+         preferences: preferences,
          publish?: Keyword.get(opts, :publish?, false),
          mode: Keyword.get(opts, :mode),
          mix_env: inputs.mix_env,
@@ -212,7 +203,8 @@ defmodule MixWorkspaceOps.Resolution do
   @spec decide(Registry.t(), String.t(), Source.t(), keyword()) ::
           {:ok, decision()} | {:error, term()}
   def decide(registry, app, declaration, opts \\ []) do
-    with {:ok, {source, reason, considered}} <- select(registry, app, declaration, opts) do
+    with {:ok, opts} <- normalize_decide_preferences(opts),
+         {:ok, {source, reason, considered}} <- select(registry, app, declaration, opts) do
       build(registry, app, declaration, source, reason, considered, opts)
     end
   end
@@ -406,8 +398,15 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   def explain({:unavailable_source, app, source, reason}) do
-    "#{gesture(reason)} asked for #{source} for #{app}, and there is nothing to build it from. " <>
-      source_remedy(app, source)
+    {origin, detail} = source_failure_reason(reason)
+
+    "#{gesture(origin)} asked for #{source} for #{app}, and it is unavailable" <>
+      availability_detail(detail) <> ". " <> source_remedy(app, source)
+  end
+
+  def explain({:ineligible_source, app, source, reason}) do
+    "#{gesture(reason)} asked for #{source} for #{app}, but that source is not an eligible " <>
+      "candidate in the registry declaration. Change the declaration or choose an eligible source."
   end
 
   def explain({:unavailable_run_mode, mode, applications}) do
@@ -418,11 +417,6 @@ defmodule MixWorkspaceOps.Resolution do
   def explain({:unknown_source, app, source, reason}) do
     "#{gesture(reason)} asked for #{inspect(source)} for #{app}, which is not a source. " <>
       "Choose local, git, or hex."
-  end
-
-  def explain({:unpublishable_local_override, app, requested}) do
-    "publish mode follows the declared publish order; " <>
-      "the local override for #{app} requests :#{requested}."
   end
 
   def explain({:unpublishable_source_override, app, requested}) do
@@ -457,11 +451,6 @@ defmodule MixWorkspaceOps.Resolution do
 
   def explain({:unknown_repository, repository}) do
     "the catalog carries no repository #{repository}."
-  end
-
-  def explain({:override_path_without_consumer_root, app}) do
-    "the override for #{app} names a path and nothing said which project is resolving, " <>
-      "so there is nothing to expand it against."
   end
 
   def explain({:local_committed_default, app}) do
@@ -547,9 +536,15 @@ defmodule MixWorkspaceOps.Resolution do
 
   defp gesture(:run_mode), do: "--mode"
   defp gesture(:dependency_override), do: "--source"
-  defp gesture(:local_override), do: "the override file"
+  defp gesture(:source_preference), do: "the persisted source preference"
   defp gesture(:publish), do: "the declared publish order"
   defp gesture(_order), do: "the declared order"
+
+  defp source_failure_reason({origin, detail}) when is_atom(origin), do: {origin, detail}
+  defp source_failure_reason(origin), do: {origin, nil}
+
+  defp availability_detail(nil), do: ""
+  defp availability_detail(detail), do: " (#{outcome_reason(detail)})"
 
   # `git` is what the command line calls the source the catalog calls `github`.
   defp run_mode(@github), do: "--mode git"
@@ -578,7 +573,7 @@ defmodule MixWorkspaceOps.Resolution do
     with target_project <- Registry.project!(registry, target),
          {:ok, declaration} <- fetch_declaration(registry, target, application),
          {:ok, root} <- target_root(registry, target),
-         {:ok, overrides} <- overrides(root, opts),
+         {:ok, preferences} <- preferences(target, opts),
          {:ok, decision} <-
            decide(
              registry,
@@ -587,7 +582,7 @@ defmodule MixWorkspaceOps.Resolution do
              Keyword.merge(opts,
                consumer_root: root,
                consumer_repository: target_project.repository,
-               overrides: overrides
+               preferences: preferences
              )
            ) do
       candidates = Registry.providers(registry, application)
@@ -602,6 +597,9 @@ defmodule MixWorkspaceOps.Resolution do
          location: decision.location,
          provider: decision.provider_project_id,
          identity_rule: rule,
+         operator_preference: Map.get(preferences, application),
+         command_source: opts |> Keyword.get(:sources, %{}) |> Map.get(application),
+         command_mode: Keyword.get(opts, :mode),
          considered: decision.considered,
          change: change_gesture(application, decision, rule),
          report: format_why(application, decision, rule, candidates)
@@ -694,39 +692,62 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   defp select(registry, app, declaration, opts) do
-    override = override(opts, app)
     requested = opts |> Keyword.get(:sources, %{}) |> Map.get(app)
     mode = Keyword.get(opts, :mode)
+    preferred = preference(opts, app)
 
     cond do
       Keyword.get(opts, :publish?, false) ->
-        with :ok <- publishable(app, override, requested, mode) do
+        with :ok <- publishable(app, requested, mode) do
           from_order(registry, app, declaration, declaration.publish_order, :publish, opts)
         end
 
       not is_nil(requested) ->
-        {:ok, {requested, :dependency_override, chosen(requested)}}
-
-      not is_nil(override.source) ->
-        {:ok, {override.source, :local_override, chosen(override.source)}}
+        explicit(registry, app, declaration, requested, :dependency_override, opts)
 
       not is_nil(mode) ->
-        {:ok, {mode, :run_mode, chosen(mode)}}
+        explicit(registry, app, declaration, mode, :run_mode, opts)
+
+      not is_nil(preferred) ->
+        explicit(registry, app, declaration, preferred, :source_preference, opts)
 
       true ->
         from_order(registry, app, declaration, declaration.order, :order, opts)
     end
   end
 
+  defp explicit(registry, app, declaration, source, reason, opts) do
+    cond do
+      source not in sources() ->
+        {:error, {:unknown_source, app, source, reason}}
+
+      not eligible_source?(declaration, source) ->
+        {:error, {:ineligible_source, app, source, reason}}
+
+      true ->
+        case availability(registry, app, declaration, source, opts) do
+          :available -> {:ok, {source, reason, chosen(source)}}
+          {:error, error} -> {:error, error}
+          outcome -> {:error, {:unavailable_source, app, source, {reason, outcome}}}
+        end
+    end
+  end
+
+  defp eligible_source?(declaration, @local), do: @local in declaration.order
+
+  defp eligible_source?(declaration, @github),
+    do: @github in declaration.order and not is_nil(declaration.github)
+
+  defp eligible_source?(declaration, @hex),
+    do: @hex in declaration.order and not is_nil(declaration.hex)
+
+  defp eligible_source?(_declaration, _source), do: false
+
   # Publishing refuses an override that would resolve to a non-Hex source, and
   # names which of the three gestures asked for it. A configured
   # `publish_order` is not an override and is never refused here.
-  defp publishable(app, override, requested, mode) do
+  defp publishable(app, requested, mode) do
     cond do
-      not is_nil(override.source) and override.source != @hex ->
-        {:error,
-         {:unpublishable_local_override, app, override.requested_source || override.source}}
-
       not is_nil(requested) and requested != @hex ->
         {:error, {:unpublishable_source_override, app, requested}}
 
@@ -738,14 +759,63 @@ defmodule MixWorkspaceOps.Resolution do
     end
   end
 
-  defp override(opts, app) do
-    opts |> Keyword.get(:overrides, %{}) |> Map.get(app, LocalOverrides.empty())
+  defp preference(opts, app) do
+    opts |> Keyword.get(:preferences, %{}) |> Map.get(app)
   end
 
-  defp overrides(consumer_root, opts) do
-    case Keyword.fetch(opts, :overrides) do
-      {:ok, overrides} -> {:ok, overrides}
-      :error -> LocalOverrides.load(consumer_root)
+  defp preferences(project_id, opts) do
+    case Keyword.fetch(opts, :preferences) do
+      {:ok, preferences} when is_map(preferences) -> normalize_preferences(preferences)
+      {:ok, other} -> {:error, {:invalid_source_preferences, other}}
+      :error ->
+        with {:ok, paths} <- OperatorPaths.resolve(%{source_preferences: Keyword.get(opts, :source_preferences)}, [:source_preferences]),
+             path <- Map.get(paths, :source_preferences, SourcePreferences.default_path()),
+             {:ok, all} <- SourcePreferences.load(path) do
+          all |> SourcePreferences.project(project_id) |> normalize_preferences()
+        end
+    end
+  end
+
+  defp normalize_preferences(preferences) do
+    Enum.reduce_while(preferences, {:ok, %{}}, fn {app, source}, {:ok, acc} ->
+      case SourcePreferences.normalize_mode(source) do
+        {:ok, mode} ->
+          {:cont, {:ok, Map.put(acc, app, SourcePreferences.resolution_mode(mode))}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:source_preference, app, reason}}}
+      end
+    end)
+  end
+
+  defp normalize_decide_preferences(opts) do
+    case Keyword.fetch(opts, :preferences) do
+      :error ->
+        {:ok, opts}
+
+      {:ok, preferences} when is_map(preferences) ->
+        preferences
+        |> Enum.reduce_while({:ok, %{}}, fn {app, source}, {:ok, acc} ->
+          case normalize_decide_preference(source) do
+            {:ok, normalized} -> {:cont, {:ok, Map.put(acc, app, normalized)}}
+            {:error, reason} -> {:halt, {:error, {:source_preference, app, reason}}}
+          end
+        end)
+        |> case do
+          {:ok, normalized} -> {:ok, Keyword.put(opts, :preferences, normalized)}
+          error -> error
+        end
+
+      {:ok, other} ->
+        {:error, {:invalid_source_preferences, other}}
+    end
+  end
+
+  defp normalize_decide_preference("github"), do: {:ok, "github"}
+
+  defp normalize_decide_preference(source) do
+    with {:ok, mode} <- SourcePreferences.normalize_mode(source) do
+      {:ok, SourcePreferences.resolution_mode(mode)}
     end
   end
 
@@ -802,16 +872,7 @@ defmodule MixWorkspaceOps.Resolution do
   defp availability(_registry, _app, _declaration, _source, _opts), do: :unknown_source
 
   defp local_source(registry, app, declaration, opts) do
-    case provider(registry, app, declaration, opts) do
-      {:known_unselected, project} ->
-        {:known_unselected, project}
-
-      _selected_or_external ->
-        case override(opts, app).path do
-          nil -> derived_local(registry, app, declaration, opts)
-          candidates -> overridden_local(registry, app, declaration, candidates, opts)
-        end
-    end
+    derived_local(registry, app, declaration, opts)
   end
 
   defp derived_local(registry, app, declaration, opts) do
@@ -840,33 +901,6 @@ defmodule MixWorkspaceOps.Resolution do
       not File.exists?(path) -> :missing_path
       under_mix_deps_dir?(consumer_root, path) -> :inside_mix_deps
       true -> {:ok, path, provider_id}
-    end
-  end
-
-  # An override path is the operator saying where the checkout is, so it stands
-  # in for the derived one both in the order walk and in the emitted location.
-  # Several candidates may be named and the first usable one wins, which is how
-  # one override file serves two machines. Every candidate is still held to the
-  # sibling test: a candidate is rejected where the consumer's own checkout root
-  # sits under a Mix `deps/` directory, because everything beside it there was
-  # fetched by Mix rather than cloned by an operator.
-  #
-  # The provider is only the label this path is reported under. Where the
-  # catalog cannot name one the operator has already settled the question by
-  # naming the path, so the label is absent rather than the resolution refused.
-  defp overridden_local(registry, app, declaration, candidates, opts) do
-    case Keyword.get(opts, :consumer_root) do
-      nil ->
-        {:error, {:override_path_without_consumer_root, app}}
-
-      consumer_root ->
-        candidates
-        |> Enum.map(&Path.expand(&1, consumer_root))
-        |> Enum.find(&usable_sibling_path?(&1, consumer_root))
-        |> case do
-          nil -> :missing_path
-          absolute -> {:ok, absolute, provider_id(registry, app, declaration, opts)}
-        end
     end
   end
 
@@ -922,7 +956,7 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   defp build(registry, app, declaration, @github, reason, considered, opts) do
-    case github(registry, app, declaration, reason, override(opts, app), opts) do
+    case github(registry, app, declaration, opts) do
       %{repo: repo} = coordinates when is_binary(repo) ->
         {:ok,
          decision(
@@ -940,8 +974,8 @@ defmodule MixWorkspaceOps.Resolution do
     end
   end
 
-  defp build(_registry, app, declaration, @hex, reason, considered, opts) do
-    case requirement(declaration, override(opts, app)) do
+  defp build(_registry, app, declaration, @hex, reason, considered, _opts) do
+    case declaration.hex do
       nil -> {:error, {:unavailable_source, app, @hex, reason}}
       requirement -> {:ok, decision(app, @hex, reason, considered, nil, requirement, declaration)}
     end
@@ -950,62 +984,29 @@ defmodule MixWorkspaceOps.Resolution do
   defp build(_registry, app, _declaration, source, reason, _considered, _opts),
     do: {:error, {:unknown_source, app, source, reason}}
 
-  defp requirement(declaration, override), do: override.hex || declaration.hex
-
-  # The override merges into the declaration's coordinates rather than
-  # replacing them, so an operator can move one branch without restating the
-  # repository.
-  #
-  # Where the declaration carries no GitHub block at all, an explicit request
-  # falls back to the catalogued provider's own repository identity, which the
-  # catalog has held the whole time. An order walk does not: an order states the
-  # declaration's intent, and making `github` universally available there would
-  # change how a declaration that names no GitHub coordinates resolves in
-  # ordinary development. An explicit gesture is the operator overriding that
-  # intent, which is a different thing.
-  defp github(registry, app, declaration, reason, override, opts) do
-    base =
-      cond do
-        not is_nil(declaration.github) ->
-          declared_coordinates(registry, app, declaration, reason, opts)
-
-        reason in @explicit_gestures ->
-          catalogued_coordinates(registry, app, declaration, opts)
-
-        true ->
-          nil
-      end
-
-    base
-    |> merge_github(declaration.github || %{})
-    |> merge_github(override)
+  defp github(registry, app, declaration, opts) do
+    if declaration.github do
+      registry
+      |> declared_coordinates(app, declaration, opts)
+      |> merge_github(declaration.github)
+    end
   end
 
-  defp declared_coordinates(registry, app, declaration, reason, opts) do
-    coordinates = catalogued_coordinates(registry, app, declaration, false, opts)
-
-    if reason in @explicit_gestures,
-      do: maybe_pin(coordinates, registry, app, declaration, opts),
-      else: coordinates
+  defp declared_coordinates(registry, app, declaration, opts) do
+    catalogued_coordinates(registry, app, declaration, opts)
   end
 
   defp catalogued_coordinates(registry, app, declaration, opts) do
-    catalogued_coordinates(registry, app, declaration, true, opts)
-  end
-
-  defp catalogued_coordinates(registry, app, declaration, pin?, opts) do
     with {:ok, project} <- provider_project(provider(registry, app, declaration, opts)),
          repository = Registry.repository!(registry, project.repository),
          true <- is_binary(repository.github) do
-      coordinates = %{
+      %{
         repo: repository.github,
         branch: repository.default_branch,
         ref: nil,
         tag: nil,
         subdir: subdirectory(project.path)
       }
-
-      if pin?, do: pin(coordinates, registry, repository), else: coordinates
     else
       _uncatalogued -> nil
     end
@@ -1014,31 +1015,6 @@ defmodule MixWorkspaceOps.Resolution do
   defp provider_project({:ok, project}), do: {:ok, project}
   defp provider_project({:known_unselected, project}), do: {:ok, project}
   defp provider_project(_outcome), do: :unavailable
-
-  defp maybe_pin(nil, _registry, _app, _declaration, _opts), do: nil
-
-  defp maybe_pin(coordinates, registry, app, declaration, opts) do
-    case provider(registry, app, declaration, opts) do
-      {:ok, project} ->
-        pin(coordinates, registry, Registry.repository!(registry, project.repository))
-
-      _unavailable ->
-        coordinates
-    end
-  end
-
-  # An explicit `--mode git` run has to be reproducible, so the coordinate is
-  # pinned to the revision the operator's checkout is at. Where there is no
-  # checkout to read there is nothing to pin to, and the repository's own
-  # default branch is what remains.
-  defp pin(coordinates, registry, repository) do
-    with {:bound, root} <- Registry.checkout(registry, repository.id),
-         {:ok, revision} <- Git.head(root) do
-      %{coordinates | ref: revision, branch: nil, tag: nil}
-    else
-      _unpinnable -> %{coordinates | branch: repository.default_branch}
-    end
-  end
 
   defp subdirectory("."), do: nil
   defp subdirectory(path), do: path

@@ -8,13 +8,13 @@ defmodule MixWorkspaceOps.OperationPlan do
   rebuilds from the recorded intent and reports named drift.
   """
 
-  alias MixWorkspaceOps.{Binding, Command, Git, Project, Registry, Report, Resolution, StrictJSON}
+  alias MixWorkspaceOps.{Binding, Command, DependencyIndex, Git, Project, Registry, Report, Resolution, Selection, StrictJSON}
   alias MixWorkspaceOps.Project.ProbeMemo
 
-  @schema "mix_workspace_ops.plan/v1"
+  @schema "mix_workspace_ops.plan/v2"
   @policy_version "mix_workspace_ops.command_policy/v1"
   @maximum_bytes 16 * 1024 * 1024
-  @top_keys ~w(schema digest registry view selection_digest sets command policy toolchain units)
+  @top_keys ~w(schema digest registry view selection_digest sets scope dependency_index command policy toolchain units)
   @unit_kinds [:project, :repository]
   @dirty_policies [:require_clean, :allow_recorded]
   @failure_policies [:continue, :fail_fast]
@@ -27,6 +27,7 @@ defmodule MixWorkspaceOps.OperationPlan do
   def build(registry, view, command, opts \\ []) do
     with {:ok, normalized} <- normalize_options(opts),
          :ok <- portable_command(command),
+         {:ok, normalized, scope, dependency_index} <- prepare_scope(registry, view, normalized),
          {:ok, units} <- units(registry, normalized),
          base <- %{
            schema: @schema,
@@ -34,6 +35,8 @@ defmodule MixWorkspaceOps.OperationPlan do
            view: view_record(view),
            selection_digest: Registry.selection_digest(registry),
            sets: portable_sets(Registry.sets(registry)),
+           scope: scope,
+           dependency_index: dependency_index,
            command: command_record(command),
            policy: policy_record(normalized),
            toolchain: toolchain(),
@@ -118,6 +121,8 @@ defmodule MixWorkspaceOps.OperationPlan do
       mix_env: Keyword.get(opts, :mix_env, "dev"),
       mix_target: Keyword.get(opts, :mix_target, "host"),
       project: Keyword.get(opts, :project),
+      affected: Keyword.get(opts, :affected),
+      project_ids: Keyword.get(opts, :project_ids),
       probe_memo: Keyword.get(opts, :probe_memo, ProbeMemo.new()),
       observe_dirty: Keyword.get(opts, :observe_dirty, false)
     }
@@ -135,8 +140,84 @@ defmodule MixWorkspaceOps.OperationPlan do
     end
   end
 
+  defp prepare_scope(registry, view, %{affected: target} = opts) when is_binary(target) do
+    cond do
+      opts.unit_kind != :project ->
+        {:error, :affected_scope_requires_project_units}
+
+      not is_nil(opts.project) ->
+        {:error, :affected_scope_conflicts_with_project}
+
+      is_nil(view) ->
+        {:error, :affected_scope_requires_view}
+
+      true ->
+        index_opts = [
+          mix_env: opts.mix_env,
+          mix_target: opts.mix_target,
+          probe_memo: opts.probe_memo
+        ]
+
+        with {:ok, index} <- DependencyIndex.build(registry, index_opts),
+             {:ok, selection} <- Selection.affected(registry, index, target) do
+          portable_index = DependencyIndex.portable(index)
+          portable_coverage = %{
+            complete: portable_index.complete,
+            selected_project_count: length(portable_index.selected_projects),
+            probed_project_count: length(portable_index.probed_projects),
+            absent_projects: portable_index.absent_projects,
+            failed_projects: portable_index.failed_projects
+          }
+
+          scope = %{
+            kind: :affected,
+            requested_target: target,
+            target: selection.target,
+            base_projects: selection.base_projects,
+            selected_projects: selection.projects,
+            impact_complete: selection.impact_complete,
+            fallback_to_full_scope: selection.fallback_to_full_scope,
+            fallback_reason: selection.fallback_reason,
+            coverage: portable_coverage,
+            dependency_index_digest: index.digest
+          }
+
+          {:ok, %{opts | project_ids: selection.projects}, scope, portable_index}
+        end
+    end
+  end
+
+  defp prepare_scope(registry, view, opts) do
+    kind =
+      cond do
+        is_binary(opts.project) -> :project
+        is_nil(view) -> :selection
+        true -> :view
+      end
+
+    selected_projects =
+      if is_binary(opts.project),
+        do: [opts.project],
+        else: Enum.map(Registry.selected_projects(registry), & &1.id)
+
+    scope = %{
+      kind: kind,
+      requested_target: nil,
+      target: nil,
+      base_projects: Enum.map(Registry.selected_projects(registry), & &1.id),
+      selected_projects: selected_projects,
+      impact_complete: nil,
+      fallback_to_full_scope: false,
+      fallback_reason: nil,
+      coverage: nil,
+      dependency_index_digest: nil
+    }
+
+    {:ok, opts, scope, nil}
+  end
+
   defp units(registry, %{unit_kind: :repository} = opts) do
-    if opts.project do
+    if opts.project || opts.project_ids do
       {:error, :repository_units_do_not_accept_project}
     else
       registry
@@ -146,7 +227,7 @@ defmodule MixWorkspaceOps.OperationPlan do
   end
 
   defp units(registry, %{unit_kind: :project} = opts) do
-    with {:ok, projects} <- selected_projects(registry, opts.project),
+    with {:ok, projects} <- selected_projects(registry, opts),
          :ok <- prewarm_projects(registry, projects, opts),
          {:ok, states} <-
            project_repository_states(registry, projects, inspection_dirty_policy(opts)) do
@@ -154,9 +235,17 @@ defmodule MixWorkspaceOps.OperationPlan do
     end
   end
 
-  defp selected_projects(registry, nil), do: {:ok, Registry.selected_projects(registry)}
+  defp selected_projects(registry, %{project_ids: ids}) when is_list(ids) do
+    projects = Enum.map(ids, &Registry.project!(registry, &1))
 
-  defp selected_projects(registry, project_id) do
+    if Enum.all?(projects, &Registry.selected?(registry, &1.id)),
+      do: {:ok, projects},
+      else: {:error, :affected_project_outside_view}
+  end
+
+  defp selected_projects(registry, %{project: nil}), do: {:ok, Registry.selected_projects(registry)}
+
+  defp selected_projects(registry, %{project: project_id}) do
     project = Registry.project!(registry, project_id)
 
     if Registry.selected?(registry, project.id),
@@ -457,6 +546,8 @@ defmodule MixWorkspaceOps.OperationPlan do
          :ok <- validate_view_record(decoded["view"]),
          :ok <- digest_or_nil(decoded["selection_digest"], :invalid_selection_digest),
          :ok <- validate_sets(decoded["sets"]),
+         :ok <- validate_scope(decoded["scope"]),
+         :ok <- validate_dependency_index(decoded["dependency_index"]),
          :ok <- validate_command(decoded["command"]),
          :ok <- validate_policy(decoded["policy"]),
          :ok <- validate_toolchain(decoded["toolchain"]),
@@ -555,6 +646,39 @@ defmodule MixWorkspaceOps.OperationPlan do
   end
 
   defp validate_materialized_set(_set), do: {:error, :invalid_operation_plan_sets}
+
+  defp validate_scope(scope) when is_map(scope) do
+    required = ~w(kind requested_target target base_projects selected_projects impact_complete fallback_to_full_scope fallback_reason coverage dependency_index_digest)
+
+    with :ok <- exact_keys(scope, required),
+         true <- scope["kind"] in ~w(affected project selection view) || {:error, :invalid_operation_plan_scope},
+         true <- string_list?(scope["base_projects"]) || {:error, :invalid_operation_plan_scope},
+         true <- string_list?(scope["selected_projects"]) || {:error, :invalid_operation_plan_scope},
+         true <- is_boolean(scope["fallback_to_full_scope"]) || {:error, :invalid_operation_plan_scope} do
+      :ok
+    end
+  end
+
+  defp validate_scope(_scope), do: {:error, :invalid_operation_plan_scope}
+
+  defp validate_dependency_index(nil), do: :ok
+
+  defp validate_dependency_index(index) when is_map(index) do
+    required = ~w(mix_env mix_target selected_projects probed_projects absent_projects failed_projects edges complete digest)
+
+    with :ok <- exact_keys(index, required),
+         true <- is_binary(index["mix_env"]) and is_binary(index["mix_target"]) || {:error, :invalid_operation_plan_dependency_index},
+         true <- string_list?(index["selected_projects"]) || {:error, :invalid_operation_plan_dependency_index},
+         true <- string_list?(index["probed_projects"]) || {:error, :invalid_operation_plan_dependency_index},
+         true <- string_list?(index["absent_projects"]) || {:error, :invalid_operation_plan_dependency_index},
+         true <- is_list(index["failed_projects"]) and is_list(index["edges"]) || {:error, :invalid_operation_plan_dependency_index},
+         true <- is_boolean(index["complete"]) || {:error, :invalid_operation_plan_dependency_index},
+         :ok <- digest_value(index["digest"], :invalid_operation_plan_dependency_index) do
+      :ok
+    end
+  end
+
+  defp validate_dependency_index(_index), do: {:error, :invalid_operation_plan_dependency_index}
 
   defp validate_command(command) when is_map(command) do
     with :ok <- exact_keys(command, ~w(executable args)),
@@ -875,6 +999,7 @@ defmodule MixWorkspaceOps.OperationPlan do
       mix_env: field(policy, :mix_env),
       mix_target: field(policy, :mix_target),
       project: field(policy, :project),
+      affected: field(field(recorded, :scope), :requested_target),
       observe_dirty: true,
       probe_memo: Keyword.get(build_opts, :probe_memo, ProbeMemo.new())
     ]
@@ -910,6 +1035,8 @@ defmodule MixWorkspaceOps.OperationPlan do
       {:registry, [:registry]},
       {:view, [:view]},
       {:selection, [:selection_digest]},
+      {:scope, [:scope]},
+      {:dependency_index, [:dependency_index]},
       {:command, [:command]},
       {:command_policy, [:policy]},
       {:toolchain, [:toolchain]}

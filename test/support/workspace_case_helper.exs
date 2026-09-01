@@ -46,19 +46,11 @@ defmodule MixWorkspaceOps.WorkspaceCase do
     path
   end
 
+  @doc "Writes canonical v2 registry data from the compact legacy-shaped test fixture helpers."
   @spec write_registry!(String.t(), [map()]) :: String.t()
   def write_registry!(root, repositories) do
-    path = Path.join(root, "registry.json")
-
-    File.write!(
-      path,
-      :json.encode(%{
-        "schema" => "mix_workspace_ops.registry/v1",
-        "repositories" => repositories
-      })
-    )
-
-    path
+    repositories = Enum.map(repositories, &fixture_repository_v2/1)
+    write_catalog!(root, repositories)
   end
 
   @spec bind!(MixWorkspaceOps.Registry.t(), String.t()) :: MixWorkspaceOps.Registry.t()
@@ -149,31 +141,26 @@ defmodule MixWorkspaceOps.WorkspaceCase do
     path
   end
 
-  @doc "Writes a `mix_workspace_ops.view/v1` document."
-  @spec write_legacy_view!(String.t(), String.t(), map()) :: String.t()
-  def write_legacy_view!(root, id, selector) do
-    path = Path.join(root, "legacy_view_#{id}.json")
+  defp fixture_repository_v2(repository) do
+    projects = Enum.map(Map.get(repository, "projects", []), &fixture_project_v2/1)
 
-    File.write!(
-      path,
-      :json.encode(%{
-        "schema" => "mix_workspace_ops.view/v1",
-        "id" => id,
-        "description" => "Fixture view #{id}.",
-        "selector" =>
-          Map.merge(
-            %{
-              "tags_any" => [],
-              "tags_all" => [],
-              "project_ids" => [],
-              "exclude_project_ids" => []
-            },
-            selector
-          )
-      })
+    catalog_repository(repository["id"],
+      github: repository["github"],
+      default_branch: Map.get(repository, "default_branch", "main"),
+      projects: projects
     )
+    |> maybe_put("dependency_sources", repository["dependency_sources"])
+    |> maybe_put("release_chain", repository["release_chain"])
+  end
 
-    path
+  defp fixture_project_v2(project) do
+    catalog_project(project["id"],
+      app: project["app"],
+      path: Map.get(project, "path", "."),
+      kind: Map.get(project, "kind", "standalone")
+    )
+    |> maybe_put("dependency_sources", project["dependency_sources"])
+    |> maybe_put("provides", project["provides"])
   end
 
   defp catalog_mix(opts) do

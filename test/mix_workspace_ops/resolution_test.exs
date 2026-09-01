@@ -1,7 +1,7 @@
 defmodule MixWorkspaceOps.ResolutionTest do
   use MixWorkspaceOps.WorkspaceCase, async: true
 
-  alias MixWorkspaceOps.{LocalOverrides, Registry, Resolution}
+  alias MixWorkspaceOps.{Registry, Resolution, SourcePreferences}
   alias MixWorkspaceOps.Registry.Source
 
   describe "ordered resolution" do
@@ -455,8 +455,8 @@ defmodule MixWorkspaceOps.ResolutionTest do
     end
   end
 
-  describe "overrides" do
-    test "each gesture wins over the one below it", context do
+  describe "operator source preferences" do
+    test "command source, run mode, preference, then declared order define precedence", context do
       root = temporary_directory!(context)
       initialize_repository!(Path.join(root, "core"))
       initialize_repository!(Path.join(root, "consumer"))
@@ -467,290 +467,55 @@ defmodule MixWorkspaceOps.ResolutionTest do
       }
 
       registry = registry(root, declaration)
-      file = %{"core" => %{LocalOverrides.empty() | source: "github"}}
 
       assert {:ok, ordered} = decide(registry, root, "core", declaration)
       assert {ordered.source, ordered.reason} == {"local", :order}
 
-      assert {:ok, run_mode} = decide(registry, root, "core", declaration, mode: "hex")
+      assert {:ok, preferred} =
+               decide(registry, root, "core", declaration, preferences: %{"core" => "git"})
+
+      assert {preferred.source, preferred.reason} == {"github", :source_preference}
+
+      assert {:ok, run_mode} =
+               decide(registry, root, "core", declaration,
+                 preferences: %{"core" => "git"},
+                 mode: "hex"
+               )
+
       assert {run_mode.source, run_mode.reason} == {"hex", :run_mode}
-
-      assert {:ok, from_file} =
-               decide(registry, root, "core", declaration, mode: "hex", overrides: file)
-
-      assert {from_file.source, from_file.reason} == {"github", :local_override}
 
       assert {:ok, per_dependency} =
                decide(registry, root, "core", declaration,
+                 preferences: %{"core" => "git"},
                  mode: "hex",
-                 overrides: file,
                  sources: %{"core" => "local"}
                )
 
       assert {per_dependency.source, per_dependency.reason} == {"local", :dependency_override}
-
-      assert {:ok, publishing} =
-               decide(registry, root, "core", declaration,
-                 publish?: true,
-                 sources: %{"core" => "hex"}
-               )
-
-      assert {publishing.source, publishing.reason} == {"hex", :publish}
     end
 
-    test "an override bypasses an order that never reaches the source", context do
+    test "a persisted preference names only an eligible registry-declared source", context do
       root = temporary_directory!(context)
       initialize_repository!(Path.join(root, "core"))
       initialize_repository!(Path.join(root, "consumer"))
       declaration = %{"hex" => "~> 1.0", "order" => ["hex"]}
       registry = registry(root, declaration)
+
+      assert {:error, {:ineligible_source, "core", "local", :source_preference}} =
+               decide(registry, root, "core", declaration, preferences: %{"core" => "local"})
 
       assert {:ok, decision} =
-               decide(registry, root, "core", declaration,
-                 overrides: %{"core" => %{LocalOverrides.empty() | source: "local"}}
-               )
+               decide(registry, root, "core", declaration, preferences: %{"core" => "hex"})
 
-      assert decision.source == "local"
-      assert decision.location == Path.join(root, "core")
-      assert decision.provider_project_id == "core"
+      assert decision.location == "~> 1.0"
+      assert decision.reason == :source_preference
     end
 
-    test "an override path replaces the derived one", context do
-      root = temporary_directory!(context)
-      elsewhere = Path.join(root, "elsewhere/core")
-      initialize_repository!(elsewhere)
-      initialize_repository!(Path.join(root, "core"))
-      initialize_repository!(Path.join(root, "consumer"))
-      declaration = %{"hex" => "~> 1.0", "order" => ["hex"]}
-      registry = registry(root, declaration)
-
-      override = %{LocalOverrides.empty() | source: "local", path: [elsewhere]}
-
-      assert {:ok, decision} =
-               decide(registry, root, "core", declaration, overrides: %{"core" => override})
-
-      assert decision.location == elsewhere
-    end
-
-    test "an override path takes the first candidate that is a checkout", context do
-      root = temporary_directory!(context)
-      elsewhere = Path.join(root, "elsewhere/core")
-      initialize_repository!(elsewhere)
-      initialize_repository!(Path.join(root, "core"))
-      initialize_repository!(Path.join(root, "consumer"))
-      declaration = %{"hex" => "~> 1.0", "order" => ["hex"]}
-      registry = registry(root, declaration)
-
-      override = %{
-        LocalOverrides.empty()
-        | source: "local",
-          path: [Path.join(root, "nowhere"), elsewhere, Path.join(root, "core")]
-      }
-
-      assert {:ok, decision} =
-               decide(registry, root, "core", declaration, overrides: %{"core" => override})
-
-      assert decision.location == elsewhere
-
-      unusable = %{LocalOverrides.empty() | source: "local", path: [Path.join(root, "nowhere")]}
-
-      assert {:error, {:unavailable_source, "core", "local", :local_override}} =
-               decide(registry, root, "core", declaration, overrides: %{"core" => unusable})
-    end
-
-    test "an override replaces the requirement and merges the coordinates", context do
+    test "resolve loads XDG SourcePreferences and never reads managed-repository override files", context do
       root = temporary_directory!(context)
       initialize_repository!(Path.join(root, "core"))
       initialize_repository!(Path.join(root, "consumer"))
-
-      declaration = %{
-        "github" => %{"repo" => "example-org/core", "branch" => "main"},
-        "hex" => "~> 1.0"
-      }
-
-      registry = registry(root, declaration)
-
-      assert {:ok, requirement} =
-               decide(registry, root, "core", declaration,
-                 overrides: %{"core" => %{LocalOverrides.empty() | source: "hex", hex: "~> 2.0"}}
-               )
-
-      assert requirement.location == "~> 2.0"
-
-      assert {:ok, coordinates} =
-               decide(registry, root, "core", declaration,
-                 overrides: %{
-                   "core" => %{
-                     LocalOverrides.empty()
-                     | source: "github",
-                       github: %{"branch" => "trial"}
-                   }
-                 }
-               )
-
-      assert coordinates.location.repo == "example-org/core"
-      assert coordinates.location.branch == "trial"
-    end
-
-    test "an override keyed on catalog identity reaches a Hex-only declaration", context do
-      root = temporary_directory!(context)
-      initialize_repository!(Path.join(root, "core"))
-      initialize_repository!(Path.join(root, "consumer"))
-
-      # The declaration names no provider and its order never reaches local,
-      # which is the shape an override has to work against.
-      declaration = %{"hex" => "~> 1.0", "order" => ["hex"]}
-      registry = registry(root, declaration)
-
-      assert {:ok, ordinary} = decide(registry, root, "core", declaration)
-      assert ordinary.source == "hex"
-
-      assert {:ok, overridden} =
-               decide(registry, root, "core", declaration,
-                 overrides: %{"core" => %{LocalOverrides.empty() | source: "local"}}
-               )
-
-      assert overridden.source == "local"
-      assert overridden.provider_project_id == "core"
-    end
-
-    test "publishing refuses every gesture asking for a non-Hex source", context do
-      root = temporary_directory!(context)
-      initialize_repository!(Path.join(root, "core"))
-      initialize_repository!(Path.join(root, "consumer"))
-      declaration = %{"github" => %{"repo" => "example-org/core"}, "hex" => "~> 1.0"}
-      registry = registry(root, declaration)
-
-      assert {:error, {:unpublishable_local_override, "core", "path"}} =
-               decide(registry, root, "core", declaration,
-                 publish?: true,
-                 overrides: %{
-                   "core" => %{LocalOverrides.empty() | source: "local", requested_source: "path"}
-                 }
-               )
-
-      assert {:error, {:unpublishable_source_override, "core", "local"}} =
-               decide(registry, root, "core", declaration,
-                 publish?: true,
-                 sources: %{"core" => "local"}
-               )
-
-      assert {:error, {:unpublishable_run_mode, "github"}} =
-               decide(registry, root, "core", declaration, publish?: true, mode: "github")
-
-      assert {:ok, allowed} =
-               decide(registry, root, "core", declaration,
-                 publish?: true,
-                 overrides: %{"core" => %{LocalOverrides.empty() | source: "hex"}}
-               )
-
-      assert allowed.source == "hex"
-    end
-
-    test "a configured publish order is honoured while an override is refused", context do
-      root = temporary_directory!(context)
-      initialize_repository!(Path.join(root, "core"))
-      initialize_repository!(Path.join(root, "consumer"))
-
-      declaration = %{
-        "github" => %{"repo" => "example-org/core", "branch" => "main"},
-        "order" => ["local", "github"],
-        "publish_order" => ["github"]
-      }
-
-      registry = registry(root, declaration)
-
-      assert {:ok, honoured} = decide(registry, root, "core", declaration, publish?: true)
-      assert honoured.source == "github"
-
-      assert {:error, {:unpublishable_local_override, "core", "path"}} =
-               decide(registry, root, "core", declaration,
-                 publish?: true,
-                 overrides: %{
-                   "core" => %{LocalOverrides.empty() | source: "local", requested_source: "path"}
-                 }
-               )
-    end
-
-    test "a named source that cannot be built from is a typed error", context do
-      root = temporary_directory!(context)
-      initialize_repository!(Path.join(root, "core"))
-      initialize_repository!(Path.join(root, "consumer"))
-      declaration = %{"hex" => "~> 1.0"}
-      registry = registry(root, declaration)
-
-      assert {:error, {:unavailable_source, "core", "local", :dependency_override}} =
-               decide(registry, root, "core", declaration,
-                 sources: %{"core" => "local"},
-                 overrides: %{"core" => %{LocalOverrides.empty() | path: ["/nowhere/at/all"]}}
-               )
-    end
-
-    # An explicit request is the operator overriding the declaration's intent,
-    # and the catalog has held the provider's repository identity the whole
-    # time. Refusing a declaration that carries no GitHub block made 82 of the
-    # live catalog's 558 declarations unable to serve `--mode git` at all.
-    test "an explicit git request falls back to the catalogued repository identity", context do
-      root = temporary_directory!(context)
-      core = initialize_repository!(Path.join(root, "core"))
-      initialize_repository!(Path.join(root, "consumer"))
-      declaration = %{"hex" => "~> 1.0"}
-      registry = registry(root, declaration)
-      head = MixWorkspaceOps.Git.head!(core)
-
-      for opts <- [[mode: "github"], [sources: %{"core" => "github"}]] do
-        assert {:ok, decision} = decide(registry, root, "core", declaration, opts)
-        assert decision.source == "github"
-
-        assert decision.location == %{
-                 repo: "example-org/core",
-                 branch: nil,
-                 ref: head,
-                 tag: nil,
-                 subdir: nil
-               }
-      end
-    end
-
-    test "an explicit git request for an absent checkout pins the default branch", context do
-      root = temporary_directory!(context)
-      initialize_repository!(Path.join(root, "core"))
-      initialize_repository!(Path.join(root, "consumer"))
-      declaration = %{"hex" => "~> 1.0"}
-      registry = registry(root, declaration)
-      File.rm_rf!(Path.join(root, "core"))
-      registry = bind!(registry, root)
-
-      assert {:ok, decision} = decide(registry, root, "core", declaration, mode: "github")
-      assert decision.location.branch == "main"
-      assert decision.location.ref == nil
-    end
-
-    # An order states the declaration's intent. Falling back there would change
-    # how every declaration with no GitHub block resolves in development.
-    test "the order walk does not fall back to the catalogued identity", context do
-      root = temporary_directory!(context)
-      initialize_repository!(Path.join(root, "core"))
-      initialize_repository!(Path.join(root, "consumer"))
-      declaration = %{"hex" => "~> 1.0"}
-      registry = registry(root, declaration)
-      File.rm_rf!(Path.join(root, "core"))
-      registry = bind!(registry, root)
-
-      assert {:ok, decision} = decide(registry, root, "core", declaration)
-      assert decision.source == "hex"
-
-      assert decision.considered == [
-               %{source: "local", outcome: :absent_checkout},
-               %{source: "github", outcome: :no_github_coordinates},
-               %{source: "hex", outcome: :chosen}
-             ]
-    end
-
-    test "resolve reads the override file from the consuming project root", context do
-      root = temporary_directory!(context)
-      initialize_repository!(Path.join(root, "core"))
-      consumer = initialize_repository!(Path.join(root, "consumer"))
+      preferences = Path.join(root, "operator/source_preferences.json")
 
       registry =
         root
@@ -758,82 +523,61 @@ defmodule MixWorkspaceOps.ResolutionTest do
           catalog_repository("core", projects: [catalog_project("core")]),
           catalog_repository("consumer",
             projects: [catalog_project("consumer")],
-            dependency_sources: %{"core" => %{"hex" => "~> 1.0", "order" => ["hex"]}}
+            dependency_sources: %{
+              "core" => %{
+                "github" => %{"repo" => "example-org/core"},
+                "hex" => "~> 1.0"
+              }
+            }
           )
         ])
         |> Registry.load!()
         |> bind!(root)
 
-      File.write!(
-        Path.join(consumer, LocalOverrides.filename()),
-        ~s|%{deps: %{core: %{source: :path}}}|
-      )
+      assert {:ok, ^preferences} = SourcePreferences.put(preferences, "consumer", "core", "git")
 
       assert {:ok, report} =
-               Resolution.resolve(registry, "consumer", dependency_reader: &reader/1)
+               Resolution.resolve(registry, "consumer",
+                 dependency_reader: &reader/1,
+                 source_preferences: preferences
+               )
 
-      assert [decision] = report.decisions
-      assert decision.source == "local"
-      assert decision.reason == :local_override
-      assert Map.keys(report.overrides) == ["core"]
+      assert report.preferences == %{"core" => "github"}
+      assert [%{source: "github", reason: :source_preference}] = report.decisions
     end
-  end
 
-  describe "where the consumer is" do
-    # The file this replaces read its override from the Mix project root, and
-    # ten of the fifty-two live installs sit in a subproject. Reading from the
-    # repository checkout instead means those ten read a file that is not there
-    # and silently apply no override.
-    test "a project inside a repository reads its own override file", context do
+    test "publish policy ignores operator preferences and follows publish_order", context do
       root = temporary_directory!(context)
       initialize_repository!(Path.join(root, "core"))
-      repository = initialize_repository!(Path.join(root, "workspace"))
-      leaf = Path.join(repository, "apps/leaf")
-      File.mkdir_p!(leaf)
-      File.write!(Path.join(leaf, "mix.exs"), "# leaf\n")
+      initialize_repository!(Path.join(root, "consumer"))
+      declaration = %{"github" => %{"repo" => "example-org/core"}, "hex" => "~> 1.0"}
+      registry = registry(root, declaration)
 
-      registry =
-        root
-        |> write_catalog!([
-          catalog_repository("core", projects: [catalog_project("core")]),
-          catalog_repository("workspace",
-            projects: [
-              catalog_project("workspace", kind: "workspace_root", app: nil),
-              catalog_project("workspace.leaf", app: "leaf", path: "apps/leaf")
-            ],
-            dependency_sources: %{"core" => %{"hex" => "~> 1.0", "order" => ["hex"]}}
-          )
-        ])
-        |> Registry.load!()
-        |> bind!(root)
+      assert {:ok, decision} =
+               decide(registry, root, "core", declaration,
+                 publish?: true,
+                 preferences: %{"core" => "local"}
+               )
 
-      reader = fn
-        %{id: "workspace.leaf"} -> {:ok, ["core"]}
-        _project -> {:ok, []}
-      end
+      assert decision.source == "hex"
+      assert decision.reason == :publish
+    end
 
-      # At the repository root, where the file is not, the override is absent.
-      File.write!(
-        Path.join(repository, LocalOverrides.filename()),
-        ~s|%{deps: %{core: %{source: :path}}}|
-      )
+    test "explicit git source still uses only registry coordinates", context do
+      root = temporary_directory!(context)
+      initialize_repository!(Path.join(root, "core"))
+      initialize_repository!(Path.join(root, "consumer"))
+      declaration = %{
+        "github" => %{"repo" => "example-org/core", "branch" => "stable"},
+        "hex" => "~> 1.0"
+      }
+      registry = registry(root, declaration)
 
-      assert {:ok, unread} =
-               Resolution.resolve(registry, "workspace.leaf", dependency_reader: reader)
+      assert {:ok, decision} =
+               decide(registry, root, "core", declaration, preferences: %{"core" => "git"})
 
-      assert unread.consumer_root == leaf
-      assert [%{source: "hex"}] = unread.decisions
-
-      # Beside the project, where a Mix command runs, it is read.
-      File.write!(
-        Path.join(leaf, LocalOverrides.filename()),
-        ~s|%{deps: %{core: %{source: :path}}}|
-      )
-
-      assert {:ok, read} =
-               Resolution.resolve(registry, "workspace.leaf", dependency_reader: reader)
-
-      assert [%{source: "local", reason: :local_override}] = read.decisions
+      assert decision.location.repo == "example-org/core"
+      assert decision.location.branch == "stable"
     end
   end
 
@@ -983,9 +727,6 @@ defmodule MixWorkspaceOps.ResolutionTest do
         {{:unavailable_run_mode, "github", ["blitz", "weld"]},
          "--mode git cannot serve blitz, weld. Add that source to each named declaration, " <>
            "or override only the applications that can use it."},
-        {{:unpublishable_local_override, "execution_plane", "path"},
-         "publish mode follows the declared publish order; " <>
-           "the local override for execution_plane requests :path."},
         {{:unpublishable_source_override, "weld", "local"},
          "publish mode follows the declared publish order; " <>
            "--source weld=local requests another source."},

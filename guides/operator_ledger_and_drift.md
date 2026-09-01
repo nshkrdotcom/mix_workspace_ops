@@ -1,83 +1,68 @@
-# Operator Ledger and Registry Drift
+# Operator ledger and registry drift
 
-The portable registry records shared remote identity and portfolio disposition. It cannot
-record where one operator cloned a repository or which extra checkout that operator has
-deliberately excluded. Those machine-local facts live together in one strict ledger.
+Portable portfolio identity and machine-local checkout reality are separate
+facts. The registry/view can be shared; the operator ledger cannot.
 
-The conventional location is
-`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/operator_ledger.json`; `registry drift`
-loads it automatically when that file exists. Override it explicitly with `--ledger`, set
-`MIX_WORKSPACE_OPS_LEDGER`, or name it as `ledger` in MWO's operator configuration.
-Existing commands that document `--binding` accept the same versioned ledger at that
-option; the legacy id-to-path JSON binding map remains readable.
+## Ledger
 
-## Format
+The operator ledger records explicit local observations such as:
 
-```json
-{
-  "schema": "mix_workspace_ops.operator_ledger/v1",
-  "bindings": [
-    {
-      "repository": "alpha",
-      "path": "/operator/other-root/alpha",
-      "remotes": ["git@github.com:example-org/alpha.git"]
-    }
-  ],
-  "ignores": [
-    {
-      "path": "/operator/checkouts/scratch-proof",
-      "remotes": ["https://github.com/example-org/scratch-proof.git"],
-      "reason": "temporary local proof, not part of this portfolio"
-    }
-  ]
-}
-```
+- an exact repository id -> checkout path binding;
+- an intentionally ignored scratch clone/worktree observation and its remote
+  evidence.
 
-Every top-level and row key is required and unknown keys fail. Paths are absolute. Remote
-lists are non-empty, exact, unique observations of origin's fetch and push URLs. Repository
-ids in bindings must exist in the supplied registry. Duplicate binding ids, paths, ignore
-paths, or ignored remote identities fail. A path cannot be both bound and ignored.
+It must not become a second portfolio registry. It contains no source-selection
+policy and no publication credentials.
 
-An ignore is intentionally not a glob or a directory name. Drift compares its absolute
-path and exact remote list with current Git evidence; moving another repository into that
-path or changing origin makes the ledger stale and the gate fails. A missing ignored path
-also fails. This prevents yesterday's exception from concealing today's repository.
+Source mode preferences are a different XDG file managed by
+`MixWorkspaceOps.SourcePreferences`; they are keyed by consumer project and
+application and contain only `local`, `git`, or `hex`.
 
-A binding ordinarily verifies the catalogued remote identity. An exact ledger row may also
-bind a checkout whose origin is a machine-local mirror and therefore has no portable
-GitHub identity. It cannot bind a checkout that names a different hosted repository.
+## Binding
 
-The ledger is operator-owned and untracked. Never add it to the portable registry or an
-application repository.
+A candidate checkout is accepted only after Git evidence identifies it as the
+registry repository. Canonical bindings must refer to the ordinary Git root/common
+directory; linked worktrees do not masquerade as the canonical checkout.
+Contradictory remote evidence or multiple canonical bindings fail closed.
 
 ## Discovery and drift
 
-`registry discover` inventories every direct child, independent of programming language.
-Mix is an optional inspector: a repository with no `mix.exs` is still a repository. The
-snapshot date comes from the command's UTC clock; there is no observation-date CLI option.
-Git, identity, inspector and task failures are evidence rather than skips.
-
-Run the gate with:
-
 ```bash
-mwo registry drift \
-  --registry /catalog/registry.json \
-  --checkout-root /operator/checkouts \
-  --ledger /operator/config/mix_workspace_ops/operator_ledger.json \
-  --output /operator/reports/registry-drift.json
+mix_workspace_ops registry drift \
+  --registry /portfolio/registry.json \
+  --checkout-root ~/src \
+  --ledger ~/.config/mix_workspace_ops/operator-ledger.json
 ```
 
-Each direct child is classified as:
+Drift reconciles catalog identity, discovered local repositories/worktrees, and
+ledger observations. It never mutates the portable registry.
 
-- `dispositioned`: its identity is in the catalog, or an exact ledger binding accounts for
-  it;
-- `ignored`: its exact checkout observation is in the ledger;
-- `discovered`: it is a valid repository that neither artifact explains;
-- `not_a_repository`: it is an ordinary direct child rather than a Git checkout;
-- `failed`: Git, identity, inspector, task, binding or ledger evidence could not be proved.
+Rows carry a severity independent of their discovery status:
 
-`discovered` and `failed` make the command exit non-zero. The full report is still written
-when `--output` is present and is printed as JSON by the escript. `not_a_repository`,
-`ignored`, and `dispositioned` are explained states. Catalog repositories with no checkout
-on this machine are listed separately as `absent_catalog`; absence is not confused with an
-uncatalogued checkout and does not by itself fail the gate.
+### Error
+
+- malformed/contradictory exact binding evidence;
+- wrong identity for an exact binding;
+- ambiguous portfolio identity.
+
+Errors make the drift report unhealthy and the command fail.
+
+### Warning
+
+- unexplained scratch/extra checkout;
+- stale ignore observation or remotes;
+- broken/unprobeable discovered checkout where no exact identity contradiction
+  has been established;
+- other development-state gaps that require operator attention.
+
+Warnings remain in `warnings` and `unexplained` but do not by themselves make the
+report unhealthy.
+
+### Info
+
+- canonical healthy checkout;
+- explicitly ignored/dispositioned worktree or clone;
+- non-repository observations as applicable.
+
+This distinction lets development diagnostics remain useful without weakening
+identity safety. Release performs separate fail-closed clean/upstream checks.

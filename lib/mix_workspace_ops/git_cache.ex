@@ -8,11 +8,52 @@ defmodule MixWorkspaceOps.GitCache do
   """
 
   alias Mix.Sync.Lock, as: SyncLock
-  alias MixWorkspaceOps.Report
+  alias MixWorkspaceOps.{Lockfile, Report}
 
   @schema "mix_workspace_ops.git_mirror/v1"
   @commit ~r/^[0-9a-f]{40,64}$/
   @scp_remote ~r/^(?<user>[^@:\s]+)@(?<host>[^:\s]+):(?<path>.+)$/
+
+
+  @doc "Extracts only locked Git transport objects from a literal lock map."
+  @spec objects_from_lock(binary(), map()) :: {:ok, [map()]} | {:error, term()}
+  def objects_from_lock(bytes, managed_sources \\ %{}) when is_binary(bytes) and is_map(managed_sources) do
+    with {:ok, lock} <- Lockfile.parse_map(bytes) do
+      lock
+      |> Enum.sort_by(fn {app, _entry} -> to_string(app) end)
+      |> Enum.reduce_while({:ok, []}, fn {app, entry}, {:ok, acc} ->
+        app = to_string(app)
+
+        case git_lock_object(app, entry) do
+          nil -> {:cont, {:ok, acc}}
+          {:ok, object} ->
+            if Map.get(managed_sources, app, "github") == "github",
+              do: {:cont, {:ok, [object | acc]}},
+              else: {:cont, {:ok, acc}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+      |> case do
+        {:ok, objects} -> {:ok, Enum.reverse(objects)}
+        error -> error
+      end
+    end
+  end
+
+  defp git_lock_object(app, entry) when is_tuple(entry) do
+    case Tuple.to_list(entry) do
+      [:git, remote, commit, options] when is_binary(remote) and is_binary(commit) and is_list(options) ->
+        {:ok, %{app: app, remote: remote, commit: commit, options: options}}
+
+      [:git | _invalid] ->
+        {:error, {:invalid_git_lock_entry, app}}
+
+      _other ->
+        nil
+    end
+  end
+
+  defp git_lock_object(_app, _entry), do: nil
 
   @spec ensure(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def ensure(state_root, object, opts \\ []) when is_binary(state_root) and is_map(object) do

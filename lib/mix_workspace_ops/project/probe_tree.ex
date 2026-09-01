@@ -12,7 +12,7 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
   alias MixWorkspaceOps.Command
 
   @excluded_directories ~w(.git _build deps .mix_workspace_ops .hex .mix .ssh .aws .config .codex)
-  @excluded_files ~w(.dependency_sources.local.exs .env credentials)
+  @excluded_files ~w(.env credentials)
   @excluded_extensions ~w(.key .pem)
   @temporary_attempts 10
 

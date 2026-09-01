@@ -2,12 +2,12 @@ defmodule MixWorkspaceOps.CLI do
   @moduledoc false
 
   alias MixWorkspaceOps.{
+    DependencyIndex,
     Discovery,
     Doctor,
     Drift,
     Fanout,
-    Inventory,
-    LocalOverrides,
+    Impact,
     OperationPlan,
     OperatorPaths,
     PublishMode,
@@ -15,12 +15,13 @@ defmodule MixWorkspaceOps.CLI do
     Report,
     Resolution,
     Runtime,
+    SourcePreferences,
     View
   }
 
   alias MixWorkspaceOps.Project.ProbeMemo
-  alias MixWorkspaceOps.Registry.{Examples, ReleaseChain}
-  alias MixWorkspaceOps.Release.{Chain, Descriptor, LocalAdapter, Transaction}
+  alias MixWorkspaceOps.Registry.{ReleaseChain, Source}
+  alias MixWorkspaceOps.Release.{Chain, Descriptor}
   alias MixWorkspaceOps.Release.Plan, as: ReleasePlan
 
   @usage """
@@ -31,12 +32,10 @@ defmodule MixWorkspaceOps.CLI do
     registry select --registry PATH --view PATH
     registry workspace --registry PATH [--repository ID]
     registry chain --registry PATH [--package APP]
-    registry examples --guide PATH
     registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
     registry drift --registry PATH --checkout-root PATH [--ledger PATH] [--output PATH]
-    inventory --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--output PATH]
     doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
-    plan --registry PATH --checkout-root PATH [--view PATH | --project ID] [--binding PATH] \
+    plan --registry PATH --checkout-root PATH [--view PATH | --project ID] [--affected TARGET] [--binding PATH] \
       [--unit project|repository] [--dirty-policy require-clean|allow-recorded] \
       [--mix-env ENV] [--mix-target TARGET] [--mode auto|local|git|hex] \
       [--source APP=SOURCE] [--fail-fast] [--output PATH] -- COMMAND [ARG ...]
@@ -48,9 +47,11 @@ defmodule MixWorkspaceOps.CLI do
     use --clear [APP] [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
     seam --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
       [--mix-env ENV] [--mix-target TARGET]
+    impact TARGET --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
+      [--mix-env ENV] [--mix-target TARGET]
     state list [--state-root PATH]
     state gc --older-than N[s|m|h|d] [--dry-run] [--state-root PATH]
-    run --registry PATH --checkout-root PATH [--view PATH | --project ID] [--binding PATH] \
+    run --registry PATH --checkout-root PATH [--view PATH | --project ID] [--affected TARGET] [--binding PATH] \
       [--unit project|repository] [--dirty-policy require-clean|allow-recorded] \
       [--mix-env ENV] [--mix-target TARGET] [--mode auto|local|git|hex] \
       [--source APP=SOURCE] [--fail-fast] [--max-concurrency N] [--beam-schedulers N] \
@@ -62,7 +63,6 @@ defmodule MixWorkspaceOps.CLI do
     release plan --registry PATH --package APP
     release chain --registry PATH --checkout-root PATH [--binding PATH] --package APP \
       --descriptor PATH [--state-root PATH] [--resume TRANSACTION]
-    release publish --descriptor PATH [--state-root PATH] [--resume TRANSACTION]
     help
   """
 
@@ -75,13 +75,12 @@ defmodule MixWorkspaceOps.CLI do
     ["registry", "select"] => [:registry, :view],
     ["registry", "workspace"] => [:registry, :repository],
     ["registry", "chain"] => [:registry, :package],
-    ["registry", "examples"] => [:guide],
     ["registry", "discover"] => [:checkout_root, :github_owner, :output],
     ["registry", "drift"] => [:registry, :checkout_root, :ledger, :output],
-    ["inventory"] => [:registry, :checkout_root, :view, :binding, :output],
     ["doctor"] => [:registry, :checkout_root, :view, :binding],
     ["plan"] => [
       :project,
+      :affected,
       :registry,
       :checkout_root,
       :view,
@@ -118,10 +117,12 @@ defmodule MixWorkspaceOps.CLI do
       :mix_env,
       :mix_target
     ],
+    ["impact"] => [:registry, :checkout_root, :view, :binding, :mix_env, :mix_target],
     ["state", "list"] => [:state_root],
     ["state", "gc"] => [:state_root, :older_than, :dry_run],
     ["run"] => [
       :project,
+      :affected,
       :plan,
       :mode,
       :source,
@@ -149,8 +150,7 @@ defmodule MixWorkspaceOps.CLI do
       :descriptor,
       :state_root,
       :resume
-    ],
-    ["release", "publish"] => [:descriptor, :state_root, :resume]
+    ]
   }
 
   @vocabulary @accepted |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
@@ -249,13 +249,6 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  def dispatch(["registry", "examples" | args]) do
-    with {:ok, options, []} <- options(["registry", "examples"], args),
-         :ok <- require_option(options, :guide) do
-      Examples.validate(options.guide)
-    end
-  end
-
   def dispatch(["registry", "workspace" | args]) do
     with {:ok, options, []} <- options(["registry", "workspace"], args),
          :ok <- require_option(options, :registry),
@@ -311,16 +304,6 @@ defmodule MixWorkspaceOps.CLI do
       registry
       |> Drift.run(options.checkout_root, ledger: options.ledger)
       |> drift_result(options.output)
-    end
-  end
-
-  def dispatch(["inventory" | args]) do
-    with {:ok, options, []} <- options(["inventory"], args),
-         {:ok, registry} <- load_bound_registry(options),
-         {:ok, rows} <- Inventory.scan_registry(registry),
-         report = Inventory.summary(rows),
-         :ok <- maybe_write_report(options.output, report) do
-      {:ok, report}
     end
   end
 
@@ -389,9 +372,8 @@ defmodule MixWorkspaceOps.CLI do
     with {:ok, options, positional} <- options(["use"], args),
          {:ok, registry} <- load_bound_registry(options),
          {:ok, project} <- project_here(registry, options.project),
-         project_root <- Registry.project_root(registry, project),
-         {:ok, path} <- use_override(project_root, options.clear, positional) do
-      {:ok, %{schema: "mix_workspace_ops.use/v1", project: project, path: path}}
+         {:ok, path} <- use_preference(registry, project, options.clear, positional) do
+      {:ok, %{schema: SourcePreferences.schema(), project: project, path: path}}
     end
   end
 
@@ -419,6 +401,31 @@ defmodule MixWorkspaceOps.CLI do
          lines: lines,
          report: Resolution.format_seam(lines)
        }}
+    end
+  end
+
+  def dispatch(["impact" | args]) do
+    with {:ok, options, [target]} <- options(["impact"], args),
+         {:ok, registry} <- load_bound_registry(options),
+         memo = ProbeMemo.new(),
+         {:ok, index} <-
+           DependencyIndex.build(registry,
+             mix_env: options.mix_env,
+             mix_target: options.mix_target,
+             probe_memo: memo
+           ),
+         {:ok, impact} <- Impact.analyze(registry, index, target) do
+      {:ok,
+       Map.merge(impact, %{
+         registry_digest: registry.digest,
+         selection_digest: Registry.selection_digest(registry)
+       })}
+    else
+      {:ok, _options, positional} ->
+        {:usage_error, "impact expects exactly one target, got #{inspect(positional)}"}
+
+      error ->
+        error
     end
   end
 
@@ -457,21 +464,6 @@ defmodule MixWorkspaceOps.CLI do
       {:fresh, option_args, command} -> run_fresh(option_args, command)
       {:replay, option_args} -> run_replay(option_args)
       {:usage_error, _reason} = error -> error
-    end
-  end
-
-  def dispatch(["release", "publish" | args]) do
-    with {:ok, options, []} <- options(["release", "publish"], args),
-         :ok <- require_option(options, :descriptor),
-         {:ok, plan} <- Descriptor.load(options.descriptor) do
-      transaction_options = [state_root: options.state_root, descriptor: plan]
-
-      transaction_options =
-        if options.resume,
-          do: [transaction_id: options.resume, resume: true] ++ transaction_options,
-          else: transaction_options
-
-      Transaction.run(plan, LocalAdapter, transaction_options)
     end
   end
 
@@ -650,7 +642,17 @@ defmodule MixWorkspaceOps.CLI do
       else: {:error, {:project_outside_view, options.project, options.view}}
   end
 
-  defp project_here(_registry, project) when is_binary(project), do: {:ok, project}
+  defp project_here(registry, project) when is_binary(project) do
+    case Map.fetch(registry.projects, project) do
+      {:ok, _project} ->
+        if Registry.selected?(registry, project),
+          do: {:ok, project},
+          else: {:usage_error, "project #{project} is outside the active selection"}
+
+      :error ->
+        {:usage_error, "unknown registry project #{inspect(project)}"}
+    end
+  end
 
   defp project_here(registry, nil) do
     cwd = File.cwd!()
@@ -862,6 +864,13 @@ defmodule MixWorkspaceOps.CLI do
   defp require_command([]), do: {:usage_error, "empty command"}
   defp require_command(_command), do: :ok
 
+  defp require_fanout_scope(%{affected: affected, project: project})
+       when is_binary(affected) and is_binary(project),
+       do: {:usage_error, "--affected cannot be combined with --project"}
+
+  defp require_fanout_scope(%{affected: affected, view: nil}) when is_binary(affected),
+    do: {:usage_error, "--affected requires --view PATH"}
+
   defp require_fanout_scope(%{view: nil, project: nil}),
     do: {:usage_error, "plan and run require --view PATH or --project ID"}
 
@@ -882,6 +891,7 @@ defmodule MixWorkspaceOps.CLI do
          mix_env: options.mix_env,
          mix_target: options.mix_target,
          project: options.project,
+         affected: options.affected,
          probe_memo: ProbeMemo.new()
        ]}
     end
@@ -945,7 +955,7 @@ defmodule MixWorkspaceOps.CLI do
   end
 
   defp reject_semantic_replay_options(args) do
-    semantic = ~w(project unit dirty-policy mode source mix-env mix-target fail-fast)
+    semantic = ~w(project affected unit dirty-policy mode source mix-env mix-target fail-fast)
 
     case Enum.find(args, fn argument ->
            String.starts_with?(argument, "--") and
@@ -1007,19 +1017,67 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
-  defp use_override(project_root, false, [application, source]) do
-    case source_name(source) do
-      {:ok, normalized} -> LocalOverrides.put(project_root, application, normalized)
-      :error -> {:usage_error, "invalid source #{inspect(source)}"}
+  defp use_preference(registry, project, false, [application, source]) do
+    with {:ok, normalized} <- SourcePreferences.normalize_mode(source),
+         :ok <- validate_source_preference(registry, project, application, normalized),
+         {:ok, path} <- source_preferences_path() do
+      SourcePreferences.put(path, project, application, normalized)
+    else
+      {:error, {:invalid_source_preference, _source}} ->
+        {:usage_error, "invalid source #{inspect(source)}"}
+
+      error ->
+        error
     end
   end
 
-  defp use_override(project_root, true, []), do: LocalOverrides.clear(project_root)
+  defp use_preference(_registry, project, true, []) do
+    with {:ok, path} <- source_preferences_path(), do: SourcePreferences.clear(path, project)
+  end
 
-  defp use_override(project_root, true, [application]),
-    do: LocalOverrides.clear(project_root, application)
+  defp use_preference(_registry, project, true, [application]) do
+    with {:ok, path} <- source_preferences_path() do
+      SourcePreferences.clear(path, project, application)
+    end
+  end
 
-  defp use_override(_project_root, clear?, positional),
+  defp validate_source_preference(registry, project, application, mode) do
+    with {:ok, declaration} <- declared_source_row(registry, project, application),
+         source = SourcePreferences.resolution_mode(mode),
+         true <- eligible_preference_source?(registry, application, declaration, source) ||
+                   {:error, {:ineligible_source_preference, project, application, mode}} do
+      :ok
+    end
+  end
+
+  defp declared_source_row(registry, project, application) do
+    case Map.fetch(Registry.dependency_sources(registry, project), application) do
+      {:ok, declaration} -> {:ok, declaration}
+      :error -> {:error, {:undeclared_source_preference, project, application}}
+    end
+  end
+
+  defp eligible_preference_source?(registry, application, declaration, "local") do
+    Source.reaches?(declaration, "local") and Registry.providers(registry, application) != []
+  end
+
+  defp eligible_preference_source?(_registry, _application, declaration, "github") do
+    Source.reaches?(declaration, "github") and not is_nil(declaration.github)
+  end
+
+  defp eligible_preference_source?(_registry, _application, declaration, "hex") do
+    Source.reaches?(declaration, "hex") and not is_nil(declaration.hex)
+  end
+
+  defp eligible_preference_source?(_registry, _application, _declaration, _source), do: false
+
+  defp source_preferences_path do
+    with {:ok, paths} <- OperatorPaths.resolve(%{}, [:source_preferences]) do
+      {:ok, Map.fetch!(paths, :source_preferences)}
+    end
+  end
+
+  defp use_preference(_registry, _project, clear?, positional),
     do: {:usage_error, "invalid use arguments with clear=#{clear?}: #{inspect(positional)}"}
 
   defp source_name("local"), do: {:ok, "local"}

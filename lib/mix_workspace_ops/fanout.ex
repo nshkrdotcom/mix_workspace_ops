@@ -250,6 +250,7 @@ defmodule MixWorkspaceOps.Fanout do
              target_head: field(expected, :head),
              target_source_digest: field(expected, :source_digest),
              binding_root: root,
+             project_identity: field(unit, :id),
              mix_env: field(policy, :mix_env),
              mix_target: field(policy, :mix_target),
              prepare_objects: true,

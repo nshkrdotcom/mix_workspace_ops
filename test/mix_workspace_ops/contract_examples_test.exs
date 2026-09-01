@@ -5,7 +5,7 @@ defmodule MixWorkspaceOps.ContractExamplesTest do
 
   @runner Path.expand("../../examples/delegated_runner.exs", __DIR__)
 
-  test "a delegated runner inherits sources, owns child state, and keys reuse by context",
+  test "a delegated runner inherits sources and reuses state without caching command results",
        context do
     root = temporary_directory!(context)
     core = initialize_repository!(Path.join(root, "core"))
@@ -40,10 +40,10 @@ defmodule MixWorkspaceOps.ContractExamplesTest do
 
     assert {first_output, 0} = run_example(consumer, runner_state, first.env)
     assert first_output =~ ":local"
-    assert first_output =~ "EXECUTED"
+    assert first_output =~ "NEW_CONTEXT"
 
     assert {second_output, 0} = run_example(consumer, runner_state, first.env)
-    assert second_output =~ "REUSED"
+    assert second_output =~ "REUSED_CONTEXT"
 
     File.write!(Path.join(core, "lib/core.ex"), "defmodule Core, do: def(value, do: :changed)\n")
 
@@ -53,14 +53,14 @@ defmodule MixWorkspaceOps.ContractExamplesTest do
                mix_state: :delegated
              )
 
-    refute changed.report.context_digest == first.report.context_digest
+    assert changed.report.context_digest == first.report.context_digest
     assert {changed_output, 0} = run_example(consumer, runner_state, changed.env)
     assert changed_output =~ ":changed"
-    assert changed_output =~ "EXECUTED"
+    assert changed_output =~ "REUSED_CONTEXT"
 
     refute File.exists?(Path.join(consumer, "deps"))
     refute File.exists?(Path.join(consumer, "_build"))
-    assert File.dir?(Path.join(runner_state, "receipts"))
+    assert File.dir?(Path.join(runner_state, "contexts"))
     refute File.exists?(Path.join(runner_state, "children"))
   end
 

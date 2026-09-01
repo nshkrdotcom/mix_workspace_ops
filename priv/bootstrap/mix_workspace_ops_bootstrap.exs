@@ -12,9 +12,7 @@ defmodule MixWorkspaceOpsBootstrap do
   @maximum_mix_bytes 1024 * 1024
   @overlay_env "MIX_WORKSPACE_OPS_OVERLAY"
   @lockfile_env "MIX_WORKSPACE_OPS_LOCKFILE"
-  @exact_hex_env "MIX_WORKSPACE_OPS_EXACT_HEX"
   @maximum_overlay_bytes 16 * 1024 * 1024
-  @maximum_exact_hex_entries 4096
   @modes ["auto", "local", "git", "hex"]
   @absent "-"
 
@@ -204,37 +202,27 @@ defmodule MixWorkspaceOpsBootstrap do
 
   def active?(_project_root \\ nil), do: not is_nil(overlay())
 
-  @doc "Installs the operator lockfile into Mix's pending project configuration."
+  @doc "Installs the private operational lockfile through the single Mix compatibility seam."
   def install_project_options! do
     case System.get_env(@lockfile_env) do
-      value when value in [nil, ""] ->
-        :ok
-
-      path ->
-        if Process.whereis(Mix.ProjectStack) do
-          Mix.ProjectStack.post_config(lockfile: validate_lockfile!(path))
-        end
-
-        :ok
+      value when value in [nil, ""] -> :ok
+      path -> path |> validate_lockfile!() |> LockfileCompat.install!()
     end
   end
 
-  @doc "Installs exact retained Hex paths ahead of Hex's ordinary SCM."
-  def install_exact_dependencies! do
-    with false <- publish_mode?(System.argv()),
-         path when is_binary(path) <- exact_hex_manifest_path(),
-         exact when map_size(exact) > 0 <- cached_exact_hex!(path) do
-      Mix.SCM.prepend(MixWorkspaceOpsBootstrap.ExactHexSCM)
-    else
-      _inactive_or_publishing -> :ok
-    end
-  end
+  # There is no public Mix environment variable for redirecting the project
+  # lockfile while preserving arbitrary external Mix task semantics. Keep the
+  # one required private API behind this deliberately tiny compatibility seam.
+  defmodule LockfileCompat do
+    @moduledoc false
 
-  @doc "Returns the retained exact Hex entry for one application, when active."
-  def exact_hex_entry(app) when is_atom(app) do
-    case exact_hex_manifest_path() do
-      nil -> nil
-      path -> path |> cached_exact_hex!() |> Map.get(Atom.to_string(app))
+    def install!(path) do
+      if Process.whereis(Mix.ProjectStack) do
+        Mix.ProjectStack.post_config(lockfile: path)
+        :ok
+      else
+        raise "Mix.ProjectStack is unavailable; cannot install MWO private lockfile"
+      end
     end
   end
 
@@ -320,156 +308,6 @@ defmodule MixWorkspaceOpsBootstrap do
     case Keyword.merge(opts, extra_opts) do
       [] -> {app, requirement}
       merged -> {app, requirement, merged}
-    end
-  end
-
-  defp exact_hex_manifest_path do
-    case System.get_env(@exact_hex_env) do
-      value when value in [nil, ""] -> nil
-      path when is_binary(path) -> absolute_path!(@exact_hex_env, path)
-    end
-  end
-
-  defp cached_exact_hex!(path) do
-    table = state_table()
-    key = {:exact_hex, path}
-
-    case :ets.lookup(table, key) do
-      [{^key, entries}] ->
-        entries
-
-      [] ->
-        entries = parse_exact_hex!(path)
-
-        if :ets.insert_new(table, {key, entries}) do
-          entries
-        else
-          [{^key, winner}] = :ets.lookup(table, key)
-          winner
-        end
-    end
-  end
-
-  defp parse_exact_hex!(path) do
-    unless File.regular?(path) and File.stat!(path).size <= @maximum_overlay_bytes do
-      raise "#{@exact_hex_env} points to a missing or oversized manifest: #{path}"
-    end
-
-    case path |> File.read!() |> String.split("\n", trim: true) do
-      ["mix_workspace_ops.exact_hex/v2" | rows] ->
-        Enum.reduce(rows, %{}, &parse_exact_hex_row!/2)
-
-      _invalid ->
-        raise "invalid Mix Workspace Ops exact Hex manifest at #{path}"
-    end
-  end
-
-  defp parse_exact_hex_row!(row, entries) do
-    with [app, version, encoded] <- String.split(row, "\t"),
-         true <- Regex.match?(~r/^[a-z][a-z0-9_]*$/, app),
-         {:ok, _version} <- Version.parse(version),
-         true <- map_size(entries) < @maximum_exact_hex_entries,
-         false <- Map.has_key?(entries, app),
-         {:ok, path} <- Base.url_decode64(encoded, padding: false),
-         true <- Path.type(path) == :absolute,
-         true <- File.regular?(Path.join(path, "mix.exs")),
-         true <- File.regular?(Path.join(path, ".hex")) do
-      Map.put(entries, app, %{path: path, version: version})
-    else
-      _invalid -> raise "invalid Mix Workspace Ops exact Hex row: #{inspect(row)}"
-    end
-  end
-
-  defp absolute_path!(environment, path) do
-    if Path.type(path) == :absolute,
-      do: path,
-      else: raise("#{environment} must contain an absolute path")
-  end
-
-  defmodule ExactHexSCM do
-    @moduledoc false
-    @behaviour Mix.SCM
-
-    @explicit_sources [:path, :git, :github, :in_umbrella]
-    @hex_sources [:hex, :repo, :organization, :warn_if_outdated]
-
-    @impl Mix.SCM
-    def fetchable?, do: false
-
-    @impl Mix.SCM
-    def format(opts), do: "exact Hex object at #{opts[:path]}"
-
-    @impl Mix.SCM
-    def format_lock(_opts), do: nil
-
-    @impl Mix.SCM
-    def accepts_options(app, opts) do
-      with false <- MixWorkspaceOpsBootstrap.publish_mode?(System.argv()),
-           false <- Enum.any?(@explicit_sources, &Keyword.has_key?(opts, &1)),
-           %{path: path, version: version} <- MixWorkspaceOpsBootstrap.exact_hex_entry(app),
-           :ok <- validate_requirement!(app, version) do
-        opts
-        |> Keyword.drop(@hex_sources)
-        |> Keyword.put(:path, path)
-        |> Keyword.put(:dest, path)
-        |> Keyword.put(:mix_workspace_ops_exact_hex, true)
-      else
-        _other_source_or_absent -> nil
-      end
-    end
-
-    @impl Mix.SCM
-    def checked_out?(opts), do: File.dir?(opts[:dest])
-
-    @impl Mix.SCM
-    def lock_status(_opts), do: :ok
-
-    @impl Mix.SCM
-    def equal?(left, right), do: left[:dest] == right[:dest]
-
-    @impl Mix.SCM
-    def managers(_opts), do: []
-
-    @impl Mix.SCM
-    def checkout(opts) do
-      Mix.raise("Missing retained exact Hex object at #{opts[:dest]}")
-    end
-
-    @impl Mix.SCM
-    def update(opts), do: opts[:lock]
-
-    defp validate_requirement!(app, version) do
-      requirement = declared_requirement(app)
-
-      case Mix.Dep.Loader.vsn_match(requirement, version, app) do
-        {:ok, true} ->
-          :ok
-
-        {:ok, false} ->
-          Mix.raise(
-            "Retained exact Hex dependency #{inspect(app)} #{version} does not match " <>
-              "the requirement #{inspect(requirement)}"
-          )
-
-        {:error, reason} ->
-          Mix.raise("Invalid retained exact Hex version #{inspect(version)} for #{inspect(app)}: #{inspect(reason)}")
-      end
-    end
-
-    defp declared_requirement(app) do
-      Mix.Project.config()
-      |> Keyword.get(:deps, [])
-      |> Enum.find_value(fn
-        {^app, requirement, _opts}
-        when is_binary(requirement) or is_struct(requirement, Regex) ->
-          requirement
-
-        {^app, requirement} when is_binary(requirement) or is_struct(requirement, Regex) ->
-          requirement
-
-        _other ->
-          nil
-      end)
     end
   end
 

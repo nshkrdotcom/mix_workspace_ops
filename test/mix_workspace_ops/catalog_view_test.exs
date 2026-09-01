@@ -103,32 +103,4 @@ defmodule MixWorkspaceOps.CatalogViewTest do
     assert {:error, {:unknown_view_selector_keys, ["group_any"]}} = View.load(path)
   end
 
-  test "a v1 view still loads and selects a v1 document by project tag", context do
-    root = temporary_directory!(context)
-
-    registry =
-      root
-      |> write_registry!([
-        repository("alpha", [project("alpha", nil, tags: ["ecosystem", "pilot"])]),
-        repository("beta", [project("beta", nil, tags: ["ecosystem"])])
-      ])
-      |> Registry.load!()
-
-    {:ok, view} = View.load(write_legacy_view!(root, "pilot", %{"tags_any" => ["pilot"]}))
-
-    assert view.schema == "mix_workspace_ops.view/v1"
-    assert {:ok, [%{id: "alpha"}]} = View.select(registry, view)
-    assert {:ok, [%{id: "alpha"}]} = View.select_repositories(registry, view)
-  end
-
-  test "a v1 view matches a v2 document against repository groups", context do
-    root = temporary_directory!(context)
-    registry = catalog(root)
-
-    {:ok, view} =
-      View.load(write_legacy_view!(root, "runtime", %{"tags_any" => ["family.runtime"]}))
-
-    assert {:ok, repositories} = View.select_repositories(registry, view)
-    assert Enum.map(repositories, & &1.id) == ["alpha", "beta"]
-  end
 end

@@ -86,8 +86,7 @@ defmodule MixWorkspaceOps.Overlay do
          {:ok, lock_bytes} <- source_lock(target_root),
          target_head <- Git.head!(target_root),
          target_source_digest <- Git.source_digest(target_root),
-         context <-
-           context_contents(registry, decided, target_project, attributed, lock_bytes),
+         context <- context_contents(registry, decided, target_project, attributed),
          context_digest <- digest(context),
          target_state <- %{
            head: target_head,
@@ -104,6 +103,7 @@ defmodule MixWorkspaceOps.Overlay do
              target_head: target_head,
              target_source_digest: target_source_digest,
              binding_root: target_root,
+             project_identity: target_project.id,
              mix_env: inputs.mix_env,
              mix_target: inputs.mix_target,
              allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
@@ -347,20 +347,11 @@ defmodule MixWorkspaceOps.Overlay do
     |> Kernel.<>("\n")
   end
 
-  defp context_contents(registry, decided, target_project, attributed, lock_bytes) do
-    target_repository = Registry.repository!(registry, target_project.repository)
-
+  defp context_contents(registry, decided, target_project, attributed) do
     metadata = [
       @context_header,
-      "selection_digest\t#{selection_digest(registry)}",
-      "graph_digest\t#{decided.closure.digest}",
       "mix_env\t#{decided.mix_env}",
       "mix_target\t#{decided.mix_target}",
-      "target\t#{decided.target}",
-      "publish\t#{decided.publish?}",
-      "target_repository\t#{target_repository.github}",
-      "target_project_path\t#{target_project.path}",
-      "lock_digest\t#{digest(lock_bytes)}",
       "toolchain\telixir-#{System.version()}-otp-#{:erlang.system_info(:otp_release)}"
     ]
 
@@ -374,33 +365,19 @@ defmodule MixWorkspaceOps.Overlay do
     |> Kernel.<>("\n")
   end
 
-  # A local source in the target's own repository is identified by where it
-  # sits in that repository, never by its revision: the target's own dirt is
-  # already covered by the overlay digest, and folding it in here would make
-  # the context digest change for every uncommitted edit to the thing being
-  # built.
+  # Local source content is deliberately not a cache-identity input. The
+  # portable provider/repository/project coordinates and source mode determine
+  # compatibility; Mix incremental compilation observes content changes inside
+  # the stable build context. The full overlay still records current revision
+  # and source digest for audit/binding verification.
   defp semantic_source(
          registry,
          decision,
-         [app, "local", _path, revision, source_digest, opts],
-         target_repository
+         [app, "local", _path, _revision, _source_digest, opts],
+         _target_repository
        ) do
     {repository, project_path} = provider_coordinates(registry, decision)
-
-    if repository == target_repository do
-      join(["source", app, "local", github(registry, repository), project_path, opts])
-    else
-      join([
-        "source",
-        app,
-        "local",
-        github(registry, repository),
-        project_path,
-        revision,
-        source_digest,
-        opts
-      ])
-    end
+    join(["source", app, "local", github(registry, repository), project_path, opts])
   end
 
   defp semantic_source(

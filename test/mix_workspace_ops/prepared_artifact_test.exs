@@ -45,7 +45,7 @@ defmodule MixWorkspaceOps.PreparedArtifactTest do
     assert {:ok, %{archive_path: nil, archive_sha256: nil}} = PreparedArtifact.load(path)
   end
 
-  test "loads the v1 handoff as incomplete compatibility data", context do
+  test "rejects the removed v1 handoff schema", context do
     path = Path.join(System.tmp_dir!(), "mwo-v1-handoff-#{context.test}.json")
 
     File.write!(path, """
@@ -59,8 +59,7 @@ defmodule MixWorkspaceOps.PreparedArtifactTest do
     }}
     """)
 
-    assert {:ok, handoff} = PreparedArtifact.load(path)
-    assert handoff.manifest_path == nil
-    assert handoff.manifest_sha256 == nil
+    assert {:error, {:prepared_artifact, ^path, :invalid}} = PreparedArtifact.load(path)
   end
+
 end

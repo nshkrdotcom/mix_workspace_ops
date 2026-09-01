@@ -1,5 +1,5 @@
 defmodule MixWorkspaceOps.Drift do
-  @moduledoc "Fail-closed reconciliation of live checkout evidence with catalog and ledger."
+  @moduledoc "Severity-aware reconciliation of live checkout evidence with registry and operator ledger."
 
   alias MixWorkspaceOps.{Discovery, Git, OperatorLedger, Registry, RemoteIdentity}
 
@@ -53,8 +53,11 @@ defmodule MixWorkspaceOps.Drift do
          stale_ignore_rows)
       |> Enum.sort_by(&{&1["path"], &1["status"], &1["source"] || "checkout"})
 
+    entries = Enum.map(entries, &put_severity/1)
     counts = Enum.frequencies_by(entries, & &1["status"])
-    blocking = Enum.filter(entries, &(&1["status"] in ["discovered", "failed"]))
+    errors = Enum.filter(entries, &(&1["severity"] == "error"))
+    warnings = Enum.filter(entries, &(&1["severity"] == "warning"))
+    info = Enum.filter(entries, &(&1["severity"] == "info"))
 
     %{
       schema: @schema,
@@ -62,7 +65,10 @@ defmodule MixWorkspaceOps.Drift do
       registry: %{schema: registry.schema, digest: registry.digest},
       ledger: %{path: ledger.path, digest: ledger.digest},
       checkout_root: inventory.checkout_root,
-      healthy: blocking == [],
+      healthy: errors == [],
+      errors: errors,
+      warnings: warnings,
+      info: info,
       summary: %{
         total: length(entries),
         discovered: Map.get(counts, "discovered", 0),
@@ -70,11 +76,14 @@ defmodule MixWorkspaceOps.Drift do
         ignored: Map.get(counts, "ignored", 0),
         dispositioned: Map.get(counts, "dispositioned", 0),
         failed: Map.get(counts, "failed", 0),
+        errors: length(errors),
+        warnings: length(warnings),
+        info: length(info),
         absent_catalog: map_size(registry.repositories) - MapSet.size(observed_ids)
       },
       entries: entries,
       absent_catalog: absent_catalog(registry, observed_ids),
-      unexplained: Enum.map(blocking, & &1["path"])
+      unexplained: Enum.map(errors ++ warnings, & &1["path"]) |> Enum.uniq() |> Enum.sort()
     }
   end
 
@@ -277,6 +286,28 @@ defmodule MixWorkspaceOps.Drift do
     |> Map.put("reason", reason)
     |> Map.put("evidence", evidence)
   end
+
+  # Severity is intentionally independent of legacy discovery status. An
+  # unexplained scratch checkout or stale ignore is a warning; contradictions
+  # in an exact binding or ambiguous portfolio identity are errors.
+  defp put_severity(%{"severity" => _severity} = entry), do: entry
+
+  defp put_severity(%{"source" => "ledger_binding", "status" => "failed"} = entry),
+    do: Map.put(entry, "severity", "error")
+
+  defp put_severity(%{"reason" => "ambiguous_catalog_identity"} = entry),
+    do: Map.put(entry, "severity", "error")
+
+  defp put_severity(%{"status" => "failed"} = entry),
+    do: Map.put(entry, "severity", "warning")
+
+  defp put_severity(%{"status" => "discovered"} = entry),
+    do: Map.put(entry, "severity", "warning")
+
+  defp put_severity(%{"status" => "not_a_repository"} = entry),
+    do: Map.put(entry, "severity", "info")
+
+  defp put_severity(entry), do: Map.put(entry, "severity", "info")
 
   defp absent_catalog(registry, observed_ids) do
     registry.repositories

@@ -39,7 +39,7 @@ defmodule MixWorkspaceOps.RuntimeTest do
     assert Enum.all?(first_paths ++ second_paths, &String.starts_with?(&1, state_root))
   end
 
-  test "target revisions and source digests select new writable dependency and build contexts",
+  test "target revisions, dirty source digests, and checkout roots reuse compatible contexts",
        context do
     state_root = temporary_directory!(context)
 
@@ -48,7 +48,11 @@ defmodule MixWorkspaceOps.RuntimeTest do
                state_root,
                @cache_identity,
                @lock,
-               runtime_opts(target_head: String.duplicate("1", 40))
+               runtime_opts(
+                 target_head: String.duplicate("1", 40),
+                 target_source_digest: String.duplicate("a", 64),
+                 binding_root: "/tmp/one"
+               )
              )
 
     assert {:ok, second} =
@@ -58,7 +62,8 @@ defmodule MixWorkspaceOps.RuntimeTest do
                @lock,
                runtime_opts(
                  target_head: String.duplicate("2", 40),
-                 target_source_digest: String.duplicate("b", 64)
+                 target_source_digest: String.duplicate("b", 64),
+                 binding_root: "/tmp/two"
                )
              )
 
@@ -67,12 +72,11 @@ defmodule MixWorkspaceOps.RuntimeTest do
       finish_and_release(second.handle)
     end)
 
-    assert first.report.cache_identity == second.report.cache_identity
-    refute first.report.dependency_identity == second.report.dependency_identity
-    refute first.report.execution_identity == second.report.execution_identity
+    assert first.report.dependency_identity == second.report.dependency_identity
+    assert first.report.execution_identity == second.report.execution_identity
+    assert first.report.deps_path == second.report.deps_path
+    assert first.report.build_path == second.report.build_path
     refute first.report.root == second.report.root
-    refute first.report.deps_path == second.report.deps_path
-    refute first.report.build_path == second.report.build_path
   end
 
   test "lock mutation is rejected unless the invocation explicitly permits it", context do
@@ -107,14 +111,15 @@ defmodule MixWorkspaceOps.RuntimeTest do
     assert File.read!(allowed.report.source_lock) == @lock
   end
 
-  test "an overlay source that differs from the source lock drops the stale entry", context do
+  test "a path-backed overlay projects only its top-level lock entry", context do
     state_root = temporary_directory!(context)
 
     lock =
       inspect(%{
         alpha:
           {:hex, :alpha, "1.0.0", String.duplicate("1", 64), [:mix], [], "hexpm",
-           String.duplicate("2", 64)}
+           String.duplicate("2", 64)},
+        untouched: {:git, "https://example.invalid/untouched.git", String.duplicate("a", 40), []}
       }) <> "\n"
 
     assert {:ok, runtime} =
@@ -122,40 +127,46 @@ defmodule MixWorkspaceOps.RuntimeTest do
                state_root,
                @cache_identity,
                lock,
-               runtime_opts(managed_sources: %{"alpha" => "github"})
+               runtime_opts(path_apps: ["alpha"])
              )
 
     on_exit(fn -> finish_and_release(runtime.handle) end)
     assert File.read!(runtime.report.source_lock) == lock
-    assert File.read!(runtime.report.lockfile) == "%{}\n"
+    projected = File.read!(runtime.report.lockfile)
+    refute projected =~ "alpha"
+    assert projected =~ "untouched"
   end
 
-  test "lock, environment, target and bound checkout select distinct exact contexts", context do
+  test "dependency/build identity changes only for semantically incompatible contexts", context do
     state_root = temporary_directory!(context)
 
-    variants = [
-      runtime_opts(),
-      runtime_opts(mix_env: "test"),
-      runtime_opts(mix_target: "other"),
-      runtime_opts(binding_root: "/tmp/mix_workspace_ops_runtime_test_other")
-    ]
+    assert {:ok, base} = Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts())
+    assert {:ok, moved} =
+             Runtime.prepare(
+               state_root,
+               @cache_identity,
+               @lock,
+               runtime_opts(binding_root: "/tmp/mix_workspace_ops_runtime_test_other")
+             )
 
-    runtimes =
-      Enum.map(variants, fn opts ->
-        assert {:ok, runtime} = Runtime.prepare(state_root, @cache_identity, @lock, opts)
-        runtime
-      end)
+    assert {:ok, test_env} =
+             Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts(mix_env: "test"))
+
+    assert {:ok, other_target} =
+             Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts(mix_target: "other"))
 
     changed_lock = String.replace(@lock, "1.0.0", "2.0.0")
-
-    assert {:ok, lock_runtime} =
+    assert {:ok, changed_deps} =
              Runtime.prepare(state_root, @cache_identity, changed_lock, runtime_opts())
 
-    runtimes = runtimes ++ [lock_runtime]
+    runtimes = [base, moved, test_env, other_target, changed_deps]
     on_exit(fn -> Enum.each(runtimes, &finish_and_release(&1.handle)) end)
 
-    assert runtimes |> Enum.map(& &1.report.deps_path) |> Enum.uniq() |> length() == 5
-    assert runtimes |> Enum.map(& &1.report.build_path) |> Enum.uniq() |> length() == 5
+    assert base.report.deps_path == moved.report.deps_path
+    assert base.report.build_path == moved.report.build_path
+    assert test_env.report.deps_path != base.report.deps_path
+    assert other_target.report.deps_path != base.report.deps_path
+    assert changed_deps.report.deps_path != base.report.deps_path
   end
 
   test "ordinary runtime state hides inherited publication capability", context do

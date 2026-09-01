@@ -32,13 +32,17 @@ defmodule MixWorkspaceOps.Doctor do
       |> Enum.map(&inspect_repository(registry, &1, catalogued, metadata))
 
     checks = Enum.flat_map(repositories, & &1.checks)
+    errors = Enum.filter(checks, &(not &1.pass and &1.severity == :error))
+    warnings = Enum.filter(checks, &(not &1.pass and &1.severity == :warning))
 
     %{
       schema: "mix_workspace_ops.doctor/v1",
       registry: registry.path,
       registry_digest: registry.digest,
       sets: Registry.sets(registry),
-      healthy: Enum.all?(checks, & &1.pass),
+      healthy: errors == [],
+      errors: errors,
+      warnings: warnings,
       repositories: repositories
     }
   end
@@ -51,10 +55,10 @@ defmodule MixWorkspaceOps.Doctor do
     end
   end
 
-  # An absent checkout carries no checks, so it neither passes nor fails: there
-  # is nothing on disk to hold to the catalog. It is still a row, because a
-  # report that omitted it would be indistinguishable from one where every
-  # repository was present.
+  # An absent checkout is a warning rather than an identity error: there is
+  # nothing on disk to hold to the catalog. It is still a row, because a report
+  # that omitted it would be indistinguishable from one where every repository
+  # was present.
   defp absent_repository(repository, expected) do
     %{
       id: repository.id,
@@ -62,7 +66,7 @@ defmodule MixWorkspaceOps.Doctor do
       root: nil,
       expected_root: expected,
       healthy: true,
-      checks: [],
+      checks: [check(:checkout_present, false, expected, :warning)],
       projects: []
     }
   end
@@ -75,8 +79,8 @@ defmodule MixWorkspaceOps.Doctor do
         check(:directory, File.dir?(root), root),
         check(:git_root, git_root?(root), root),
         check(:remote, remote_matches?(root, repository.github, catalogued), repository.github),
-        check(:clean, Git.clean?(root), root),
-        check(:branch, Git.branch!(root) == repository.default_branch, repository.default_branch)
+        check(:clean, Git.clean?(root), root, :warning),
+        check(:branch, Git.branch!(root) == repository.default_branch, repository.default_branch, :warning)
       ] ++ Enum.flat_map(projects, & &1.checks)
 
     %{
@@ -84,7 +88,7 @@ defmodule MixWorkspaceOps.Doctor do
       status: "bound",
       root: root,
       expected_root: root,
-      healthy: all_pass?(checks),
+      healthy: no_error_failures?(checks),
       checks: checks,
       projects: projects
     }
@@ -127,6 +131,9 @@ defmodule MixWorkspaceOps.Doctor do
   defp remote_matches?(root, github, catalogued),
     do: match?({:ok, ^github}, Binding.resolve_identity(root, catalogued))
 
-  defp check(name, pass?, detail), do: %{name: name, pass: pass?, detail: detail}
-  defp all_pass?(checks), do: Enum.all?(checks, & &1.pass)
+  defp check(name, pass?, detail, severity \\ :error),
+    do: %{name: name, pass: pass?, severity: severity, detail: detail}
+
+  defp no_error_failures?(checks),
+    do: Enum.all?(checks, &(&1.pass or &1.severity != :error))
 end

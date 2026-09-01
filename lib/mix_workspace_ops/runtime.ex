@@ -10,12 +10,12 @@ defmodule MixWorkspaceOps.Runtime do
   """
 
   alias Mix.Sync.Lock, as: SyncLock
-  alias MixWorkspaceOps.{DependencyLock, GitCache, HexCache, Report}
+  alias MixWorkspaceOps.{GitCache, Lockfile, Report}
 
   @state_marker "mix_workspace_ops.state/v1\n"
-  @runtime_schema "mix_workspace_ops.runtime/v3"
-  @list_schema "mix_workspace_ops.state_list/v2"
-  @gc_schema "mix_workspace_ops.state_gc/v2"
+  @runtime_schema "mix_workspace_ops.runtime/v4"
+  @list_schema "mix_workspace_ops.state_list/v3"
+  @gc_schema "mix_workspace_ops.state_gc/v3"
   @access_marker ".mwo-access"
   @metadata_atom_keys %{
     "created_at" => :created_at,
@@ -45,7 +45,6 @@ defmodule MixWorkspaceOps.Runtime do
     "build_root" => :build_root,
     "build_path" => :build_path,
     "mix_exs" => :mix_exs,
-    "exact_hex_manifest" => :exact_hex_manifest,
     "lockfile" => :lockfile
   }
   @publication_credentials ~w(
@@ -131,8 +130,9 @@ defmodule MixWorkspaceOps.Runtime do
 
     with :ok <- valid_ownership(ownership),
          :ok <- valid_identity(:cache_identity, cache_identity),
-         {:ok, execution_inputs} <- execution_inputs(opts),
-         dependency_identity <- dependency_identity(cache_identity, lock_bytes, execution_inputs),
+         {:ok, execution_inputs} <- execution_inputs(Keyword.put_new(opts, :project_identity, cache_identity)),
+         {:ok, operational_lock} <- operational_lock(lock_bytes, opts),
+         dependency_identity <- dependency_identity(cache_identity, operational_lock, execution_inputs),
          execution_identity <- execution_identity(dependency_identity, execution_inputs),
          :ok <- ensure_state_root(state_root),
          {:ok, root, run_id} <- create_run_root(state_root, execution_identity),
@@ -147,6 +147,7 @@ defmodule MixWorkspaceOps.Runtime do
              state_root,
              identities,
              lock_bytes,
+             operational_lock,
              %{
                run_id: run_id,
                binding_root: execution_inputs.binding_root,
@@ -155,7 +156,7 @@ defmodule MixWorkspaceOps.Runtime do
                created_at: created_at
              }
            ) do
-      prepare_run(handle, lock_bytes, execution_inputs, opts)
+      prepare_run(handle, lock_bytes, operational_lock, execution_inputs, opts)
     end
   end
 
@@ -270,7 +271,7 @@ defmodule MixWorkspaceOps.Runtime do
 
   def parse_age(value), do: {:error, {:invalid_gc_age, value}}
 
-  defp prepare_run(handle, lock_bytes, execution_inputs, opts) do
+  defp prepare_run(handle, lock_bytes, operational_lock, execution_inputs, opts) do
     paths = runtime_paths(handle)
 
     result =
@@ -280,10 +281,8 @@ defmodule MixWorkspaceOps.Runtime do
            {:ok, paths} <- create_state_directories(paths, handle.created_at),
            :ok <-
              copy_archives(paths.archives, Keyword.get(opts, :archives_source, archives_source())),
-           {:ok, cache_objects} <- prepare_dependency_objects(handle, lock_bytes, paths, opts),
-           :ok <- write_exact_hex_manifest(paths.exact_hex, cache_objects.hex),
+           {:ok, cache_objects} <- prepare_git_transport(handle, lock_bytes, paths, opts),
            :ok <- write_mix_wrapper(paths.mix_exs),
-           {:ok, operational_lock} <- operational_lock(lock_bytes, cache_objects, opts),
            :ok <- write_private(Path.join(handle.root, "source.mix.lock"), lock_bytes),
            {:ok, lockfile} <- prepare_lockfile(handle, paths, operational_lock),
            handle = %{
@@ -311,7 +310,7 @@ defmodule MixWorkspaceOps.Runtime do
     end
   end
 
-  defp handle(root, state_root, identities, lock_bytes, invocation) do
+  defp handle(root, state_root, identities, lock_bytes, operational_lock, invocation) do
     %__MODULE__{
       root: root,
       state_root: state_root,
@@ -324,7 +323,7 @@ defmodule MixWorkspaceOps.Runtime do
       lease_path: Path.join(root, "lease.json"),
       metadata_path: Path.join(root, "runtime.json"),
       source_lock_digest: lock_digest(lock_bytes),
-      operational_lock_digest: lock_digest(lock_bytes),
+      operational_lock_digest: lock_digest(operational_lock),
       allow_lock_mutation: invocation.allow_lock_mutation,
       created_at: invocation.created_at
     }
@@ -333,12 +332,19 @@ defmodule MixWorkspaceOps.Runtime do
   defp execution_inputs(opts) do
     keys = [:target_head, :target_source_digest, :mix_env, :mix_target, :binding_root]
 
-    Enum.reduce_while(keys, {:ok, %{}}, fn key, {:ok, acc} ->
-      case runtime_input(opts, key) do
-        {:ok, value} -> {:cont, {:ok, Map.put(acc, key, value)}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
+    with {:ok, inputs} <-
+           Enum.reduce_while(keys, {:ok, %{}}, fn key, {:ok, acc} ->
+             case runtime_input(opts, key) do
+               {:ok, value} -> {:cont, {:ok, Map.put(acc, key, value)}}
+               {:error, _reason} = error -> {:halt, error}
+             end
+           end) do
+      project_identity = Keyword.get(opts, :project_identity)
+
+      if is_binary(project_identity) and project_identity != "",
+        do: {:ok, Map.put(inputs, :project_identity, project_identity)},
+        else: {:error, {:invalid_runtime_input, :project_identity, project_identity}}
+    end
   end
 
   defp runtime_input(opts, key) do
@@ -354,13 +360,11 @@ defmodule MixWorkspaceOps.Runtime do
     end
   end
 
-  defp dependency_identity(cache_identity, lock_bytes, inputs) do
+  defp dependency_identity(cache_identity, operational_lock, inputs) do
     Report.encode(%{
-      cache_identity: cache_identity,
-      lock_digest: lock_digest(lock_bytes),
-      target_head: inputs.target_head,
-      target_source_digest: inputs.target_source_digest,
-      binding_root: inputs.binding_root,
+      version: 4,
+      source_fingerprint: cache_identity,
+      operational_lock_digest: lock_digest(operational_lock),
       mix_env: inputs.mix_env,
       mix_target: inputs.mix_target,
       toolchain: toolchain()
@@ -370,10 +374,11 @@ defmodule MixWorkspaceOps.Runtime do
 
   defp execution_identity(dependency_identity, inputs) do
     Report.encode(%{
+      version: 4,
+      project_identity: inputs.project_identity,
       dependency_identity: dependency_identity,
       mix_env: inputs.mix_env,
       mix_target: inputs.mix_target,
-      binding_root: inputs.binding_root,
       toolchain: toolchain()
     })
     |> sha256()
@@ -488,7 +493,6 @@ defmodule MixWorkspaceOps.Runtime do
       home: Path.join(handle.root, "home"),
       tmp: Path.join(handle.root, "tmp"),
       config: Path.join(handle.root, "config"),
-      exact_hex: Path.join(handle.root, "exact_hex.tsv"),
       mix_exs: Path.join(handle.root, "mix.exs"),
       xdg_cache: Path.join([handle.state_root, "cache", "xdg"]),
       hex_cache: Path.join([handle.state_root, "cache", "xdg", "hex"]),
@@ -655,30 +659,20 @@ defmodule MixWorkspaceOps.Runtime do
     end)
   end
 
-  defp prepare_dependency_objects(handle, lock_bytes, paths, opts) do
+  defp prepare_git_transport(handle, lock_bytes, paths, opts) do
     if Keyword.get(opts, :prepare_objects, false) do
-      with {:ok, objects} <- DependencyLock.parse(lock_bytes),
-           objects <- effective_objects(objects, Keyword.get(opts, :managed_sources, %{})),
-           {:ok, hex} <- prepare_hex_objects(handle, paths, objects.hex, opts),
-           {:ok, git} <- prepare_git_objects(handle, paths, objects.git, opts) do
-        {:ok, %{hex: hex, git: git, git_env: GitCache.environment(git)}}
+      managed_sources = Keyword.get(opts, :managed_sources, %{})
+
+      with {:ok, objects} <- GitCache.objects_from_lock(lock_bytes, managed_sources),
+           {:ok, git} <- prepare_git_objects(handle, paths, objects, opts) do
+        {:ok, %{git: git, git_env: GitCache.environment(git)}}
       end
     else
-      {:ok, %{hex: [], git: [], git_env: []}}
+      {:ok, empty_cache_objects()}
     end
   end
 
-  defp empty_cache_objects, do: %{hex: [], git: [], git_env: []}
-
-  defp write_exact_hex_manifest(path, objects) do
-    rows =
-      Enum.map(objects, fn object ->
-        encoded = Base.url_encode64(object.materialization.destination, padding: false)
-        "#{object.app}\t#{object.object.version}\t#{encoded}"
-      end)
-
-    write_private(path, Enum.join(["mix_workspace_ops.exact_hex/v2" | rows], "\n") <> "\n")
-  end
+  defp empty_cache_objects, do: %{git: [], git_env: []}
 
   defp write_mix_wrapper(path) do
     contents = """
@@ -689,7 +683,6 @@ defmodule MixWorkspaceOps.Runtime do
       bootstrap = System.fetch_env!("MIX_WORKSPACE_OPS_BOOTSTRAP")
       Code.require_file(bootstrap)
       Code.compile_file(Path.join(root, "mix.exs"))
-      MixWorkspaceOpsBootstrap.install_exact_dependencies!()
     else
       Code.compile_file(Path.join(current, "mix.exs"))
     end
@@ -698,76 +691,8 @@ defmodule MixWorkspaceOps.Runtime do
     write_private(path, contents)
   end
 
-  defp operational_lock(lock_bytes, cache_objects, opts) do
-    managed_sources = Keyword.get(opts, :managed_sources, %{})
-
-    path_apps =
-      opts
-      |> Keyword.get(:path_apps, [])
-      |> Kernel.++(Enum.map(cache_objects.hex, & &1.app))
-      |> Kernel.++(mismatched_source_apps(lock_bytes, managed_sources))
-      |> Enum.uniq()
-
-    DependencyLock.project(lock_bytes, path_apps)
-  end
-
-  defp mismatched_source_apps(lock_bytes, managed_sources) when is_map(managed_sources) do
-    lock_sources =
-      case DependencyLock.parse(lock_bytes) do
-        {:ok, objects} ->
-          Enum.reduce(objects.hex, %{}, &Map.put(&2, &1.app, "hex"))
-          |> then(fn sources ->
-            Enum.reduce(objects.git, sources, &Map.put(&2, &1.app, "github"))
-          end)
-
-        {:error, _invalid_lock} ->
-          %{}
-      end
-
-    for {app, source} <- managed_sources,
-        source in ["hex", "github"],
-        present = Map.get(lock_sources, app),
-        not is_nil(present),
-        present != source,
-        do: app
-  end
-
-  defp effective_objects(objects, managed_sources) when is_map(managed_sources) do
-    %{
-      hex: Enum.filter(objects.hex, &effective_object?(&1, "hex", managed_sources)),
-      git: Enum.filter(objects.git, &effective_object?(&1, "github", managed_sources))
-    }
-  end
-
-  defp effective_object?(object, expected, managed_sources) do
-    case Map.fetch(managed_sources, object.app) do
-      :error -> true
-      {:ok, ^expected} -> true
-      {:ok, _different_source} -> false
-    end
-  end
-
-  defp prepare_hex_objects(handle, paths, objects, opts) do
-    mix_executable = HexCache.mix_executable()
-
-    fetch =
-      Keyword.get_lazy(opts, :hex_fetch, fn ->
-        fn object ->
-          HexCache.fetch(object,
-            command: mix_executable,
-            env: cache_command_environment(paths),
-            temporary_root: paths.tmp
-          )
-        end
-      end)
-
-    map_objects(objects, opts, fn object ->
-      with {:ok, object_report} <- HexCache.ensure(handle.state_root, object, fetch),
-           {:ok, materialization} <-
-             HexCache.materialize(handle.state_root, object, paths.deps) do
-        {:ok, %{app: object.app, object: object_report, materialization: materialization}}
-      end
-    end)
+  defp operational_lock(lock_bytes, opts) do
+    Lockfile.project_path_apps(lock_bytes, Keyword.get(opts, :path_apps, []))
   end
 
   defp prepare_git_objects(handle, paths, objects, opts) do
@@ -813,8 +738,7 @@ defmodule MixWorkspaceOps.Runtime do
       {"MIX_BUILD_PATH", paths.build},
       {"MIX_EXS", paths.mix_exs},
       {"MIX_WORKSPACE_OPS_PROJECT_ROOT", handle.binding_root},
-      {"MIX_WORKSPACE_OPS_LOCKFILE", handle.lockfile},
-      {"MIX_WORKSPACE_OPS_EXACT_HEX", paths.exact_hex}
+      {"MIX_WORKSPACE_OPS_LOCKFILE", handle.lockfile}
     ]
 
     removed = Enum.map(publication_credential_keys(), &{&1, nil})
@@ -910,7 +834,6 @@ defmodule MixWorkspaceOps.Runtime do
       build_root: paths.build,
       build_path: paths.build,
       mix_exs: paths.mix_exs,
-      exact_hex_manifest: paths.exact_hex,
       lockfile: handle.lockfile
     }
   end
@@ -1090,7 +1013,7 @@ defmodule MixWorkspaceOps.Runtime do
 
     with {:ok, metadata} <- read_metadata(metadata_path),
          true <-
-           metadata["schema"] in [@runtime_schema, "mix_workspace_ops.runtime/v2"] ||
+           metadata["schema"] in [@runtime_schema, "mix_workspace_ops.runtime/v3", "mix_workspace_ops.runtime/v2"] ||
              {:error, {:runtime_schema, metadata_path}},
          {:ok, lease} <- lease_status(Path.join(root, "lease.json")) do
       {:ok,
@@ -1345,7 +1268,7 @@ defmodule MixWorkspaceOps.Runtime do
   defp context_lock(path), do: "mix_workspace_ops:context:" <> Path.expand(path)
 
   defp lock_digest(bytes) do
-    case DependencyLock.semantic_digest(bytes) do
+    case Lockfile.digest(bytes) do
       {:ok, digest} -> digest
       {:error, _reason} -> "invalid-" <> sha256(bytes)
     end

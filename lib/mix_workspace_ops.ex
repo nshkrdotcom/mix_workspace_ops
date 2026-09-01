@@ -1,6 +1,6 @@
 defmodule MixWorkspaceOps do
   @moduledoc """
-  Operator tooling for explicit Elixir workspace source overlays and releases.
+  Portfolio development and release control plane around ordinary Mix projects.
 
   This project is distributed as an escript and is not a Hex package.
   """

@@ -4,16 +4,19 @@ defmodule MixWorkspaceOps.OperatorPaths do
 
   An explicit flag wins, followed by the matching environment variable, then
   `${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/config.json`, then discovery
-  by walking upward from the working directory. The configuration document may
-  carry `registry`, `checkout_root`, and `ledger`; all paths are expanded when read.
+  by walking upward from the working directory or by a conventional XDG default
+  where the path is inherently operator-owned. The configuration document may
+  carry `registry`, `checkout_root`, `ledger`, and `source_preferences`; all
+  paths are expanded when read.
   """
 
-  alias MixWorkspaceOps.{Git, OperatorLedger, StrictJSON}
+  alias MixWorkspaceOps.{Git, OperatorLedger, SourcePreferences, StrictJSON}
 
   @fields %{
     registry: {"MIX_WORKSPACE_OPS_REGISTRY", "registry"},
     checkout_root: {"MIX_WORKSPACE_OPS_CHECKOUT_ROOT", "checkout_root"},
-    ledger: {"MIX_WORKSPACE_OPS_LEDGER", "ledger"}
+    ledger: {"MIX_WORKSPACE_OPS_LEDGER", "ledger"},
+    source_preferences: {nil, "source_preferences"}
   }
 
   @spec resolve(map(), [atom()]) :: {:ok, map()} | {:error, term()}
@@ -49,7 +52,7 @@ defmodule MixWorkspaceOps.OperatorPaths do
       present?(Map.get(options, field)) ->
         {:ok, Path.expand(Map.fetch!(options, field))}
 
-      present?(System.get_env(environment)) ->
+      is_binary(environment) and present?(System.get_env(environment)) ->
         {:ok, Path.expand(System.fetch_env!(environment))}
 
       present?(Map.get(config, config_key)) ->
@@ -89,7 +92,7 @@ defmodule MixWorkspaceOps.OperatorPaths do
   end
 
   defp validate_config(path, decoded) when is_map(decoded) do
-    unknown = Map.keys(decoded) -- ~w(registry checkout_root ledger)
+    unknown = Map.keys(decoded) -- ~w(registry checkout_root ledger source_preferences)
     invalid = Enum.reject(decoded, fn {_key, value} -> is_binary(value) and value != "" end)
 
     cond do
@@ -121,6 +124,8 @@ defmodule MixWorkspaceOps.OperatorPaths do
     path = OperatorLedger.default_path()
     if File.regular?(path), do: {:ok, path}, else: :missing
   end
+
+  defp discover(:source_preferences), do: {:ok, SourcePreferences.default_path()}
 
   defp walk_up(directory, name) do
     candidate = Path.join(directory, name)

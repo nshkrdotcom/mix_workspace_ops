@@ -39,6 +39,7 @@ defmodule MixWorkspaceOps.MixProject do
         "README.md",
         "guides/architecture.md",
         "guides/operator_ledger_and_drift.md",
+        "guides/dependency_impact.md",
         "guides/release_transaction.md",
         "examples/contract_examples.md"
       ]

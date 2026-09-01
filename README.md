@@ -13,59 +13,155 @@
 
 # Mix Workspace Ops
 
-Operator-first Elixir workspace tooling for safe local sibling dependency
-overlays, dependency-DAG planning, isolated Mix execution, reproducible Hex
-verification, and fail-closed releases across standalone projects and ponchos.
+Mix Workspace Ops (MWO) is an operator-side development and release control
+plane for a portfolio of independent Elixir/Mix repositories. It makes a
+polyrepo portfolio behave like an optionally composed workspace while every
+managed repository remains an ordinary standalone Mix project.
 
-Mix Workspace Ops is deliberately not a Hex package and never enters an
-application runtime dependency graph. It is an operator-built escript for
-coordinating independent source repositories while keeping each published
-package's `mix.exs` as the compatibility authority.
-
-## Status
-
-The project is under active pilot development. Its protocols and examples are
-ecosystem-neutral: a registry is supplied at invocation time, and no operator's
-repository inventory is compiled into the tool.
+MWO is an escript, not a Hex dependency. It decides **which** repositories and
+projects to operate on, verifies local identity, derives cross-repository
+relationships from real Mix metadata, chooses eligible dependency sources,
+arranges private/external execution state, delegates fan-out to Blitz, and
+coordinates release transactions. Mix remains authoritative for dependency,
+build, and task semantics; Hex and Git remain authoritative for their ordinary
+package/repository behavior.
 
 ## Build
 
+The repository currently declares Elixir `~> 1.19`.
+
 ```bash
 mix deps.get
+mix format --check-formatted
+mix test
 mix escript.build
 ./mix_workspace_ops version
 ```
 
-Install the built escript on an operator-owned path; do not copy it into a
-managed application's repository or invoke it through `sudo`.
+Install the built escript on an operator-owned path. Do not add MWO as a runtime
+dependency of managed applications and do not copy generated MWO state into
+managed repositories.
 
-## Boundary
+## Product boundary
 
-Mix Workspace Ops owns generic registry validation, explicit local dependency
-overlays, graph planning, release preconditions, clean-checkout verification,
-and publication receipts. It does not own a user's ecosystem registry,
-application runtime configuration, product acceptance, package projection
-semantics, or workspace impact scheduling.
+MWO owns generic portfolio operations:
 
-The default repository integration is zero code. Repositories without
-switchable cross-repository internal dependencies need no MWO file, module,
-task, or dependency. Existing `mix.exs` files remain authoritative; only a
-project whose dependency tuple must switch source needs the minimal Mix-load
-seam. Exceptional repository configuration, if ever required, is limited to one
-declarative manifest rather than a copied helper subsystem.
+- canonical portable registry/view validation;
+- verified local Git binding and local drift/health reporting;
+- authoritative Mix project probing;
+- managed dependency indexing and reverse impact analysis;
+- local/Git/Hex source policy and process-scoped overlays;
+- bounded command fan-out through Blitz;
+- portable plans and strict replay;
+- stable external dependency/build contexts and lease-aware GC;
+- fail-closed cross-repository release transactions.
 
-## The Mix-load seam
+It does **not** own organization `.github` automation, profile README generation,
+site generation/synchronization, application runtime composition, a generic
+workflow engine, or a replacement package manager/scheduler.
+
+## Registry, views, and local binding
+
+MWO consumes only:
+
+- `portfolio_registry.registry/v2`
+- `portfolio_registry.view/v2`
+
+The registry is repository-first, so repositories without Mix projects remain
+representable. Portable registry/view data contains identities and policy, not
+machine-local checkout paths or credentials.
+
+At invocation time MWO joins portable repository identity to local reality. A
+path is accepted only when Git remote/common-directory evidence matches the
+registry identity; a matching directory name is not sufficient. Scratch clones,
+worktrees, explicit local bindings, and ignored observations remain
+operator-owned state.
+
+Path resolution is centralized. Explicit flags win over matching environment
+variables, then `${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/config.json`,
+then documented discovery/defaults.
+
+Typical inspection commands:
+
+```bash
+./mix_workspace_ops registry validate --registry /portfolio/registry.json
+./mix_workspace_ops registry select \
+  --registry /portfolio/registry.json \
+  --view /portfolio/governed-stack.json
+./mix_workspace_ops registry discover \
+  --checkout-root ~/src \
+  --github-owner example-org \
+  --output /tmp/discovery.json
+./mix_workspace_ops registry drift \
+  --registry /portfolio/registry.json \
+  --checkout-root ~/src
+./mix_workspace_ops doctor \
+  --registry /portfolio/registry.json \
+  --checkout-root ~/src \
+  --view /portfolio/governed-stack.json
+```
+
+## Real Mix dependency truth
+
+Whether project A depends on application B comes from real `mix.exs` metadata
+observed under explicit `MIX_ENV`/`MIX_TARGET` inputs. Registry
+`dependency_sources` rows are **source-resolution declarations**, not dependency
+declarations.
+
+MWO evaluates project metadata in a disposable, time-limited probe tree with
+private Mix/Home state. That contains incidental writes and protects MWO's own
+process state, but it is not a kernel security sandbox: arbitrary `mix.exs` code
+still runs with the operator's OS authority.
+
+The selected-scope DependencyIndex classifies observed edges as managed,
+known-but-unselected, or external and carries coverage for selected, probed,
+absent, and failed/unprobeable projects.
+
+## Impact and affected execution
+
+Reverse impact is derived from the same managed dependency edges:
+
+```bash
+./mix_workspace_ops impact core \
+  --registry /portfolio/registry.json \
+  --checkout-root ~/src \
+  --view /portfolio/governed-stack.json \
+  --mix-env test --mix-target host
+```
+
+The report includes direct consumers, transitive affected projects,
+repository aggregation, explanation paths, and dependency-index coverage.
+
+Affected-only execution is a safe optimization. With complete coverage, MWO
+runs the affected closure. With incomplete coverage, it widens automatically to
+the full base selection and records the fallback rather than silently treating
+missing/unprobeable projects as unaffected:
+
+```bash
+./mix_workspace_ops run \
+  --affected core \
+  --registry /portfolio/registry.json \
+  --checkout-root ~/src \
+  --view /portfolio/governed-stack.json \
+  --mix-env test \
+  -- mix test
+```
+
+See [Dependency index and impact](guides/dependency_impact.md).
+
+## Source resolution and the Mix-load seam
+
+A managed repository's committed dependency tuple is always the standalone
+default. Repositories with no switchable cross-repository dependency need no
+MWO integration. A project that does need source substitution uses only the
+minimal bootstrap + wrapper seam:
 
 ```elixir
 if bootstrap = System.get_env("MIX_WORKSPACE_OPS_BOOTSTRAP"), do: Code.require_file(bootstrap)
 
 defp deps do
   [
-    workspace_dep({:example_core, "~> 1.0"}),
-    workspace_dep(
-      {:example_edge,
-       [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
-    )
+    workspace_dep({:example_core, "~> 1.0"})
   ]
 end
 
@@ -76,244 +172,163 @@ defp workspace_dep(committed) do
 end
 ```
 
-The first line is what puts the bootstrap on the code path, and the rest goes
-inside the `MixProject` module. Without that line nothing loads
-`MixWorkspaceOpsBootstrap`: it is an `.exs` file in operator state whose path
-arrives in `MIX_WORKSPACE_OPS_BOOTSTRAP`, so a `mix.exs` that only asks whether
-the module is loaded gets `false` every time and resolves nothing, while looking
-wired.
+Without MWO activation, `workspace_dep/1` returns the committed tuple unchanged.
+With an active overlay, only source coordinates are substituted; call-site
+semantics such as `only`, `targets`, `optional`, and `runtime` remain owned by
+the committed Mix declaration.
 
-The argument is an ordinary committed Mix dependency tuple. With no bootstrap,
-the wrapper returns it byte-for-byte unchanged. With a bootstrap, only its
-source may be substituted. The tuple contains the Hex requirement, or committed
-git coordinates for a dependency that has no Hex release, plus any call-site
-options. It is what the repository resolves to on a fresh clone with no tool
-involved, and `mwo seam --project ID` prints it rather than leaving it to be
-written by hand. `only:`, `optional:`, `runtime:` and `targets:` stay in the
-tuple because they say whether a dependency exists here at all.
+Source policy has four inputs with explicit precedence:
 
-Where an operator has activated an overlay, the row for that application decides
-instead, and the plan records which source it chose and why.
+1. committed `mix.exs` default;
+2. portable registry eligibility/order;
+3. operator SourcePreferences;
+4. one-command CLI overrides.
 
-## Registry-driven usage
-
-The portable catalog is repository-first. Each repository carries its remote
-identity, languages, lifecycle, disposition, visibility, roles, groups, and
-agent scope; Mix projects are an optional block within it, so a repository that
-builds nothing with Mix is still catalogued, grouped, and selectable. Where a
-repository consumes cross-repository applications, it also carries the
-dependency-source table that says how each one resolves, and the release-train
-membership of the packages it publishes.
-
-`portfolio_registry.registry/v2` and `portfolio_registry.view/v2` are the
-current schemas. `mix_workspace_ops.registry/v1` and `mix_workspace_ops.view/v1`
-still load.
-
-The operator supplies a checkout root at runtime; every checkout is then
-verified against its Git origin and Git common directory.
-
-Path flags are optional. Every command resolves them in the same order: flag,
-the matching `MIX_WORKSPACE_OPS_*` environment variable,
-`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/config.json`, then discovery.
-For the ledger, discovery means the conventional
-`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/operator_ledger.json` when it
-exists. A configured checkout therefore needs no repeated path flags:
-
-```json
-{
-  "registry": "/catalog/registry.json",
-  "checkout_root": "/operator/checkouts",
-  "ledger": "/operator/config/mix_workspace_ops/operator_ledger.json"
-}
-```
+Persistent SourcePreferences live at
+`${XDG_CONFIG_HOME:-~/.config}/mix_workspace_ops/source_preferences.json` (or an
+explicit operator configuration path). They contain only `local`, `git`, or
+`hex` preferences keyed by consumer project and application; they never contain
+checkout paths or Git coordinates.
 
 ```bash
-./mix_workspace_ops registry validate --registry /path/to/registry.json
-./mix_workspace_ops registry discover \
-  --checkout-root /path/to/checkouts \
-  --github-owner example-org \
-  --output /path/to/discovery.json
-./mix_workspace_ops registry drift \
-  --registry /path/to/registry.json \
-  --checkout-root /path/to/checkouts \
-  --ledger /path/to/operator_ledger.json
-./mix_workspace_ops registry select \
-  --registry /path/to/registry.json \
-  --view /path/to/view.json
-./mix_workspace_ops registry chain \
-  --registry /path/to/registry.json \
-  --package example_core
-./mix_workspace_ops plan \
-  --registry /path/to/registry.json \
-  --checkout-root /path/to/checkouts \
-  --view /path/to/view.json \
-  --mix-env dev --mix-target host \
-  -- mix compile
+./mix_workspace_ops why core --project app.web
+./mix_workspace_ops use core local --project app.web
+./mix_workspace_ops use core git   --project app.web
+./mix_workspace_ops use core hex   --project app.web
+./mix_workspace_ops use --clear core --project app.web
+```
+
+`use` validates that the consumer and source declaration exist and that the
+requested mode is eligible. A persisted explicit preference is intentional: if
+that source is temporarily unavailable, resolution fails until the preference
+is changed/cleared rather than silently falling through. Automatic mode, by
+contrast, walks the declared source order and can fall through unavailable
+candidates.
+
+`seam` and `sources` expose the generated/actual source behavior:
+
+```bash
 ./mix_workspace_ops seam \
-  --registry /path/to/registry.json \
-  --checkout-root /path/to/checkouts \
-  --project example.consumer
-./mix_workspace_ops why example_core --project example.consumer
-./mix_workspace_ops use example_core local --project example.consumer
-./mix_workspace_ops use --clear example_core --project example.consumer
+  --project app.web \
+  --registry /portfolio/registry.json \
+  --checkout-root ~/src
+
+./mix_workspace_ops sources \
+  --project app.web \
+  --registry /portfolio/registry.json \
+  --checkout-root ~/src
+```
+
+Ordinary Hex dependencies are resolved/materialized by standard Mix/Hex. MWO
+does not install a custom Hex SCM or retain its own Hex package object store.
+Bare Git mirrors are retained only as a transport optimization; Mix still owns
+Git dependency checkout and lock semantics.
+
+## Portable plan v2 and strict replay
+
+`plan` computes semantic intent but never executes the requested command:
+
+```bash
+./mix_workspace_ops plan \
+  --registry /portfolio/registry.json \
+  --checkout-root ~/src \
+  --view /portfolio/governed-stack.json \
+  --mix-env test \
+  --output /tmp/plan.json \
+  -- mix test
+```
+
+The portable artifact is `mix_workspace_ops.plan/v2`. It is self-digested and
+contains no local checkout/runtime paths or credentials. It binds registry/view
+identity, normalized scope, Mix inputs, command/policy/toolchain, unit source
+state, source decisions, and dependency-index/impact facts where applicable.
+
+Replay rebuilds current semantics and refuses named material drift before
+allocating runtime state:
+
+```bash
 ./mix_workspace_ops run \
-  --registry /path/to/registry.json \
-  --checkout-root /path/to/checkouts \
-  --view /path/to/view.json \
-  --mix-env test --mix-target host \
-  --mode local --max-concurrency 8 -- mix test
+  --plan /tmp/plan.json \
+  --registry /portfolio/registry.json \
+  --checkout-root ~/src \
+  --view /portfolio/governed-stack.json
+```
+
+There is no generic force-through-drift mode. Produce a new plan when the
+intended operation changes.
+
+## Execution, runtime contexts, and lock isolation
+
+Project units are the default; repository units remain available where useful.
+Blitz owns bounded concurrency. Continue-on-failure is the default and
+`--fail-fast` is explicit. Structured run output preserves deterministic logical
+unit order and records passed, failed, absent, and not-run outcomes.
+
+MWO keeps generated state outside managed repositories:
+
+- stable external dependency contexts;
+- project-specific stable external build contexts;
+- invocation-private HOME/config/temp/report/lease state;
+- a private operational `mix.lock` copy;
+- content-addressed source overlays/bootstrap state;
+- credential-free shared Hex/Rebar/archive caches;
+- Git mirrors.
+
+Reusable dependency/build identity excludes the absolute checkout root and does
+not create a new build directory just because the target project's HEAD or dirty
+source digest changed. Normal Mix incremental compilation remains authoritative.
+Incompatible dependency/source/lock contexts still select different dependency
+state.
+
+The checkout's committed `mix.lock` is never mutated. If local path substitution
+requires it, MWO projects only the corresponding top-level lock entries from the
+private operational copy. The lock parser accepts literal data only and does not
+interpret package objects.
+
+Runtime GC is lease-aware:
+
+```bash
 ./mix_workspace_ops state list
 ./mix_workspace_ops state gc --older-than 7d --dry-run
 ```
 
-`--mix-env` and `--mix-target` are graph inputs, not readings of ambient shell
-state. They default deterministically to `dev` and `host`, appear in plans and
-overlays, and contribute to graph and context digests.
+Ordinary `run` children have private Home/config state and publication
+credentials are scrubbed. Publication belongs to the release capability.
 
-### Portable plans and fan-out
+## Release transactions
 
-`plan` emits a strict, self-digested `mix_workspace_ops.plan/v1` document and
-does not execute the command after `--`. The plan freezes the registry and view
-digests, selected units, command and policy, toolchain, repository revisions and
-source digests, dependency graph, and every resolved source decision. It carries
-portable repository/project coordinates only: no checkout root, generated state
-path, environment binding, or credential.
-
-Project units are the default. `--unit repository` selects repositories instead,
-including repositories with no Mix project. A selected checkout that is absent
-is an `absent` unit rather than a failure. Source dirt is refused by default;
-`--dirty-policy allow-recorded` freezes its exact source digest for replay.
-
-`run` constructs the same semantic plan, binds present units to local checkouts
-and private runtime state, and translates them to real `%Blitz.Command{}` values.
-Blitz owns bounded concurrency. Continue-on-failure is the default;
-`--fail-fast` is explicit. The final `mix_workspace_ops.run/v1` JSON carries the
-semantic plan, the machine-local `mix_workspace_ops.binding/v1`, and stable
-per-unit `passed`, `failed`, `absent`, or `not_run` results. A failed unit makes
-the escript exit non-zero while still emitting that complete JSON report.
-
-Write a portable plan with `--output` and replay it without semantic overrides:
-
-```bash
-./mix_workspace_ops plan \
-  --registry /path/to/registry.json \
-  --checkout-root /path/to/checkouts \
-  --view /path/to/view.json \
-  --output /path/to/plan.json -- mix test
-
-./mix_workspace_ops run \
-  --plan /path/to/plan.json \
-  --registry /path/to/registry.json \
-  --checkout-root /path/to/checkouts \
-  --view /path/to/view.json \
-  --max-concurrency 8 --timeout 20m
-```
-
-A plan created with `--project ID` is replayed without either `--project` or
-`--view`; the recorded project identity is the scope. A view-scoped plan still
-requires the local `--view PATH`, whose identity and digest must match the
-recorded view.
-
-Replay reconstructs current semantics and refuses named registry, view,
-selection, revision, source-digest, dirty-state, graph/source-decision, command
-policy, or toolchain drift before allocating runtime state. There is no force
-flag or silent replan; produce a new plan when the intended inputs change.
-
-Local and Git overlays are stored beneath operator-owned XDG state and passed
-only to the child command through `MIX_WORKSPACE_OPS_OVERLAY`. No source-mode
-state is written into managed repositories. A direct `mix` invocation with no
-overlay environment variable uses the ordinary dependency declarations.
-
-`mwo why APP` explains the provider identity rule, the source chosen, every
-candidate considered, and both the durable and machine-local gestures that
-would change it. `mwo use APP local|git|hex` and `mwo use --clear [APP]` amend
-the parsed, never evaluated `.dependency_sources.local.exs` file so an operator
-does not have to remember its syntax.
-
-MWO materializes its bootstrap in operator state and supplies its path through
-`MIX_WORKSPACE_OPS_BOOTSTRAP`; it does not install executable helper code into
-the repository. `MIX_WORKSPACE_OPS_CONTEXT_DIGEST` identifies the normalized,
-path-independent dependency-source selection for cache-aware callers.
-
-The source context, exact source lock, target HEAD/source state, bound checkout,
-toolchain, Mix environment and target select stable external dependency and
-build paths. Repeating the exact question reuses those paths. Different
-versions, source states or build inputs select different paths and coexist.
-Mix's own path-scoped cross-process locks coordinate identical work; unrelated
-contexts continue in parallel.
-
-Only transient state is invocation-specific: Home, configuration, temporary
-files, leases, reports and the operational lock. Hex's XDG download cache,
-Rebar downloads and toolchain-scoped Mix archives are shared without sharing
-credentials. Locked Hex archives are retained by verified outer checksum and
-materialized into the exact dependency context. For ordinary managed work, the
-bootstrap places a narrow exact-Hex SCM ahead of Hex's SCM. It recognizes only
-applications in the verified manifest and only Hex-shaped dependency tuples,
-so Mix reaches the retained path at every dependency depth while local and Git
-sources pass through unchanged. The manifest carries the exact locked version,
-and the SCM preserves Mix's requirement check before selecting it. Reports
-retain the logical Hex source.
-Bare Git mirrors eliminate repeated network fetches while Mix remains the Git
-checkout authority. Every consumed commit receives a private retention ref, so
-a later force-push and mirror prune cannot discard a still-addressable object.
-The source lock remains byte-for-byte untouched. A derived
-operational lock omits path-backed entries, and its canonical term digest is
-audited before and after execution. The checkout's `mix.lock` is never changed.
-The run record says whether a mutable dependency or build context was already
-present; it does not infer a cache hit from the existence of a directory.
-Exact-object hits and warm-build reuse come from verified operations.
-
-Recognized publishing task names are refused through `run` as an operator error,
-but task recognition is not the security boundary. Every ordinary activation
-gets private Home and configuration state, explicitly removes `HEX_HOME` and
-inherited publication credentials, and shares only credential-free caches.
-Capability is available only through the release transaction below.
-
-`state list` reports durable runs, reusable dependency/build contexts and live
-leases. `state gc --older-than N[s|m|h|d] --dry-run` previews exactly the old,
-unleased runs and contexts a matching destructive invocation would remove.
-Context locks and a second live-lease check close the prepare/GC race. Shared
-overlays, bootstraps, verified archives and Git mirrors are not removed by
-runtime GC.
-
-Discovery is also generic. It accepts the owner explicitly, deduplicates by Git
-identity, rejects worktrees and wrongly named clones, prunes generated and
-fixture trees, and records unloadable or duplicate Mix applications as
-unresolved evidence rather than guessing an identity. A real project is not
-discarded merely because it lives beneath `examples` or `support`.
-
-Dependency discovery evaluates arbitrary `mix.exs` code only in a disposable
-worktree copy, with temporary Home/Mix/Hex state, a replacement environment,
-and a hard timeout. Repository-relative source remains available, while Git
-metadata, dependencies, build output, common credential files, publication
-credentials, and agent credentials are excluded. This protects the checkout
-and ambient process state; it is not a kernel sandbox and does not prevent code
-running as the operator from explicitly accessing host paths or the network.
-
-Release publication is a separate, fail-closed transaction over an already
-committed and pushed revision:
+Release planning remains portable and credential-free:
 
 ```bash
 ./mix_workspace_ops release plan \
-  --registry /path/to/portfolio_registry/registry.json \
+  --registry /portfolio/registry.json \
   --package sample_package
 
 ./mix_workspace_ops release chain \
-  --registry /path/to/portfolio_registry/registry.json \
-  --checkout-root /operator/checkouts \
+  --registry /portfolio/registry.json \
+  --checkout-root ~/src \
   --package sample_package \
-  --descriptor /path/to/untracked-release-chain.json
+  --descriptor /operator/release.json
 ```
 
-The semantic plan is catalog-only, canonical, and self-digested. The descriptor
-adds only operator release policy; repository identity, project coordinates,
-branches, and prerequisites remain catalog-owned. Each unit builds from a
-detached clean checkout, persists resumable transition evidence, exposes
-credentials only to its publisher step, verifies the exact Hex checksum, and
-creates the tag only afterward. Weld projections are rebuilt and digest-matched
-inside that checkout rather than accepted as prebuilt directories.
+Each release unit runs from the exact already-pushed revision in a detached clean
+checkout. Before gates or publication, MWO probes that clean source and verifies
+that actual managed publishable Mix dependencies are represented by the declared
+release prerequisite topology. A missing prerequisite blocks before publisher
+invocation; dev/test-only dependencies observed outside the publish environment
+do not create false release prerequisites.
 
-See [Architecture](guides/architecture.md) for the ownership split and safety
-model, [Contract examples](examples/contract_examples.md) for the synthetic runner seam,
-and [Fail-closed release transaction](guides/release_transaction.md) for the
-publication state machine.
+The retained transaction then executes structured gates, exposes credentials
+only to the publisher path, verifies the exact package/version/checksum in the
+registry, tags only after verification, persists ordered non-secret receipts,
+and supports externally revalidated safe resume.
+
+See [Fail-closed release transaction](guides/release_transaction.md).
+
+## Documentation
+
+- [Architecture](guides/architecture.md)
+- [Operator ledger and drift](guides/operator_ledger_and_drift.md)
+- [Dependency index and impact](guides/dependency_impact.md)
+- [Release transaction](guides/release_transaction.md)
+- [Contract examples](examples/contract_examples.md)

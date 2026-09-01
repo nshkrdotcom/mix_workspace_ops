@@ -149,6 +149,82 @@ defmodule MixWorkspaceOps.Release.PreflightTest do
              Preflight.check(registry, "client", dependencies: ["core"])
   end
 
+
+  test "clean-checkout topology blocks an actual managed publish dependency missing from release policy",
+       context do
+    root = temporary_directory!(context)
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("core",
+          projects: [catalog_project("core")],
+          release_chain: %{"core" => []}
+        ),
+        catalog_repository("client",
+          projects: [catalog_project("client")],
+          release_chain: %{"client" => []}
+        )
+      ])
+      |> Registry.load!()
+
+    reader = fn _project_root, opts ->
+      assert Keyword.fetch!(opts, :mix_env) == "prod"
+      {:ok, %{app: "client", dependencies: ["core"]}}
+    end
+
+    assert {:error, {:release_topology_mismatch, report}} =
+             Preflight.verify_topology(
+               registry,
+               "client",
+               root,
+               %{"core" => [], "client" => []},
+               metadata_reader: reader
+             )
+
+    assert report.missing_prerequisites == ["core"]
+    assert [%{package: "core", reason: :managed_publish_dependency}] =
+             report.observed_managed_publish_dependencies
+  end
+
+  test "clean-checkout topology accepts declared prerequisites and excludes dependencies absent in prod",
+       context do
+    root = temporary_directory!(context)
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("core",
+          projects: [catalog_project("core")],
+          release_chain: %{"core" => []}
+        ),
+        catalog_repository("dev_tool", projects: [catalog_project("dev_tool")]),
+        catalog_repository("client",
+          projects: [catalog_project("client")],
+          release_chain: %{"client" => ["core"]}
+        )
+      ])
+      |> Registry.load!()
+
+    reader = fn _project_root, opts ->
+      assert Keyword.fetch!(opts, :mix_env) == "prod"
+      {:ok, %{app: "client", dependencies: ["core"]}}
+    end
+
+    assert {:ok, report} =
+             Preflight.verify_topology(
+               registry,
+               "client",
+               root,
+               %{"core" => [], "client" => ["core"]},
+               metadata_reader: reader
+             )
+
+    assert report.missing_prerequisites == []
+    assert report.satisfied_prerequisites == ["core"]
+    refute Enum.any?(report.observed_managed_publish_dependencies, &(&1.application == "dev_tool"))
+  end
+
   defp bind(registry, bindings), do: %{registry | bindings: bindings, absent_checkouts: %{}}
 
   defp project!(root, app, version) do

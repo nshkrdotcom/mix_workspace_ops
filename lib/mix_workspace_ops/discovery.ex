@@ -28,8 +28,12 @@ defmodule MixWorkspaceOps.Discovery do
 
       {:ok,
        %{
+         schema: "mix_workspace_ops.discovery/v1",
          registry: %{
-           schema: "mix_workspace_ops.registry/v1",
+           # These are observed identity candidates, not a portable registry:
+           # v2 requires portfolio-owned classification fields discovery cannot
+           # infer without inventing policy.
+           schema: "mix_workspace_ops.discovery_candidates/v1",
            repositories: Enum.sort_by(repositories, & &1["id"])
          },
          snapshot: %{
@@ -327,9 +331,7 @@ defmodule MixWorkspaceOps.Discovery do
              "id" => project_id,
              "app" => metadata.app,
              "path" => relative_path,
-             "kind" => project_kind(relative_path, workspace_root?),
-             "tags" => ["ecosystem"],
-             "profile" => "default"
+             "kind" => project_kind(relative_path, workspace_root?)
            }}
         end
 

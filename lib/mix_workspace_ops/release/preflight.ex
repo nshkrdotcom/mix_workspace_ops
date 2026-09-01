@@ -1,8 +1,8 @@
 defmodule MixWorkspaceOps.Release.Preflight do
-  @moduledoc "Catalog-aware publication preflight with actionable legacy-parity blockers."
+  @moduledoc "Catalog-aware publication preflight and clean-checkout topology verification."
 
   alias MixWorkspaceOps.{Project, Registry}
-  alias MixWorkspaceOps.Registry.Source
+  alias MixWorkspaceOps.Registry.{ReleaseChain, Source}
   alias MixWorkspaceOps.Release.HexRegistry
 
   @type entry :: map()
@@ -22,6 +22,171 @@ defmodule MixWorkspaceOps.Release.Preflight do
     case Enum.filter(entries, &(&1.status == :blocked)) do
       [] -> {:ok, entries}
       blockers -> {:error, blockers}
+    end
+  end
+
+  @doc "Verifies clean-checkout managed publish dependencies against declared release policy."
+  @spec verify_topology(Registry.t(), String.t(), String.t(), map(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def verify_topology(%Registry{} = registry, package, project_root, prerequisites, opts \\ [])
+      when is_binary(package) and is_binary(project_root) and is_map(prerequisites) do
+    probe_opts =
+      opts
+      |> Keyword.put(:mix_env, "prod")
+      |> Keyword.put_new(:mix_target, "host")
+
+    with {:ok, consumer} <- provider(registry, package),
+         {:ok, metadata} <- read_metadata(project_root, probe_opts, opts),
+         true <- metadata.app == package || {:error, {:wrong_package, metadata.app}},
+         {:ok, classified} <- classify_publish_dependencies(registry, consumer, metadata.dependencies),
+         declared <- prerequisite_closure(prerequisites, package),
+         report <- topology_report(package, classified, declared),
+         true <- report.missing_prerequisites == [] || {:error, {:release_topology_mismatch, report}} do
+      {:ok, report}
+    else
+      {:error, _reason} = error -> error
+      false -> {:error, :release_topology_mismatch}
+    end
+  end
+
+  defp read_metadata(project_root, probe_opts, opts) do
+    reader = Keyword.get(opts, :metadata_reader, &Project.metadata_at/2)
+    reader.(project_root, probe_opts)
+  end
+
+  defp classify_publish_dependencies(registry, consumer, dependencies) do
+    train = ReleaseChain.packages(registry)
+
+    dependencies
+    |> Enum.map(&to_string/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.reduce_while({:ok, %{observed: [], ignored: []}}, fn app, {:ok, acc} ->
+      provider_hint = Registry.declared_provider(registry, consumer, app)
+
+      case Registry.resolve_dependency(registry, app, provider_hint, consumer.repository) do
+        {:ok, provider_project} ->
+          case publish_dependency(registry, consumer, app, provider_project, train) do
+            {:required, row} ->
+              {:cont, {:ok, %{acc | observed: [row | acc.observed]}}}
+
+            {:ignored, row} ->
+              {:cont, {:ok, %{acc | ignored: [row | acc.ignored]}}}
+
+            {:error, reason} ->
+              {:halt, {:error, reason}}
+          end
+
+        {:known_unselected, project_ids} ->
+          {:halt, {:error, {:release_dependency_unselected, app, project_ids}}}
+
+        {:error, reason} ->
+          {:halt, {:error, {:release_dependency_provider, app, reason}}}
+
+        :unknown ->
+          {:cont, {:ok, acc}}
+      end
+    end)
+    |> case do
+      {:ok, result} ->
+        {:ok,
+         %{
+           observed: Enum.reverse(result.observed),
+           ignored: Enum.reverse(result.ignored)
+         }}
+
+      error ->
+        error
+    end
+  end
+
+  defp publish_dependency(registry, consumer, app, provider_project, train) do
+    packages = publish_packages_for_provider(registry, provider_project, train)
+    declaration = Map.get(Registry.dependency_sources(registry, consumer), app)
+
+    cond do
+      packages == [] ->
+        {:ignored,
+         dependency_row(app, provider_project, nil, :provider_not_in_release_train)}
+
+      declaration && not Source.reaches_while_publishing?(declaration, "hex") ->
+        with {:ok, package} <- publish_package(app, packages) do
+          {:ignored,
+           dependency_row(app, provider_project, package, :non_hex_publish_strategy)}
+        end
+
+      true ->
+        with {:ok, package} <- publish_package(app, packages) do
+          {:required, dependency_row(app, provider_project, package, :managed_publish_dependency)}
+        end
+    end
+  end
+
+  defp publish_packages_for_provider(registry, provider_project, train) do
+    train
+    |> Enum.filter(fn package ->
+      case Registry.resolve_dependency(registry, package) do
+        {:ok, project} -> project.id == provider_project.id
+        _other -> false
+      end
+    end)
+    |> Enum.sort()
+  end
+
+  defp publish_package(app, packages) do
+    cond do
+      app in packages -> {:ok, app}
+      length(packages) == 1 -> {:ok, hd(packages)}
+      true -> {:error, {:ambiguous_release_package_provider, app, packages}}
+    end
+  end
+
+  defp dependency_row(app, provider_project, package, reason) do
+    %{
+      application: app,
+      provider_project: provider_project.id,
+      provider_repository: provider_project.repository,
+      package: package,
+      reason: reason
+    }
+  end
+
+  defp topology_report(package, classified, declared) do
+    observed_packages =
+      classified.observed
+      |> Enum.map(& &1.package)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    satisfied = Enum.filter(observed_packages, &(&1 in declared))
+    missing = observed_packages -- declared
+
+    %{
+      package: package,
+      observed_managed_publish_dependencies: classified.observed,
+      declared_prerequisites: declared,
+      satisfied_prerequisites: satisfied,
+      missing_prerequisites: missing,
+      ignored_internal_dependencies: classified.ignored
+    }
+  end
+
+  defp prerequisite_closure(prerequisites, package) do
+    walk_prerequisites(prerequisites, [package], MapSet.new())
+    |> MapSet.delete(package)
+    |> MapSet.to_list()
+    |> Enum.sort()
+  end
+
+  defp walk_prerequisites(_prerequisites, [], seen), do: seen
+
+  defp walk_prerequisites(prerequisites, [package | rest], seen) do
+    if MapSet.member?(seen, package) do
+      walk_prerequisites(prerequisites, rest, seen)
+    else
+      direct = Map.get(prerequisites, package, Map.get(prerequisites, to_string(package), []))
+      walk_prerequisites(prerequisites, Enum.map(direct, &to_string/1) ++ rest, MapSet.put(seen, package))
     end
   end
 

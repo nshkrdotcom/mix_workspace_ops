@@ -17,7 +17,7 @@ defmodule MixWorkspaceOps.OperationPlanTest do
              )
 
     refute File.exists?(marker)
-    assert plan.schema == "mix_workspace_ops.plan/v1"
+    assert plan.schema == "mix_workspace_ops.plan/v2"
     assert plan.digest == digest(Map.delete(plan, :digest))
     assert Enum.map(plan.units, & &1.id) == ["alpha", "beta"]
     assert Enum.all?(plan.units, &(&1.status == :planned))
@@ -33,6 +33,12 @@ defmodule MixWorkspaceOps.OperationPlanTest do
     assert String.trim_trailing(File.read!(path)) == Report.encode(plan)
     assert {:ok, loaded} = OperationPlan.load(path)
     assert loaded["digest"] == plan.digest
+
+    legacy = plan |> Map.put(:schema, "mix_workspace_ops.plan/v1") |> redigest()
+    assert :ok = Report.write(path, legacy)
+
+    assert {:error, {:operation_plan, ^path, :unsupported_operation_plan_schema}} =
+             OperationPlan.load(path)
 
     extra = plan |> Map.put(:unexpected, true) |> redigest()
     assert :ok = Report.write(path, extra)
@@ -63,53 +69,6 @@ defmodule MixWorkspaceOps.OperationPlanTest do
 
     assert OperationPlan.build(fixture.registry, fixture.view, ["env", "OUT=/tmp/result"]) ==
              {:error, {:nonportable_command_segment, "OUT=/tmp/result"}}
-  end
-
-  test "a local override keeps an alternate checkout portable and binds that identity", context do
-    fixture = fixture(context)
-    alternate = Path.join([fixture.root, "alternate", "beta"])
-    initialize_repository!(alternate, "[]", "example-org/beta")
-    File.write!(Path.join(alternate, "alternate.txt"), "alternate checkout\n")
-    git!(alternate, ["add", "alternate.txt"])
-    git!(alternate, ["commit", "--quiet", "-m", "alternate revision"])
-
-    File.write!(Path.join(fixture.alpha, ".gitignore"), ".dependency_sources.local.exs\n")
-    git!(fixture.alpha, ["add", ".gitignore"])
-    git!(fixture.alpha, ["commit", "--quiet", "-m", "ignore operator overrides"])
-
-    File.write!(
-      Path.join(fixture.alpha, ".dependency_sources.local.exs"),
-      inspect(%{
-        "deps" => %{
-          "beta" => %{"source" => "path", "path" => alternate}
-        }
-      })
-    )
-
-    assert {:ok, plan} =
-             OperationPlan.build(fixture.registry, fixture.view, ["true"], project: "alpha")
-
-    assert [unit] = plan.units
-    assert [source] = unit.sources
-    assert source.source == "local"
-    assert source.coordinates.repository.github == "example-org/beta"
-
-    assert source.coordinates.expected.head ==
-             alternate |> git!(["rev-parse", "HEAD"]) |> String.trim()
-
-    refute Enum.any?(strings(plan), &String.contains?(&1, alternate))
-
-    path = Path.join(fixture.root, "alternate-checkout-plan.json")
-    assert :ok = OperationPlan.write(path, plan)
-    assert {:ok, loaded} = OperationPlan.load(path)
-
-    assert {:ok, report} =
-             MixWorkspaceOps.Fanout.run(loaded, fixture.registry,
-               state_root: Path.join(fixture.root, "alternate-state")
-             )
-
-    assert report.status == :passed
-    assert [%{id: "alpha", status: :passed}] = report.results
   end
 
   test "replay names revision, dirty-byte, view, toolchain, and requested-policy drift",

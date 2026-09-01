@@ -3,20 +3,11 @@ defmodule MixWorkspaceOps.BootstrapTest do
 
   import ExUnit.CaptureIO
 
-  alias Mix.Dep.Loader, as: DependencyLoader
   alias MixWorkspaceOps.{Bootstrap, Overlay, Project, Resolution}
-  alias MixWorkspaceOpsBootstrap.ExactHexSCM
-
-  defmodule ProjectFixture do
-    def project do
-      [app: :exact_projection_fixture, version: "0.1.0", deps: Process.get(:exact_hex_deps)]
-    end
-  end
 
   setup do
     previous = System.get_env("MIX_WORKSPACE_OPS_OVERLAY")
     previous_lock = System.get_env("MIX_WORKSPACE_OPS_LOCKFILE")
-    previous_exact_hex = System.get_env("MIX_WORKSPACE_OPS_EXACT_HEX")
     argv = System.argv()
 
     on_exit(fn ->
@@ -29,14 +20,9 @@ defmodule MixWorkspaceOps.BootstrapTest do
       if previous_lock,
         do: System.put_env("MIX_WORKSPACE_OPS_LOCKFILE", previous_lock),
         else: System.delete_env("MIX_WORKSPACE_OPS_LOCKFILE")
-
-      if previous_exact_hex,
-        do: System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", previous_exact_hex),
-        else: System.delete_env("MIX_WORKSPACE_OPS_EXACT_HEX")
     end)
 
     System.delete_env("MIX_WORKSPACE_OPS_OVERLAY")
-    System.delete_env("MIX_WORKSPACE_OPS_EXACT_HEX")
     :ok
   end
 
@@ -113,106 +99,6 @@ defmodule MixWorkspaceOps.BootstrapTest do
                 runtime: false},
                root
              ) == {:example_core, "~> 2.0", [only: :test, runtime: false]}
-    end
-  end
-
-  describe "an exact retained Hex object" do
-    test "is consumed centrally as a path while reporting the committed Hex source", context do
-      root = temporary_directory!(context)
-      dependency = exact_hex_dependency!(root, "example_core")
-      transitive = exact_hex_dependency!(root, "transitive_core")
-
-      manifest =
-        write_exact_hex!(root, %{
-          "example_core" => dependency,
-          "transitive_core" => transitive
-        })
-
-      System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", manifest)
-
-      assert MixWorkspaceOpsBootstrap.dep(
-               {:example_core, "~> 1.0", hex: :renamed_package, runtime: false},
-               root
-             ) == {:example_core, "~> 1.0", [hex: :renamed_package, runtime: false]}
-
-      assert MixWorkspaceOpsBootstrap.recorded_sources(root) == [
-               %{app: :example_core, source: "hex", location: "hex", version: "~> 1.0"}
-             ]
-
-      dependencies =
-        exact_dependency_records!([
-          {:example_core, "~> 1.0", hex: :renamed_package, runtime: false},
-          {:git_core, github: "example/git_core", ref: "abc"}
-        ])
-
-      assert [exact_record, git_record] = dependencies
-      assert exact_record.app == :example_core
-      assert exact_record.scm == ExactHexSCM
-      assert exact_record.opts[:dest] == dependency
-      assert exact_record.opts[:runtime] == false
-      assert git_record.app == :git_core
-      assert git_record.scm == Mix.SCM.Git
-      refute Enum.any?(dependencies, &(&1.app == :transitive_core))
-    end
-
-    test "does not replace git, a selected local source, or publication coordinates", context do
-      root = temporary_directory!(context)
-      exact = exact_hex_dependency!(root, "example_core")
-      local = initialize_repository!(Path.join(root, "local_core"))
-      manifest = write_exact_hex!(root, %{"example_core" => exact})
-      System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", manifest)
-
-      assert MixWorkspaceOpsBootstrap.dep(
-               {:example_core, [github: "example-org/example_core", ref: "abc"]},
-               root
-             ) == {:example_core, [github: "example-org/example_core", ref: "abc"]}
-
-      overlay = write_overlay!(root, ["example_core\tlocal\t#{local}\trevision\tsource\t-"])
-      System.put_env("MIX_WORKSPACE_OPS_OVERLAY", overlay)
-
-      capture_io(fn ->
-        assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
-                 {:example_core, [path: local]}
-      end)
-
-      publish_overlay =
-        write_overlay!(root, ["example_core\thex\t~> 2.0\t-"], publish: true, mode: "hex")
-
-      System.put_env("MIX_WORKSPACE_OPS_OVERLAY", publish_overlay)
-      System.argv(["hex.build"])
-
-      assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
-               {:example_core, "~> 2.0"}
-
-      assert ExactHexSCM.accepts_options(:example_core, []) == nil
-    end
-
-    test "refuses malformed, relative and missing materializations", context do
-      root = temporary_directory!(context)
-      relative = Path.join("relative", "exact_hex.tsv")
-      System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", relative)
-
-      assert_raise RuntimeError, ~r/must contain an absolute path/, fn ->
-        exact_dependency_records!([])
-      end
-
-      malformed = Path.join(root, "malformed.tsv")
-      File.write!(malformed, "not-the-schema\n")
-      System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", malformed)
-
-      assert_raise RuntimeError, ~r/invalid Mix Workspace Ops exact Hex manifest/, fn ->
-        exact_dependency_records!([])
-      end
-
-      missing = Path.join(root, "missing")
-      encoded = Base.url_encode64(missing, padding: false)
-      invalid = Path.join(root, "invalid-row.tsv")
-      File.write!(invalid, "mix_workspace_ops.exact_hex/v2\nexample_core\t1.0.0\t#{encoded}\n")
-      System.put_env("MIX_WORKSPACE_OPS_EXACT_HEX", invalid)
-
-      assert_raise RuntimeError, ~r/invalid Mix Workspace Ops exact Hex row/, fn ->
-        exact_dependency_records!([])
-      end
     end
   end
 
@@ -680,44 +566,4 @@ defmodule MixWorkspaceOps.BootstrapTest do
     path
   end
 
-  defp exact_hex_dependency!(root, app) do
-    path = Path.join(root, "exact_#{app}")
-    File.mkdir_p!(path)
-    File.write!(Path.join(path, "mix.exs"), "defmodule Exact.MixProject, do: use(Mix.Project)\n")
-    File.write!(Path.join(path, ".hex"), "verified fixture\n")
-    path
-  end
-
-  defp write_exact_hex!(root, entries) do
-    rows =
-      entries
-      |> Enum.sort()
-      |> Enum.map(fn {app, path} ->
-        "#{app}\t1.0.0\t#{Base.url_encode64(path, padding: false)}"
-      end)
-
-    path = Path.join(root, "exact_hex_#{System.unique_integer([:positive])}.tsv")
-    File.write!(path, Enum.join(["mix_workspace_ops.exact_hex/v2" | rows], "\n") <> "\n")
-    path
-  end
-
-  defp exact_dependency_records!(dependencies) do
-    Mix.ProjectStack.on_clean_slate(fn ->
-      Process.put(:exact_hex_deps, dependencies)
-
-      try do
-        :ok =
-          Mix.Project.push(
-            ProjectFixture,
-            "exact_projection_fixture.exs",
-            :exact_projection_fixture
-          )
-
-        :ok = MixWorkspaceOpsBootstrap.install_exact_dependencies!()
-        DependencyLoader.children(false)
-      after
-        Process.delete(:exact_hex_deps)
-      end
-    end)
-  end
 end

@@ -5,7 +5,7 @@ defmodule MixWorkspaceOps.CatalogSchemaTest do
   alias MixWorkspaceOps.Registry.Source
 
   describe "schema acceptance" do
-    test "loads a v2 document and a v1 document", context do
+    test "loads only the canonical v2 schema and rejects legacy v1", context do
       root = temporary_directory!(context)
 
       v2 =
@@ -15,18 +15,11 @@ defmodule MixWorkspaceOps.CatalogSchemaTest do
 
       assert v2.schema == "portfolio_registry.registry/v2"
       assert Registry.schema() == "portfolio_registry.registry/v2"
-      assert "mix_workspace_ops.registry/v1" in Registry.schemas()
+      assert Registry.schemas() == ["portfolio_registry.registry/v2"]
 
-      v1 =
-        root
-        |> write_registry!([repository("alpha", [project("alpha")])])
-        |> Registry.load!()
-
-      assert v1.schema == "mix_workspace_ops.registry/v1"
-      assert v1.projects["alpha"].provides == ["alpha"]
-      assert v1.repositories["alpha"].languages == ["elixir"]
-      assert v1.repositories["alpha"].disposition == "tracked"
-      assert v1.repositories["alpha"].groups == ["fixture"]
+      legacy = Path.join(root, "legacy.json")
+      File.write!(legacy, :json.encode(%{"schema" => "mix_workspace_ops.registry/v1", "repositories" => []}))
+      assert {:error, :unsupported_registry_schema} = Registry.load(legacy)
     end
 
     test "rejects an unknown schema", context do

@@ -1,16 +1,11 @@
 defmodule MixWorkspaceOps.Registry.Document do
   @moduledoc """
-  Parses a catalog document into normalized repository records.
-
-  Two schemas are accepted. `portfolio_registry.registry/v2` is the current
-  repository-first, language-aware shape. `mix_workspace_ops.registry/v1` is the
-  Elixir-only shape it replaces; a v1 document still loads and is normalized onto
-  the same records, so a v1 catalog keeps working while it is migrated.
+  Parses the canonical repository-first `portfolio_registry.registry/v2`
+  document into normalized repository records.
   """
 
   alias MixWorkspaceOps.Registry.{Source, Workspace}
 
-  @v1 "mix_workspace_ops.registry/v1"
   @v2 "portfolio_registry.registry/v2"
 
   @repository_required ~w(id github default_branch languages lifecycle disposition visibility
@@ -27,17 +22,11 @@ defmodule MixWorkspaceOps.Registry.Document do
   @workspace_kinds ~w(umbrella blitz)
   @reserved_path_segments ~w(.git .mix_workspace_ops _build deps)
 
-  @v1_repository_keys ~w(id github default_branch projects)
-  @v1_project_keys ~w(id app path kind tags profile)
-
   @spec schemas() :: [String.t()]
-  def schemas, do: [@v2, @v1]
+  def schemas, do: [@v2]
 
   @spec current_schema() :: String.t()
   def current_schema, do: @v2
-
-  @spec legacy_schema() :: String.t()
-  def legacy_schema, do: @v1
 
   @spec project_kinds() :: [String.t()]
   def project_kinds, do: @project_kinds
@@ -49,14 +38,6 @@ defmodule MixWorkspaceOps.Registry.Document do
     with {:ok, parsed} <- map_ok(repositories, &repository/1),
          :ok <- unique(parsed, :id, "repository") do
       {:ok, {@v2, parsed}}
-    end
-  end
-
-  def parse(%{"schema" => @v1, "repositories" => repositories} = raw)
-      when map_size(raw) == 2 and is_list(repositories) do
-    with {:ok, parsed} <- map_ok(repositories, &v1_repository/1),
-         :ok <- unique(parsed, :id, "repository") do
-      {:ok, {@v1, parsed}}
     end
   end
 
@@ -267,87 +248,6 @@ defmodule MixWorkspaceOps.Registry.Document do
     end
   end
 
-  # -- v1 ------------------------------------------------------------------
-
-  defp v1_repository(%{"projects" => projects} = raw) when is_map(raw) and is_list(projects) do
-    with :ok <- exact_keys(raw, @v1_repository_keys, :repository),
-         :ok <- stable_id(raw["id"]),
-         :ok <- github(raw["github"]),
-         :ok <- branch(raw["default_branch"]),
-         {:ok, parsed} <- map_ok(projects, &v1_project(&1, raw["id"])),
-         :ok <- unique(parsed, :id, "project") do
-      {:ok,
-       %{
-         id: raw["id"],
-         github: raw["github"],
-         default_branch: raw["default_branch"],
-         languages: ["elixir"],
-         lifecycle: "active",
-         disposition: "tracked",
-         visibility: "public",
-         roles: [],
-         groups: v1_groups(parsed),
-         agent_scope: "eligible",
-         projects: parsed,
-         workspace: nil,
-         dependency_sources: %{},
-         release_chain: %{}
-       }}
-    end
-  end
-
-  defp v1_repository(raw), do: {:error, {:invalid_repository, raw}}
-
-  defp v1_groups(projects) do
-    case projects |> Enum.flat_map(& &1.tags) |> Enum.uniq() |> Enum.sort() do
-      [] -> ["unclassified"]
-      groups -> groups
-    end
-  end
-
-  defp v1_project(raw, repository_id) when is_map(raw) do
-    app = nullable(raw["app"])
-
-    with :ok <- exact_keys(raw, @v1_project_keys, :project),
-         :ok <- stable_id(raw["id"]),
-         :ok <- v1_application(app, raw["kind"]),
-         :ok <- relative_path(raw["path"]),
-         :ok <- member(raw["kind"], @project_kinds, :project_kind),
-         {:ok, tags} <- v1_tags(raw["tags"]),
-         :ok <- stable_id(raw["profile"]) do
-      {:ok,
-       %{
-         id: raw["id"],
-         app: app,
-         path: raw["path"],
-         kind: raw["kind"],
-         provides: if(is_nil(app), do: [], else: [app]),
-         current: false,
-         lineage: nil,
-         dependency_sources: %{},
-         repository: repository_id,
-         tags: tags
-       }}
-    end
-  end
-
-  defp v1_project(raw, repository_id), do: {:error, {:invalid_project, repository_id, raw}}
-
-  defp v1_application(nil, kind) when kind in ~w(workspace_root tooling), do: :ok
-  defp v1_application(app, _kind) when is_binary(app), do: identifier(app, :application)
-  defp v1_application(app, kind), do: {:error, {:invalid_application, app, kind}}
-
-  defp v1_tags(tags) when is_list(tags) do
-    cond do
-      not Enum.all?(tags, &is_binary/1) -> {:error, {:invalid_tags, tags}}
-      tags != Enum.uniq(tags) -> {:error, {:duplicate_tags, tags}}
-      Enum.any?(tags, &(stable_id(&1) != :ok)) -> {:error, {:invalid_tags, tags}}
-      true -> {:ok, Enum.sort(tags)}
-    end
-  end
-
-  defp v1_tags(tags), do: {:error, {:invalid_tags, tags}}
-
   # -- shared --------------------------------------------------------------
 
   defp keys(raw, required, optional, label) do
@@ -363,12 +263,6 @@ defmodule MixWorkspaceOps.Registry.Document do
       true ->
         :ok
     end
-  end
-
-  defp exact_keys(raw, expected, label) do
-    if Enum.sort(Map.keys(raw)) == Enum.sort(expected),
-      do: :ok,
-      else: {:error, {:unexpected_keys, label, Enum.sort(Map.keys(raw))}}
   end
 
   defp map_ok(entries, parser) do

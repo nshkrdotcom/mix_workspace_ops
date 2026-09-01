@@ -92,6 +92,8 @@ defmodule MixWorkspaceOps.DiscoveryTest do
     initialize_repository!(Path.join(root, "wrong-name"), "[]", "example-org/different")
 
     assert {:ok, discovery} = Discovery.scan(root, "example-org")
+    assert discovery.schema == "mix_workspace_ops.discovery/v1"
+    assert discovery.registry.schema == "mix_workspace_ops.discovery_candidates/v1"
 
     assert [%{"github" => "example-org/alpha", "projects" => [project]}] =
              discovery.registry.repositories

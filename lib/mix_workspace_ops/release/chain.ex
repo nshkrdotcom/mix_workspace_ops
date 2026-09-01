@@ -75,6 +75,7 @@ defmodule MixWorkspaceOps.Release.Chain do
             publisher_prefix: descriptor.publisher_prefix,
             prepared_artifact: package_descriptor.prepared_artifact,
             registry: registry,
+            release_prerequisites: field(semantic_plan, :prerequisites),
             adapter_options: adapter_options
           }
 

@@ -107,11 +107,6 @@ defmodule MixWorkspaceOps.Graph do
         {:ok, members} ->
           {:ok, Enum.filter(members, &Registry.selected?(registry, &1.id))}
 
-        {:error, {:not_a_workspace, _repository}}
-        when registry.schema == "mix_workspace_ops.registry/v1" ->
-          members = Registry.repository!(registry, project.repository).projects
-          {:ok, Enum.filter(members, &Registry.selected?(registry, &1.id))}
-
         error ->
           error
       end

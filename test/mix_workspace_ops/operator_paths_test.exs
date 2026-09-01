@@ -1,7 +1,7 @@
 defmodule MixWorkspaceOps.OperatorPathsTest do
   use MixWorkspaceOps.WorkspaceCase, async: false
 
-  alias MixWorkspaceOps.{OperatorLedger, OperatorPaths}
+  alias MixWorkspaceOps.{OperatorLedger, OperatorPaths, SourcePreferences}
 
   setup do
     original_cwd = File.cwd!()
@@ -33,16 +33,19 @@ defmodule MixWorkspaceOps.OperatorPathsTest do
 
     File.write!(
       Path.join(config_dir, "config.json"),
-      ~s({"registry":"configured.json","checkout_root":"configured","ledger":"ledger.json"})
+      ~s({"registry":"configured.json","checkout_root":"configured","ledger":"ledger.json","source_preferences":"preferences.json"})
     )
 
     System.put_env("XDG_CONFIG_HOME", config_home)
     File.cd!(nested)
 
-    assert {:ok, configured} = OperatorPaths.resolve(%{}, [:registry, :checkout_root, :ledger])
+    assert {:ok, configured} =
+             OperatorPaths.resolve(%{}, [:registry, :checkout_root, :ledger, :source_preferences])
+
     assert configured.registry == Path.join(config_dir, "configured.json")
     assert configured.checkout_root == Path.join(config_dir, "configured")
     assert configured.ledger == Path.join(config_dir, "ledger.json")
+    assert configured.source_preferences == Path.join(config_dir, "preferences.json")
 
     System.put_env("MIX_WORKSPACE_OPS_REGISTRY", Path.join(root, "environment.json"))
     assert {:ok, environment} = OperatorPaths.resolve(%{}, [:registry])
@@ -59,11 +62,12 @@ defmodule MixWorkspaceOps.OperatorPathsTest do
     File.write!(default_ledger, "{}")
 
     assert {:ok, discovered} =
-             OperatorPaths.resolve(%{}, [:registry, :checkout_root, :ledger])
+             OperatorPaths.resolve(%{}, [:registry, :checkout_root, :ledger, :source_preferences])
 
     assert discovered.registry == Path.join(checkout, "registry.json")
     assert discovered.checkout_root == root
     assert discovered.ledger == default_ledger
+    assert discovered.source_preferences == SourcePreferences.default_path()
   end
 
   test "an empty config requests the ordinary discovery fallbacks", context do

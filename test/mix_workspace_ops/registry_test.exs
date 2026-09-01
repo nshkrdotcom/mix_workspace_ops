@@ -207,7 +207,7 @@ defmodule MixWorkspaceOps.RegistryTest do
 
     File.write!(
       path,
-      ~s({"schema":"mix_workspace_ops.registry/v1","schema":"other","repositories":[]})
+      ~s({"schema":"portfolio_registry.registry/v2","schema":"other","repositories":[]})
     )
 
     assert {:error, {:duplicate_json_key, "schema"}} = Registry.load(path)

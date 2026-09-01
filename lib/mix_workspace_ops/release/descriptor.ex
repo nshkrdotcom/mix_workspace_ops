@@ -1,19 +1,10 @@
 defmodule MixWorkspaceOps.Release.Descriptor do
   @moduledoc "Strict operator-owned input for a concrete release transaction."
 
-  @schema "mix_workspace_ops.release/v1"
   @chain_schema "mix_workspace_ops.release_descriptor/v2"
   @digest ~r/^[0-9a-f]{64}$/
 
   alias MixWorkspaceOps.StrictJSON
-
-  @spec load(String.t()) :: {:ok, map()} | {:error, term()}
-  def load(path) do
-    with {:ok, bytes} <- File.read(Path.expand(path)),
-         {:ok, decoded} <- decode(bytes) do
-      parse(decoded)
-    end
-  end
 
   @doc "Loads the strict operator-owned descriptor for a catalogued release chain."
   @spec load_chain(String.t()) :: {:ok, map()} | {:error, term()}
@@ -23,48 +14,6 @@ defmodule MixWorkspaceOps.Release.Descriptor do
       parse_chain(decoded)
     end
   end
-
-  defp parse(
-         %{
-           "schema" => @schema,
-           "repository" => repository,
-           "project_path" => project_path,
-           "package" => package,
-           "version" => version,
-           "tag" => tag,
-           "default_branch" => default_branch,
-           "gates" => gates,
-           "publisher_prefix" => publisher_prefix
-         } = raw
-       )
-       when map_size(raw) == 9 and is_binary(repository) and is_binary(project_path) and
-              is_binary(package) and is_binary(version) and is_binary(tag) and
-              is_binary(default_branch) and is_list(gates) and is_list(publisher_prefix) do
-    with :ok <- require_absolute_repository(repository),
-         :ok <- require_relative_project(project_path),
-         :ok <- require_identifier(package),
-         :ok <- require_version(version),
-         :ok <- require_tag(tag, package, version),
-         :ok <- require_branch(default_branch),
-         :ok <- require_argv_list(gates, :gates),
-         :ok <- require_publisher_prefix(publisher_prefix),
-         :ok <- reject_embedded_credentials(gates),
-         :ok <- reject_embedded_credentials(publisher_prefix) do
-      {:ok,
-       %{
-         repository: Path.expand(repository),
-         project_path: project_path,
-         package: package,
-         version: version,
-         tag: tag,
-         default_branch: default_branch,
-         gates: gates,
-         publisher_prefix: publisher_prefix
-       }}
-    end
-  end
-
-  defp parse(_decoded), do: {:error, :invalid_release_descriptor}
 
   defp parse_chain(
          %{
@@ -159,10 +108,6 @@ defmodule MixWorkspaceOps.Release.Descriptor do
     StrictJSON.decode(bytes, maximum_bytes: 1024 * 1024)
   end
 
-  defp require_absolute_repository(path) do
-    if Path.type(path) == :absolute, do: :ok, else: {:error, :repository_must_be_absolute}
-  end
-
   defp require_relative_project(path) do
     expanded = Path.expand(path, "/repository")
     segments = Path.split(path)
@@ -191,12 +136,6 @@ defmodule MixWorkspaceOps.Release.Descriptor do
     if tag in ["v#{version}", "#{package}-v#{version}"],
       do: :ok,
       else: {:error, :tag_must_match_version}
-  end
-
-  defp require_branch(branch) do
-    if branch != "" and not String.contains?(branch, ["..", " ", "~", "^", ":"]),
-      do: :ok,
-      else: {:error, :invalid_default_branch}
   end
 
   defp require_digest(value, reason) do

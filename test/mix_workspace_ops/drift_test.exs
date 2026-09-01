@@ -3,11 +3,11 @@ defmodule MixWorkspaceOps.DriftTest do
 
   alias MixWorkspaceOps.{Binding, CLI, Drift, Git, Registry}
 
-  test "uncatalogued non-Elixir repository fails until its exact ledger observation explains it",
+  test "uncatalogued non-Elixir repository warns until its exact ledger observation explains it",
        context do
     %{root: root, registry: registry, beta: beta, catalog: catalog} = fixture(context)
 
-    assert {:error, {:registry_drift, report}} =
+    assert {:ok, report} =
              Drift.run(registry, root, clock: fn -> ~D[2032-04-05] end)
 
     assert report.observed_on == "2032-04-05"
@@ -19,7 +19,7 @@ defmodule MixWorkspaceOps.DriftTest do
     failed_output = Path.join(Path.dirname(root), "failed-drift.json")
     empty_ledger = write_ledger!(Path.dirname(root), [], [])
 
-    assert {:error, {:registry_drift, failed_cli_report}} =
+    assert {:ok, failed_cli_report} =
              CLI.dispatch([
                "registry",
                "drift",
@@ -33,7 +33,8 @@ defmodule MixWorkspaceOps.DriftTest do
                failed_output
              ])
 
-    refute failed_cli_report.healthy
+    assert failed_cli_report.healthy
+    assert failed_cli_report.summary.warnings == 1
     assert File.read!(failed_output) == MixWorkspaceOps.Report.encode(failed_cli_report) <> "\n"
 
     ledger = write_ledger!(Path.dirname(root), [], [ignore(beta, "operator scratch")])
@@ -69,7 +70,7 @@ defmodule MixWorkspaceOps.DriftTest do
              {:usage_error, "unknown option --observed-on"}
   end
 
-  test "path reuse, changed origin and stale ignore rows fail closed", context do
+  test "path reuse and stale ignore rows are warnings rather than identity errors", context do
     %{root: root, registry: registry, beta: beta} = fixture(context)
     missing = Path.join(root, "missing")
 
@@ -89,8 +90,10 @@ defmodule MixWorkspaceOps.DriftTest do
         stderr_to_stdout: true
       )
 
-    assert {:error, {:registry_drift, report}} = Drift.run(registry, root, ledger: ledger)
+    assert {:ok, report} = Drift.run(registry, root, ledger: ledger)
+    assert report.healthy
     assert report.summary.failed == 2
+    assert report.summary.warnings == 2
 
     reasons = for row <- report.entries, row["status"] == "failed", do: row["reason"]
     assert "stale_ignore_remotes" in reasons
@@ -131,7 +134,7 @@ defmodule MixWorkspaceOps.DriftTest do
              Binding.normalize_github("n:example-org/alpha")
   end
 
-  test "a broken Git checkout is failed rather than skipped", context do
+  test "a broken Git checkout is a visible warning rather than skipped", context do
     base = temporary_directory!(context)
     root = Path.join(base, "checkouts")
     File.mkdir_p!(root)
@@ -142,8 +145,10 @@ defmodule MixWorkspaceOps.DriftTest do
     catalog = write_catalog!(base, [catalog_repository("alpha")])
     {:ok, registry} = Registry.load(catalog)
 
-    assert {:error, {:registry_drift, report}} = Drift.run(registry, root)
+    assert {:ok, report} = Drift.run(registry, root)
+    assert report.healthy
     assert report.summary.failed == 1
+    assert report.summary.warnings == 1
     assert status(report, "broken") == "failed"
     assert Enum.any?(report.unexplained, &String.ends_with?(&1, "/broken"))
   end
@@ -235,9 +240,10 @@ defmodule MixWorkspaceOps.DriftTest do
         [%{"path" => ordinary, "remotes" => ["n:example-org/old"], "reason" => "old"}]
       )
 
-    assert {:error, {:registry_drift, report}} = Drift.run(registry, root, ledger: ledger)
+    assert {:ok, report} = Drift.run(registry, root, ledger: ledger)
+    assert report.healthy
 
-    assert [%{"status" => "failed", "reason" => "stale_ignore_checkout"}] =
+    assert [%{"status" => "failed", "reason" => "stale_ignore_checkout", "severity" => "warning"}] =
              Enum.filter(report.entries, &(&1["path"] == ordinary))
   end
 

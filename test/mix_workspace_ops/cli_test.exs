@@ -1,9 +1,9 @@
 defmodule MixWorkspaceOps.CLITest do
-  use MixWorkspaceOps.WorkspaceCase, async: true
+  use MixWorkspaceOps.WorkspaceCase, async: false
 
   import ExUnit.CaptureIO
 
-  alias MixWorkspaceOps.{CLI, Command}
+  alias MixWorkspaceOps.{CLI, Command, SourcePreferences}
 
   test "version is the Mix project version" do
     assert MixWorkspaceOps.version() == "0.1.0"
@@ -57,18 +57,16 @@ defmodule MixWorkspaceOps.CLITest do
 
     assert Enum.map(documented, &elem(&1, 0)) |> Enum.uniq() |> Enum.sort() == [
              ["doctor"],
-             ["inventory"],
+             ["impact"],
              ["plan"],
              ["registry", "chain"],
              ["registry", "discover"],
              ["registry", "drift"],
-             ["registry", "examples"],
              ["registry", "select"],
              ["registry", "validate"],
              ["registry", "workspace"],
              ["release", "chain"],
              ["release", "plan"],
-             ["release", "publish"],
              ["run"],
              ["seam"],
              ["sources"],
@@ -108,6 +106,13 @@ defmodule MixWorkspaceOps.CLITest do
   test "an unknown command names itself" do
     assert {:usage_error, message} = CLI.dispatch(["nonsense"])
     assert message =~ "unknown command: nonsense"
+  end
+
+  test "removed legacy commands are not accepted" do
+    for command <- [["inventory"], ["registry", "examples"], ["release", "publish"]] do
+      assert {:usage_error, message} = CLI.dispatch(command)
+      assert message =~ "unknown command"
+    end
   end
 
   test "registry validate reports the document", context do
@@ -243,54 +248,6 @@ defmodule MixWorkspaceOps.CLITest do
              {:usage_error, "missing --github-owner"}
   end
 
-  test "inventory reports every bound repository and writes its report", context do
-    %{root: root, catalog: catalog} = workspace!(context)
-    output = Path.join(root, "inventory.json")
-
-    assert {:ok, report} =
-             CLI.dispatch([
-               "inventory",
-               "--registry",
-               catalog,
-               "--checkout-root",
-               root,
-               "--output",
-               output
-             ])
-
-    assert report.helper_files == 2
-    assert report.unique_git_repositories == 2
-    assert Enum.map(report.rows, & &1.application) == ["alpha", "plane"]
-    assert File.regular?(output)
-  end
-
-  test "inventory accepts a view and a binding file", context do
-    %{root: root, catalog: catalog, view: view, binding: binding} = workspace!(context)
-
-    assert {:ok, report} =
-             CLI.dispatch([
-               "inventory",
-               "--registry",
-               catalog,
-               "--checkout-root",
-               root,
-               "--view",
-               view,
-               "--binding",
-               binding
-             ])
-
-    assert report.helper_files == 1
-    assert Enum.map(report.rows, & &1.application) == ["alpha"]
-  end
-
-  test "inventory requires a registry and a checkout root", context do
-    %{root: root} = workspace!(context)
-
-    assert CLI.dispatch(["inventory", "--checkout-root", root]) ==
-             {:usage_error, "missing --registry"}
-  end
-
   test "doctor reports a healthy workspace", context do
     %{root: root, catalog: catalog} = workspace!(context)
 
@@ -347,7 +304,7 @@ defmodule MixWorkspaceOps.CLITest do
                "true"
              ])
 
-    assert report.schema == "mix_workspace_ops.plan/v1"
+    assert report.schema == "mix_workspace_ops.plan/v2"
     assert report.command == %{executable: "true", args: []}
     assert report.policy.unit_kind == :project
     assert report.policy.source_mode == :auto
@@ -702,6 +659,253 @@ defmodule MixWorkspaceOps.CLITest do
       assert Enum.map(development.sources, & &1.source) == ["local", "github"]
       assert Enum.map(publishing.sources, & &1.source) == ["hex", "github"]
     end
+  end
+
+  test "impact uses real Mix dependencies and collapses equivalent target namespaces", context do
+    %{root: root, catalog: catalog, view: view} = affected_workspace!(context)
+
+    assert {:ok, report} =
+             CLI.dispatch([
+               "impact",
+               "core",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--view",
+               view
+             ])
+
+    assert report.schema == "mix_workspace_ops.impact/v1"
+    assert report.target.id == "core"
+    assert report.target.seed_projects == ["core"]
+    assert report.target.matched_kinds == [:application, :project, :repository]
+    assert report.direct_dependents == ["alpha"]
+    assert report.transitive_dependents == []
+    assert report.selected_affected_projects == ["alpha", "core"]
+    assert report.coverage.complete
+    assert report.safe_affected_only
+  end
+
+  test "affected plan uses only the reverse closure when coverage is complete", context do
+    %{root: root, catalog: catalog, view: view} = affected_workspace!(context)
+
+    assert {:ok, plan} =
+             CLI.dispatch([
+               "plan",
+               "--affected",
+               "core",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--view",
+               view,
+               "--",
+               "true"
+             ])
+
+    assert plan.schema == "mix_workspace_ops.plan/v2"
+    assert plan.scope.kind == :affected
+    assert plan.scope.impact_complete
+    refute plan.scope.fallback_to_full_scope
+    assert plan.scope.base_projects == ["alpha", "core", "missing"]
+    assert plan.scope.selected_projects == ["alpha", "core"]
+    assert Enum.map(plan.units, & &1.id) == ["alpha", "core"]
+    assert plan.dependency_index.complete
+  end
+
+  test "affected plan widens to the full base scope when coverage is incomplete", context do
+    %{root: root, catalog: catalog, view: view, missing: missing} = affected_workspace!(context)
+    File.rm_rf!(missing)
+
+    assert {:ok, plan} =
+             CLI.dispatch([
+               "plan",
+               "--affected",
+               "core",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root,
+               "--view",
+               view,
+               "--",
+               "true"
+             ])
+
+    refute plan.scope.impact_complete
+    assert plan.scope.fallback_to_full_scope
+    assert plan.scope.fallback_reason == :dependency_index_incomplete
+    assert plan.scope.coverage.absent_projects == ["missing"]
+    assert plan.scope.selected_projects == ["alpha", "core", "missing"]
+    assert Enum.map(plan.units, & &1.id) == ["alpha", "core", "missing"]
+    assert %{status: :absent} = Enum.find(plan.units, &(&1.id == "missing"))
+  end
+
+  test "affected scope requires a view and conflicts with an explicit project" do
+    assert CLI.dispatch(["plan", "--affected", "core", "--", "true"]) ==
+             {:usage_error, "--affected requires --view PATH"}
+
+    assert CLI.dispatch([
+             "plan",
+             "--affected",
+             "core",
+             "--project",
+             "alpha",
+             "--view",
+             "view.json",
+             "--",
+             "true"
+           ]) == {:usage_error, "--affected cannot be combined with --project"}
+  end
+
+  test "use persists only an XDG source mode and resolution consumes it", context do
+    %{root: root, catalog: catalog} = sibling_workspace!(context)
+    xdg = Path.join(root, "operator-config")
+    previous = System.get_env("XDG_CONFIG_HOME")
+    System.put_env("XDG_CONFIG_HOME", xdg)
+
+    on_exit(fn ->
+      if previous,
+        do: System.put_env("XDG_CONFIG_HOME", previous),
+        else: System.delete_env("XDG_CONFIG_HOME")
+    end)
+
+    assert {:ok, use_report} =
+             CLI.dispatch([
+               "use",
+               "core",
+               "git",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root
+             ])
+
+    expected_preferences = Path.join([xdg, "mix_workspace_ops", "source_preferences.json"])
+    assert use_report.path == expected_preferences
+
+    decoded = expected_preferences |> File.read!() |> :json.decode()
+    assert decoded == %{
+             "schema" => "mix_workspace_ops.source_preferences/v1",
+             "projects" => %{"alpha" => %{"core" => "git"}}
+           }
+
+    assert {:ok, sources} =
+             CLI.dispatch([
+               "sources",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root
+             ])
+
+    assert [%{application: "core", source: "github", reason: :source_preference}] =
+             sources.sources
+
+    {status, 0} = System.cmd("git", ["status", "--porcelain"], cd: Path.join(root, "alpha"))
+    assert status == ""
+
+    assert {:ok, _clear_report} =
+             CLI.dispatch([
+               "use",
+               "--clear",
+               "core",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root
+             ])
+
+    assert {:ok, sources} =
+             CLI.dispatch([
+               "sources",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root
+             ])
+
+    assert [%{application: "core", source: "local"}] = sources.sources
+  end
+
+  test "use stores only XDG source preferences and leaves the consumer checkout unchanged", context do
+    %{root: root, catalog: catalog} = sibling_workspace!(context)
+    xdg = Path.join(root, "xdg-config")
+    previous = System.get_env("XDG_CONFIG_HOME")
+    System.put_env("XDG_CONFIG_HOME", xdg)
+
+    on_exit(fn ->
+      if previous, do: System.put_env("XDG_CONFIG_HOME", previous), else: System.delete_env("XDG_CONFIG_HOME")
+    end)
+
+    {before_status, 0} = System.cmd("git", ["status", "--porcelain"], cd: Path.join(root, "alpha"))
+
+    assert {:ok, report} =
+             CLI.dispatch([
+               "use",
+               "core",
+               "local",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root
+             ])
+
+    assert report.path == SourcePreferences.default_path()
+    assert {:ok, preferences} = SourcePreferences.load(report.path)
+    assert SourcePreferences.get(preferences, "alpha", "core") == "local"
+
+    {after_status, 0} = System.cmd("git", ["status", "--porcelain"], cd: Path.join(root, "alpha"))
+    assert after_status == before_status
+  end
+
+  test "use rejects undeclared or ineligible source preferences", context do
+    %{root: root, catalog: catalog} = seam_workspace!(context)
+    xdg = Path.join(root, "xdg-config")
+    previous = System.get_env("XDG_CONFIG_HOME")
+    System.put_env("XDG_CONFIG_HOME", xdg)
+
+    on_exit(fn ->
+      if previous, do: System.put_env("XDG_CONFIG_HOME", previous), else: System.delete_env("XDG_CONFIG_HOME")
+    end)
+
+    assert {:error, {:undeclared_source_preference, "alpha", "unknown_app"}} =
+             CLI.dispatch([
+               "use",
+               "unknown_app",
+               "hex",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root
+             ])
+
+    assert {:error, {:ineligible_source_preference, "alpha", "third_party", "hex"}} =
+             CLI.dispatch([
+               "use",
+               "third_party",
+               "hex",
+               "--project",
+               "alpha",
+               "--registry",
+               catalog,
+               "--checkout-root",
+               root
+             ])
   end
 
   test "plan refuses a project the view excludes", context do
@@ -1097,10 +1301,6 @@ defmodule MixWorkspaceOps.CLITest do
     )
   end
 
-  test "release publish requires a descriptor" do
-    assert CLI.dispatch(["release", "publish"]) == {:usage_error, "missing --descriptor"}
-  end
-
   test "release plan exposes the catalog-derived semantic plan", context do
     %{catalog: catalog} = workspace!(context)
 
@@ -1143,53 +1343,6 @@ defmodule MixWorkspaceOps.CLITest do
              "--package",
              "sample_package"
            ]) == {:usage_error, "missing --descriptor"}
-  end
-
-  test "release publish reports an unreadable descriptor", context do
-    %{root: root, state_root: state_root} = workspace!(context)
-
-    assert {:error, _reason} =
-             CLI.dispatch([
-               "release",
-               "publish",
-               "--descriptor",
-               Path.join(root, "absent.json"),
-               "--state-root",
-               state_root
-             ])
-  end
-
-  test "release publish accepts a transaction id for resume", context do
-    %{root: root, state_root: state_root} = workspace!(context)
-    descriptor = Path.join(root, "release.json")
-
-    File.write!(
-      descriptor,
-      :json.encode(%{
-        "schema" => "mix_workspace_ops.release/v1",
-        "repository" => Path.join(root, "plane"),
-        "project_path" => ".",
-        "package" => "plane",
-        "version" => "0.1.0",
-        "tag" => "v0.1.0",
-        "default_branch" => "main",
-        "gates" => [["mix", "test"]],
-        "publisher_prefix" => ["/operator/publisher"]
-      })
-    )
-
-    expected = Path.join([state_root, "releases", "missing-transaction"])
-
-    assert CLI.dispatch([
-             "release",
-             "publish",
-             "--descriptor",
-             descriptor,
-             "--state-root",
-             state_root,
-             "--resume",
-             "missing-transaction"
-           ]) == {:error, {:unknown_transaction, expected}}
   end
 
   # -- fixtures ------------------------------------------------------------
@@ -1269,6 +1422,35 @@ defmodule MixWorkspaceOps.CLITest do
       )
 
     %{root: root, catalog: catalog}
+  end
+
+  defp affected_workspace!(context) do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "core"))
+    initialize_repository!(Path.join(root, "alpha"), ~s([{:core, path: "../core"}]))
+    missing = initialize_repository!(Path.join(root, "missing"))
+
+    catalog =
+      write_catalog!(
+        root,
+        [
+          catalog_repository("core", projects: [catalog_project("core")]),
+          catalog_repository("alpha",
+            projects: [catalog_project("alpha")],
+            dependency_sources: %{
+              "core" => %{
+                "github" => %{"repo" => "example-org/core", "branch" => "main"},
+                "hex" => "~> 1.0"
+              }
+            }
+          ),
+          catalog_repository("missing", projects: [catalog_project("missing")])
+        ],
+        name: "affected_registry.json"
+      )
+
+    view = write_catalog_view!(root, "affected_all", %{})
+    %{root: root, catalog: catalog, view: view, missing: missing}
   end
 
   defp sibling_workspace!(context) do

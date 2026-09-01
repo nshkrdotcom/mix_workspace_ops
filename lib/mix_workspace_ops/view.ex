@@ -10,18 +10,15 @@ defmodule MixWorkspaceOps.View do
   independently, so repository-scoped fan-out can operate on a selected
   repository even when it has no Mix project.
 
-  `portfolio_registry.view/v2` selects on repository identity, groups, languages,
-  and lifecycles as well as project identity. `mix_workspace_ops.view/v1` still
-  loads; its `tags_any` and `tags_all` match a v1 document's project tags and a
-  v2 document's repository groups.
+  `portfolio_registry.view/v2` selects on repository identity, groups,
+  languages, lifecycles, and project identity. It is the only supported view
+  schema.
   """
 
   alias MixWorkspaceOps.{Registry, StrictJSON}
 
-  @v1 "mix_workspace_ops.view/v1"
   @v2 "portfolio_registry.view/v2"
 
-  @v1_selector_keys ~w(tags_any tags_all project_ids exclude_project_ids)
   @v2_selector_keys ~w(groups_any groups_all languages lifecycles repository_ids
                        exclude_repository_ids project_ids exclude_project_ids)
 
@@ -62,7 +59,7 @@ defmodule MixWorkspaceOps.View do
   def schema, do: @v2
 
   @spec schemas() :: [String.t()]
-  def schemas, do: [@v2, @v1]
+  def schemas, do: [@v2]
 
   @spec load(String.t()) :: {:ok, t()} | {:error, term()}
   def load(path) do
@@ -163,24 +160,6 @@ defmodule MixWorkspaceOps.View do
     end
   end
 
-  defp parse(
-         %{"schema" => @v1, "id" => id, "description" => description, "selector" => selector} =
-           raw
-       )
-       when map_size(raw) == 4 do
-    with :ok <- strings(id, description),
-         :ok <- exact_selector_keys(selector, @v1_selector_keys),
-         {:ok, parsed} <- selector_lists(selector, @v1_selector_keys) do
-      selector =
-        parsed
-        |> Map.put(:groups_any, Map.fetch!(parsed, :tags_any))
-        |> Map.put(:groups_all, Map.fetch!(parsed, :tags_all))
-        |> Map.drop([:tags_any, :tags_all])
-
-      {:ok, %{schema: @v1, id: id, description: description, selector: selector}}
-    end
-  end
-
   defp parse(_decoded), do: {:error, :unsupported_view_schema}
 
   defp strings(id, description) do
@@ -195,14 +174,6 @@ defmodule MixWorkspaceOps.View do
   end
 
   defp selector_keys(_selector, _allowed), do: {:error, :invalid_view_selector}
-
-  defp exact_selector_keys(selector, expected) when is_map(selector) do
-    if Enum.sort(Map.keys(selector)) == Enum.sort(expected),
-      do: :ok,
-      else: {:error, :invalid_view_selector}
-  end
-
-  defp exact_selector_keys(_selector, _expected), do: {:error, :invalid_view_selector}
 
   defp selector_lists(selector, keys) do
     keys
