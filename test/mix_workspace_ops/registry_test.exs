@@ -29,6 +29,7 @@ defmodule MixWorkspaceOps.RegistryTest do
       |> write_registry!([
         repository("core", [project("core")]),
         repository("consumer", [project("consumer")])
+        |> Map.put("dependency_sources", %{"core" => %{"hex" => "~> 0.1"}})
       ])
       |> Registry.load!()
       |> bind!(root)
@@ -61,7 +62,10 @@ defmodule MixWorkspaceOps.RegistryTest do
     registry =
       root
       |> write_catalog!([
-        catalog_repository("consumer", projects: [catalog_project("consumer")]),
+        catalog_repository("consumer",
+          projects: [catalog_project("consumer")],
+          dependency_sources: %{"core" => %{"hex" => "~> 0.1"}}
+        ),
         catalog_repository("core", projects: [catalog_project("core")]),
         catalog_repository("deep", projects: [catalog_project("deep")])
       ])

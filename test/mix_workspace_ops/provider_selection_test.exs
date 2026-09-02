@@ -120,17 +120,17 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
     assert resolution.known_unselected == []
   end
 
-  test "a declaration naming no provider leaves the closure ambiguous", context do
+  test "a catalogued application without a source declaration remains external", context do
     root = temporary_directory!(context)
     registry = bound_two_providers(context, root, nil)
 
-    assert {:error, {:ambiguous_application, "shared", candidates, "alpha"}} =
+    assert {:ok, resolution} =
              Graph.resolve(registry, "alpha", dependency_reader: shared_reader())
 
-    assert candidates == [
-             %{project: "upstream.shared", repository: "upstream"},
-             %{project: "vendored.shared", repository: "vendored"}
-           ]
+    assert Enum.map(resolution.projects, & &1.id) == ["alpha"]
+    assert resolution.edges == []
+    assert resolution.external_dependencies == [{"alpha", "shared"}]
+    assert resolution.known_unselected == []
   end
 
   test "one current provider settles an otherwise ambiguous application", context do

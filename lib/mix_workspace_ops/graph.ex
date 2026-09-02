@@ -185,8 +185,30 @@ defmodule MixWorkspaceOps.Graph do
   # table, so a declared `provider` selects among several catalogued providers
   # instead of the closure refusing an ambiguity the catalog already answered.
   defp reduce_dependency(registry, project, dependency_app, reader, current) do
-    provider = Registry.declared_provider(registry, project, dependency_app)
+    case Map.fetch(Registry.dependency_sources(registry, project), dependency_app) do
+      {:ok, declaration} ->
+        reduce_declared_dependency(
+          registry,
+          project,
+          dependency_app,
+          declaration.provider,
+          reader,
+          current
+        )
 
+      :error ->
+        reduce_external_dependency(project, dependency_app, current)
+    end
+  end
+
+  defp reduce_declared_dependency(
+         registry,
+         project,
+         dependency_app,
+         provider,
+         reader,
+         current
+       ) do
     case Registry.resolve_dependency(registry, dependency_app, provider, project.repository) do
       {:ok, dependency} ->
         reduce_managed_dependency(
