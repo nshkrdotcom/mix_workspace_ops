@@ -524,7 +524,8 @@ defmodule MixWorkspaceOps.CLITest do
 
     assert Enum.any?(drifts, &(&1.field == :repository_head and &1.unit == "alpha"))
     refute File.exists?(marker)
-    refute File.exists?(state_root)
+    refute File.exists?(Path.join(state_root, "runs"))
+    assert File.dir?(Path.join(state_root, "metadata/probes"))
   end
 
   test "sources reports where every dependency resolves from", context do
@@ -1227,7 +1228,12 @@ defmodule MixWorkspaceOps.CLITest do
     %{root: root, catalog: catalog, state_root: state_root} = workspace!(context)
     project_lock = Path.join(root, "alpha/mix.lock")
     File.write!(project_lock, "%{}\n")
-    changed_lock = inspect(%{changed: {:hex, :changed, "1.0.0"}}) <> "\n"
+
+    changed_lock =
+      inspect(%{
+        changed:
+          {:hex, :changed, "1.0.0", "inner", [:mix], [], "hexpm", String.duplicate("c", 64)}
+      }) <> "\n"
 
     command = [
       "--",

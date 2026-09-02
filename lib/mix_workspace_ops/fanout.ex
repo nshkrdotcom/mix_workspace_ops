@@ -12,12 +12,12 @@ defmodule MixWorkspaceOps.Fanout do
   alias MixWorkspaceOps.{
     Binding,
     Git,
-    HexCache,
     OperationPlan,
     Overlay,
     PublishMode,
     Registry,
     Report,
+    ResourceBudget,
     Runtime,
     Toolchain
   }
@@ -34,8 +34,7 @@ defmodule MixWorkspaceOps.Fanout do
   def run(plan, registry, opts \\ []) do
     started_at = System.system_time(:millisecond)
 
-    with {:ok, execution} <- execution_options(opts),
-         execution <- Map.put(execution, :dependency_fetch?, dependency_fetch?(plan)),
+    with {:ok, execution} <- execution_options(plan, opts),
          execution <- binding_budget(plan, execution),
          :ok <- verify_all_units(plan, registry),
          {:ok, bound} <- bind_all(plan, registry, execution) do
@@ -49,11 +48,23 @@ defmodule MixWorkspaceOps.Fanout do
     end
   end
 
-  defp execution_options(opts) do
-    max_concurrency = Keyword.get(opts, :max_concurrency, System.schedulers_online())
+  defp execution_options(plan, opts) do
+    items =
+      plan
+      |> field(:units)
+      |> Enum.count(&(field(&1, :status) in [:planned, "planned"]))
 
-    beam_schedulers =
-      Keyword.get_lazy(opts, :beam_schedulers, fn -> child_scheduler_budget(max_concurrency) end)
+    resource_budget =
+      opts
+      |> Keyword.get(:resource_snapshot, ResourceBudget.snapshot())
+      |> ResourceBudget.allocate(
+        operation_class(plan),
+        items,
+        Keyword.take(opts, [:max_concurrency, :beam_schedulers])
+      )
+
+    max_concurrency = resource_budget.workers
+    beam_schedulers = resource_budget.beam_schedulers
 
     timeout = Keyword.get(opts, :timeout, :infinity)
     binding_timeout = Keyword.get(opts, :binding_timeout, 300_000)
@@ -73,12 +84,11 @@ defmodule MixWorkspaceOps.Fanout do
          timeout: timeout,
          binding_timeout: binding_timeout,
          preparation_timeout: preparation_timeout,
+         resource_budget: resource_budget,
          state_root: state_root,
          allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
          git_cache_memo:
            :ets.new(GitCache, [:set, :public, read_concurrency: true, write_concurrency: true]),
-         hex_cache_memo:
-           :ets.new(HexCache, [:set, :public, read_concurrency: true, write_concurrency: true]),
          probe_memo: Keyword.get(opts, :probe_memo, ProbeMemo.new())
        }}
     end
@@ -219,6 +229,8 @@ defmodule MixWorkspaceOps.Fanout do
       publish?: false,
       mix_env: field(policy, :mix_env),
       mix_target: field(policy, :mix_target),
+      dependency_scope:
+        PublishMode.dependency_scope(OperationPlan.command_argv(plan), field(policy, :mix_env)),
       allow_lock_mutation: execution.allow_lock_mutation,
       prepare_objects: true,
       cache_concurrency: execution.cache_concurrency,
@@ -602,38 +614,8 @@ defmodule MixWorkspaceOps.Fanout do
       end)
     end
 
-    if execution.dependency_fetch?,
-      do: dependency_fetch(item, execution, operation),
-      else: operation.()
+    operation.()
   end
-
-  defp dependency_fetch(item, execution, operation) do
-    runtime = item.binding.runtime
-    handle = item.activation.runtime_handle
-
-    if HexCache.complete?(runtime.hex_cache, handle.lockfile, execution.hex_cache_memo) do
-      operation.()
-    else
-      serialized_dependency_fetch(runtime, handle, execution, operation)
-    end
-  end
-
-  defp serialized_dependency_fetch(runtime, handle, execution, operation) do
-    handle
-    |> Runtime.with_dependency_cache_lock(fn ->
-      execute_if_cache_incomplete(runtime, handle, execution, operation)
-    end)
-    |> continue_after_cache_check(operation)
-  end
-
-  defp execute_if_cache_incomplete(runtime, handle, execution, operation) do
-    if HexCache.complete?(runtime.hex_cache, handle.lockfile, execution.hex_cache_memo),
-      do: :cache_ready,
-      else: {:executed, operation.()}
-  end
-
-  defp continue_after_cache_check(:cache_ready, operation), do: operation.()
-  defp continue_after_cache_check({:executed, result}, _operation), do: result
 
   defp run_item(item, execution) do
     case Blitz.run([item.blitz], blitz_options(execution)) do
@@ -646,16 +628,6 @@ defmodule MixWorkspaceOps.Fanout do
     do: Toolchain.executable(executable)
 
   defp bound_executable(executable), do: executable
-
-  defp dependency_fetch?(plan) do
-    command = field(plan, :command)
-
-    command
-    |> then(&[field(&1, :executable) | field(&1, :args)])
-    |> PublishMode.task_argv()
-    |> PublishMode.task_tokens()
-    |> Enum.any?(&(&1 in ["deps.get", "deps.update"]))
-  end
 
   defp blitz_options(execution) do
     [
@@ -772,7 +744,9 @@ defmodule MixWorkspaceOps.Fanout do
       binding_concurrency: execution.binding_concurrency,
       cache_concurrency: execution.cache_concurrency,
       beam_schedulers: execution.beam_schedulers,
-      scheduler_budget: System.schedulers_online(),
+      scheduler_budget: execution.resource_budget.cpu_slots,
+      resource_budget: execution.resource_budget,
+      probe_cache: ProbeMemo.stats(execution.probe_memo),
       timeout: execution.timeout,
       started_at: started_at,
       finished_at: finished_at,
@@ -789,19 +763,11 @@ defmodule MixWorkspaceOps.Fanout do
     finalized = finalize_all(bound)
     finished_at = System.system_time(:millisecond)
 
-    max_concurrency = Keyword.get(opts, :max_concurrency, System.schedulers_online())
-
     execution =
-      binding_budget(plan, %{
-        max_concurrency: max_concurrency,
-        beam_schedulers:
-          Keyword.get_lazy(opts, :beam_schedulers, fn ->
-            child_scheduler_budget(max_concurrency)
-          end),
-        timeout: Keyword.get(opts, :timeout, :infinity),
-        binding_timeout: Keyword.get(opts, :binding_timeout, 300_000),
-        preparation_timeout: Keyword.get(opts, :preparation_timeout, 120_000)
-      })
+      case execution_options(plan, opts) do
+        {:ok, value} -> binding_budget(plan, value)
+        {:error, _invalid_options} -> failure_execution(plan, opts)
+      end
 
     binding = binding_report(plan, finalized, execution, started_at, finished_at)
 
@@ -891,7 +857,29 @@ defmodule MixWorkspaceOps.Fanout do
     |> Enum.sort_by(&elem(&1, 0))
   end
 
-  defp child_scheduler_budget(max_concurrency) do
-    max(div(System.schedulers_online(), max_concurrency), 1)
+  defp operation_class(plan) do
+    tasks =
+      plan |> OperationPlan.command_argv() |> PublishMode.task_argv() |> PublishMode.task_tokens()
+
+    if Enum.any?(tasks, &(&1 in ["deps.get", "deps.update"])), do: :transport, else: :cpu
+  end
+
+  defp failure_execution(plan, opts) do
+    items =
+      plan
+      |> field(:units)
+      |> Enum.count(&(field(&1, :status) in [:planned, "planned"]))
+
+    budget = ResourceBudget.allocate(ResourceBudget.snapshot(), operation_class(plan), items)
+
+    binding_budget(plan, %{
+      max_concurrency: budget.workers,
+      beam_schedulers: budget.beam_schedulers,
+      timeout: Keyword.get(opts, :timeout, :infinity),
+      binding_timeout: Keyword.get(opts, :binding_timeout, 300_000),
+      preparation_timeout: Keyword.get(opts, :preparation_timeout, 120_000),
+      resource_budget: budget,
+      probe_memo: ProbeMemo.new()
+    })
   end
 end

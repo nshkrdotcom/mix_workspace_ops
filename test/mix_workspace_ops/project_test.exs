@@ -102,6 +102,48 @@ defmodule MixWorkspaceOps.ProjectTest do
     assert File.read!(counter) == "xxxx"
   end
 
+  test "dependency scope can include every only environment without changing Mix.env", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "scoped"))
+
+    File.write!(Path.join(repository, "mix.exs"), """
+    defmodule Scoped.MixProject do
+      use Mix.Project
+
+      def project do
+        [
+          app: :scoped,
+          version: "0.1.0",
+          deps: [
+            {:always, "~> 1.0"},
+            {:dev_only, "~> 1.0", only: :dev},
+            {:test_only, "~> 1.0", only: [:test]},
+            {if(Mix.env() == :dev, do: :dynamic_dev, else: :dynamic_other), "~> 1.0"}
+          ]
+        ]
+      end
+    end
+    """)
+
+    assert {:ok, active} =
+             Project.metadata_at(repository, mix_env: "dev", dependency_scope: :active)
+
+    assert active.dependencies == ["always", "dev_only", "dynamic_dev"]
+
+    assert {:ok, all} =
+             Project.metadata_at(repository, mix_env: "dev", dependency_scope: :all)
+
+    assert all.dependencies == ["always", "dev_only", "dynamic_dev", "test_only"]
+
+    assert {:ok, test_only} =
+             Project.metadata_at(repository,
+               mix_env: "dev",
+               dependency_scope: {:only, ["test"]}
+             )
+
+    assert test_only.dependencies == ["always", "dynamic_dev", "test_only"]
+  end
+
   test "a later invocation owns no answers from the earlier one", context do
     root = temporary_directory!(context)
     repository = Path.join(root, "alpha")
@@ -115,6 +157,34 @@ defmodule MixWorkspaceOps.ProjectTest do
     assert {:ok, _metadata} =
              Project.metadata_at(repository, probe_memo: ProbeMemo.new())
 
+    assert File.read!(counter) == "xx"
+  end
+
+  test "a later invocation reuses an exact persistent answer", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "alpha"))
+    counter = Path.join(root, "persistent-probes")
+    cache = Path.join(root, "metadata")
+    File.write!(Path.join(repository, "mix.exs"), instrumented_mix(counter, "0.1.0"))
+    git_ok!(repository, ["add", "mix.exs"])
+    git_ok!(repository, ["commit", "--quiet", "-m", "instrument metadata"])
+
+    first = ProbeMemo.new(cache)
+    assert {:ok, %{version: "0.1.0"}} = Project.metadata_at(repository, probe_memo: first)
+    assert ProbeMemo.stats(first) == %{disk_hits: 0, memory_hits: 0, misses: 1}
+
+    second = ProbeMemo.new(cache)
+    assert {:ok, %{version: "0.1.0"}} = Project.metadata_at(repository, probe_memo: second)
+    assert ProbeMemo.stats(second) == %{disk_hits: 1, memory_hits: 0, misses: 0}
+    assert File.read!(counter) == "x"
+
+    File.write!(Path.join(repository, "mix.exs"), instrumented_mix(counter, "0.2.0"))
+    git_ok!(repository, ["add", "mix.exs"])
+    git_ok!(repository, ["commit", "--quiet", "-m", "change metadata"])
+
+    third = ProbeMemo.new(cache)
+    assert {:ok, %{version: "0.2.0"}} = Project.metadata_at(repository, probe_memo: third)
+    assert ProbeMemo.stats(third).misses == 1
     assert File.read!(counter) == "xx"
   end
 
@@ -206,6 +276,10 @@ defmodule MixWorkspaceOps.ProjectTest do
       def project, do: [app: :alpha, version: #{inspect(version)}, deps: []]
     end
     """
+  end
+
+  defp git_ok!(repository, args) do
+    assert {_output, 0} = System.cmd("git", args, cd: repository, stderr_to_stdout: true)
   end
 
   defp load_fixture_registry!(root) do

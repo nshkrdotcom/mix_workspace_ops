@@ -38,7 +38,7 @@ defmodule MixWorkspaceOps.CLI do
     plan --registry PATH --checkout-root PATH [--view PATH | --project ID] [--affected TARGET] [--binding PATH] \
       [--unit project|repository] [--dirty-policy require-clean|allow-recorded] \
       [--mix-env ENV] [--mix-target TARGET] [--mode auto|local|git|hex] \
-      [--source APP=SOURCE] [--fail-fast] [--output PATH] -- COMMAND [ARG ...]
+      [--source APP=SOURCE] [--fail-fast] [--state-root PATH] [--output PATH] -- COMMAND [ARG ...]
     sources --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
       [--mix-env ENV] [--mix-target TARGET] \
       [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false]
@@ -92,6 +92,7 @@ defmodule MixWorkspaceOps.CLI do
       :unit,
       :dirty_policy,
       :fail_fast,
+      :state_root,
       :output
     ],
     ["sources"] => [
@@ -503,9 +504,10 @@ defmodule MixWorkspaceOps.CLI do
          :ok <- require_command(command),
          :ok <- require_safe_run_command(command),
          {:ok, registry, view} <- load_fanout_context(options),
-         {:ok, build_opts} <- semantic_options(options),
+         memo <- probe_memo(options),
+         {:ok, build_opts} <- semantic_options(options, memo),
          {:ok, plan} <- OperationPlan.build(registry, view, command, build_opts),
-         {:ok, execution_opts} <- execution_options(options) do
+         {:ok, execution_opts} <- execution_options(options, memo) do
       Fanout.run(plan, registry, execution_opts)
     end
   end
@@ -518,7 +520,7 @@ defmodule MixWorkspaceOps.CLI do
          {:ok, options} <- replay_scope(recorded, options),
          :ok <- require_safe_run_command(OperationPlan.command_argv(recorded)),
          {:ok, registry, view} <- load_fanout_context(options),
-         memo <- ProbeMemo.new(),
+         memo <- probe_memo(options),
          {:ok, plan} <- OperationPlan.replay(recorded, registry, view, probe_memo: memo),
          {:ok, execution_opts} <- execution_options(options, memo) do
       Fanout.run(plan, registry, execution_opts)
@@ -699,7 +701,7 @@ defmodule MixWorkspaceOps.CLI do
   defp default(:unit), do: "project"
   defp default(:dirty_policy), do: "require-clean"
   defp default(:fail_fast), do: false
-  defp default(:max_concurrency), do: Integer.to_string(System.schedulers_online())
+  defp default(:max_concurrency), do: nil
   defp default(:timeout), do: "infinity"
   defp default(:state_root), do: default_state_root()
   defp default(:allow_lock_mutation), do: false
@@ -876,7 +878,9 @@ defmodule MixWorkspaceOps.CLI do
 
   defp require_fanout_scope(_options), do: :ok
 
-  defp semantic_options(options) do
+  defp semantic_options(options, memo \\ nil) do
+    memo = memo || probe_memo(options)
+
     with {:ok, mode} <- source_mode(options.mode),
          {:ok, sources} <- source_overrides(options.source),
          {:ok, unit_kind} <- unit_kind(options.unit),
@@ -892,13 +896,14 @@ defmodule MixWorkspaceOps.CLI do
          mix_target: options.mix_target,
          project: options.project,
          affected: options.affected,
-         probe_memo: ProbeMemo.new()
+         probe_memo: memo
        ]}
     end
   end
 
-  defp execution_options(options, memo \\ ProbeMemo.new()) do
-    with {:ok, max_concurrency} <- positive_integer(options.max_concurrency, :max_concurrency),
+  defp execution_options(options, memo) do
+    with {:ok, max_concurrency} <-
+           optional_positive_integer(options.max_concurrency, :max_concurrency),
          {:ok, beam_schedulers} <-
            optional_positive_integer(options.beam_schedulers, :beam_schedulers),
          {:ok, timeout} <- timeout(options.timeout) do
@@ -919,6 +924,10 @@ defmodule MixWorkspaceOps.CLI do
   defp optional_positive_integer(value, field), do: positive_integer(value, field)
 
   defp drop_nil_options({:ok, options}), do: {:ok, Enum.reject(options, &(elem(&1, 1) == nil))}
+
+  defp probe_memo(options) do
+    ProbeMemo.new(Path.join(options.state_root, "metadata/probes"))
+  end
 
   defp unit_kind("project"), do: {:ok, :project}
   defp unit_kind("repository"), do: {:ok, :repository}

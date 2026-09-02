@@ -3,6 +3,23 @@ defmodule MixWorkspaceOps.PublishModeTest do
 
   alias MixWorkspaceOps.PublishMode
 
+  test "dependency fetch scope follows deps.get options and mix do task boundaries" do
+    assert PublishMode.dependency_scope(["mix", "deps.get"], "dev") == :all
+
+    assert PublishMode.dependency_scope(["mix", "deps.get", "--only", "test"], "dev") ==
+             {:only, ["test"]}
+
+    assert PublishMode.dependency_scope(["mix", "deps.get", "--only=dev,test"], "dev") ==
+             {:only, ["dev", "test"]}
+
+    assert PublishMode.dependency_scope(
+             ["mix", "do", "deps.get", "--only", "test,", "compile"],
+             "dev"
+           ) == {:only, ["test"]}
+
+    assert PublishMode.dependency_scope(["mix", "compile"], "dev") == :active
+  end
+
   # One table, read by both implementations. The bootstrap is a standalone
   # script a `mix.exs` loads without Mix Workspace Ops on the code path, so its
   # copy of the parser is deliberate duplication; this table is what stops the

@@ -14,6 +14,7 @@ defmodule MixWorkspaceOps.OperationPlan do
     DependencyIndex,
     Git,
     Project,
+    PublishMode,
     Registry,
     Report,
     Resolution,
@@ -37,7 +38,7 @@ defmodule MixWorkspaceOps.OperationPlan do
   @spec build(Registry.t(), struct() | nil, [String.t()], keyword()) ::
           {:ok, plan()} | {:error, term()}
   def build(registry, view, command, opts \\ []) do
-    with {:ok, normalized} <- normalize_options(opts),
+    with {:ok, normalized} <- normalize_options(command, opts),
          :ok <- portable_command(command),
          {:ok, normalized, scope, dependency_index} <- prepare_scope(registry, view, normalized),
          {:ok, units} <- units(registry, normalized),
@@ -123,15 +124,18 @@ defmodule MixWorkspaceOps.OperationPlan do
     }
   end
 
-  defp normalize_options(opts) do
+  defp normalize_options(command, opts) do
+    mix_env = Keyword.get(opts, :mix_env, "dev")
+
     values = %{
       unit_kind: Keyword.get(opts, :unit_kind, :project),
       dirty_policy: Keyword.get(opts, :dirty_policy, :require_clean),
       failure_policy: Keyword.get(opts, :failure_policy, :continue),
       mode: Keyword.get(opts, :mode, :auto),
       sources: Keyword.get(opts, :sources, %{}),
-      mix_env: Keyword.get(opts, :mix_env, "dev"),
+      mix_env: mix_env,
       mix_target: Keyword.get(opts, :mix_target, "host"),
+      dependency_scope: PublishMode.dependency_scope(command, mix_env),
       project: Keyword.get(opts, :project),
       affected: Keyword.get(opts, :affected),
       project_ids: Keyword.get(opts, :project_ids),
@@ -167,6 +171,7 @@ defmodule MixWorkspaceOps.OperationPlan do
         index_opts = [
           mix_env: opts.mix_env,
           mix_target: opts.mix_target,
+          dependency_scope: opts.dependency_scope,
           probe_memo: opts.probe_memo
         ]
 
@@ -273,7 +278,8 @@ defmodule MixWorkspaceOps.OperationPlan do
 
     Project.prewarm(registry, bound, opts.probe_memo,
       mix_env: opts.mix_env,
-      mix_target: opts.mix_target
+      mix_target: opts.mix_target,
+      dependency_scope: opts.dependency_scope
     )
 
     :ok
@@ -375,6 +381,7 @@ defmodule MixWorkspaceOps.OperationPlan do
       sources: opts.sources,
       mix_env: opts.mix_env,
       mix_target: opts.mix_target,
+      dependency_scope: opts.dependency_scope,
       probe_memo: opts.probe_memo
     ]
 

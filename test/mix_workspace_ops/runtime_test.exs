@@ -5,8 +5,12 @@ defmodule MixWorkspaceOps.RuntimeTest do
   alias MixWorkspaceOps.{Runtime, Toolchain}
 
   @cache_identity String.duplicate("a", 64)
-  @lock ~S|%{"alpha" => {:hex, :alpha, "1.0.0"}}| <> "\n"
-  @changed_lock ~S|%{"alpha" => {:hex, :alpha, "2.0.0"}}| <> "\n"
+  @checksum String.duplicate("b", 64)
+  @lock inspect(%{"alpha" => {:hex, :alpha, "1.0.0", "inner", [:mix], [], "hexpm", @checksum}}) <>
+          "\n"
+  @changed_lock inspect(%{
+                  "alpha" => {:hex, :alpha, "2.0.0", "inner", [:mix], [], "hexpm", @checksum}
+                }) <> "\n"
 
   test "concurrent identical invocations share reusable contexts but not transient state",
        context do
@@ -203,8 +207,14 @@ defmodule MixWorkspaceOps.RuntimeTest do
     assert {:ok, first} = Runtime.prepare(state_root, @cache_identity, @lock, opts)
     assert {:ok, second} = Runtime.prepare(state_root, @cache_identity, @lock, opts)
 
-    first_lock = ~S|%{"alpha" => {:hex, :alpha, "2.0.0"}}| <> "\n"
-    second_lock = ~S|%{"alpha" => {:hex, :alpha, "3.0.0"}}| <> "\n"
+    first_lock =
+      inspect(%{"alpha" => {:hex, :alpha, "2.0.0", "inner", [:mix], [], "hexpm", @checksum}}) <>
+        "\n"
+
+    second_lock =
+      inspect(%{"alpha" => {:hex, :alpha, "3.0.0", "inner", [:mix], [], "hexpm", @checksum}}) <>
+        "\n"
+
     File.write!(first.report.lockfile, first_lock)
     File.write!(second.report.lockfile, second_lock)
 
@@ -488,47 +498,6 @@ defmodule MixWorkspaceOps.RuntimeTest do
     on_exit(fn -> finish_and_release(runtime.handle) end)
     assert [%{remote: ^private_remote, commit: ^commit}] = runtime.report.cache_objects.git
     assert Map.new(runtime.env)["HOME"] == runtime.report.home
-  end
-
-  test "dependency-cache mutation is serialized across different project contexts", context do
-    state_root = temporary_directory!(context)
-
-    assert {:ok, first} =
-             Runtime.prepare(
-               state_root,
-               String.duplicate("a", 64),
-               "%{}\n",
-               runtime_opts(project_identity: "first")
-             )
-
-    assert {:ok, second} =
-             Runtime.prepare(
-               state_root,
-               String.duplicate("b", 64),
-               "%{}\n",
-               runtime_opts(project_identity: "second")
-             )
-
-    on_exit(fn -> finish_and_release(first.handle) end)
-    on_exit(fn -> finish_and_release(second.handle) end)
-
-    active = :atomics.new(1, [])
-    parent = self()
-
-    tasks =
-      for handle <- [first.handle, second.handle] do
-        Task.async(fn ->
-          Runtime.with_dependency_cache_lock(handle, fn ->
-            send(parent, {:entered, :atomics.add_get(active, 1, 1)})
-            Process.sleep(100)
-            :atomics.sub_get(active, 1, 1)
-          end)
-        end)
-      end
-
-    assert_receive {:entered, 1}, 1_000
-    assert_receive {:entered, 1}, 1_000
-    Enum.each(tasks, &Task.await(&1, 1_000))
   end
 
   test "delegated units use external reusable Mix state and shield credentials", context do

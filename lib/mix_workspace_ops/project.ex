@@ -9,7 +9,7 @@ defmodule MixWorkspaceOps.Project do
   by parsing.
   """
 
-  alias MixWorkspaceOps.{Command, MixInputs, Registry, Toolchain}
+  alias MixWorkspaceOps.{Command, Git, MixInputs, Registry, ResourceBudget, Toolchain}
   alias MixWorkspaceOps.Project.{ProbeMemo, ProbeTree}
 
   @marker "__MIX_WORKSPACE_OPS_METADATA__"
@@ -26,12 +26,23 @@ defmodule MixWorkspaceOps.Project do
   version = config |> Keyword.get(:version, "") |> to_string()
   mix_env = Mix.env()
   mix_target = Mix.target()
+  dependency_scope = System.get_env("MIX_WORKSPACE_OPS_DEPENDENCY_SCOPE", "active")
   active_for = fn opts, key, current ->
-    case Keyword.get(opts, key) do
-      nil -> true
-      value when is_atom(value) -> value == current
-      values when is_list(values) -> current in values
-      _other -> false
+    if key == :only and dependency_scope == "all" do
+      true
+    else
+      current_names =
+        case {key, dependency_scope} do
+          {:only, "only:" <> names} -> String.split(names, ",", trim: true)
+          _other -> [Atom.to_string(current)]
+        end
+
+      case Keyword.get(opts, key) do
+        nil -> true
+        value when is_atom(value) -> Atom.to_string(value) in current_names
+        values when is_list(values) -> Enum.any?(values, &(Atom.to_string(&1) in current_names))
+        _other -> false
+      end
     end
   end
   active = fn opts ->
@@ -104,6 +115,7 @@ defmodule MixWorkspaceOps.Project do
           probe_memo: ProbeMemo.t(),
           mix_env: String.t(),
           mix_target: String.t(),
+          dependency_scope: :active | :all | {:only, [String.t()]},
           toolchain: term()
         ]
 
@@ -111,6 +123,8 @@ defmodule MixWorkspaceOps.Project do
           {:ok, map()} | {:error, term()}
   def metadata(registry, project, opts \\ []) do
     project_root = Registry.project_root(registry, project)
+    repository_root = Registry.repository_root(registry, project.repository)
+    opts = Keyword.put_new(opts, :repository_root, repository_root)
 
     case metadata_at(project_root, opts) do
       {:ok, %{app: app} = metadata} when app == project.app ->
@@ -129,18 +143,26 @@ defmodule MixWorkspaceOps.Project do
     project_root = Path.expand(project_root)
 
     with {:ok, inputs} <- MixInputs.normalize(opts),
-         {:ok, stage} <- ProbeTree.stage(project_root) do
+         {:ok, key, staged} <- probe_key(project_root, inputs, opts) do
       try do
-        with {:ok, key} <- probe_key(stage, inputs, opts) do
-          question = fn -> evaluate_at(stage, inputs.mix_env, inputs.mix_target) end
+        dependency_scope = Keyword.get(opts, :dependency_scope, :active)
 
-          case Keyword.get(opts, :probe_memo) do
-            nil -> question.()
-            memo -> ProbeMemo.fetch(memo, key, question)
-          end
+        question = fn ->
+          evaluate_project(
+            project_root,
+            staged,
+            inputs.mix_env,
+            inputs.mix_target,
+            dependency_scope
+          )
+        end
+
+        case Keyword.get(opts, :probe_memo) do
+          nil -> question.()
+          memo -> ProbeMemo.fetch(memo, key, question)
         end
       after
-        ProbeTree.cleanup(stage)
+        if staged, do: ProbeTree.cleanup(staged)
       end
     end
   end
@@ -149,7 +171,12 @@ defmodule MixWorkspaceOps.Project do
   @spec prewarm(Registry.t(), [Registry.project()], ProbeMemo.t(), keyword()) ::
           [{String.t(), {:ok, map()} | {:error, term()}}]
   def prewarm(registry, projects, memo, opts \\ []) do
-    max_concurrency = Keyword.get(opts, :max_concurrency, min(System.schedulers_online(), 8))
+    default_concurrency =
+      ResourceBudget.snapshot()
+      |> ResourceBudget.allocate(:cpu, length(projects))
+      |> Map.fetch!(:workers)
+
+    max_concurrency = Keyword.get(opts, :max_concurrency, default_concurrency)
     probe_opts = Keyword.put(opts, :probe_memo, memo)
 
     projects
@@ -162,13 +189,72 @@ defmodule MixWorkspaceOps.Project do
     |> Enum.map(fn {:ok, result} -> result end)
   end
 
-  defp probe_key(stage, inputs, opts) do
-    path = Path.join(stage.project_root, "mix.exs")
+  defp probe_key(project_root, inputs, opts) do
+    path = Path.join(project_root, "mix.exs")
 
-    with :ok <- readable(path), {:ok, bytes} <- File.read(path) do
+    with :ok <- readable(path),
+         {:ok, bytes} <- File.read(path),
+         {:ok, source_identity, staged} <- probe_source_identity(project_root, opts) do
       digest = :crypto.hash(:sha256, bytes)
       toolchain = Keyword.get_lazy(opts, :toolchain, &toolchain/0)
-      {:ok, {digest, stage.source_digest, inputs.mix_env, inputs.mix_target, toolchain}}
+      dependency_scope = Keyword.get(opts, :dependency_scope, :active)
+
+      {:ok,
+       {digest, source_identity, inputs.mix_env, inputs.mix_target, dependency_scope, toolchain},
+       staged}
+    end
+  end
+
+  defp probe_source_identity(project_root, opts) do
+    case Keyword.get(opts, :repository_root) || git_root(project_root) do
+      {:error, _not_git} ->
+        staged_source_identity(project_root)
+
+      root when is_binary(root) ->
+        with {:ok, repository_identity} <-
+               repository_identity(root, Keyword.get(opts, :probe_memo)) do
+          {:ok, {:git, repository_identity, Path.relative_to(project_root, root)}, nil}
+        end
+    end
+  end
+
+  defp git_root(project_root) do
+    case Git.root(project_root) do
+      {:ok, root} -> root
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp repository_identity(root, nil), do: compute_repository_identity(root)
+
+  defp repository_identity(root, memo) do
+    ProbeMemo.fetch_transient(memo, {:repository_identity, root}, fn ->
+      compute_repository_identity(root)
+    end)
+  end
+
+  defp compute_repository_identity(root) do
+    head = Git.head!(root)
+    dirty = if Git.clean?(root), do: nil, else: Git.source_digest(root)
+    {:ok, {head, dirty}}
+  end
+
+  defp staged_source_identity(project_root) do
+    with {:ok, stage} <- ProbeTree.stage(project_root) do
+      {:ok, {:source, stage.source_digest}, stage}
+    end
+  end
+
+  defp evaluate_project(_project_root, %ProbeTree{} = stage, mix_env, mix_target, scope),
+    do: evaluate_at(stage, mix_env, mix_target, scope)
+
+  defp evaluate_project(project_root, nil, mix_env, mix_target, scope) do
+    with {:ok, stage} <- ProbeTree.stage(project_root) do
+      try do
+        evaluate_at(stage, mix_env, mix_target, scope)
+      after
+        ProbeTree.cleanup(stage)
+      end
     end
   end
 
@@ -177,7 +263,7 @@ defmodule MixWorkspaceOps.Project do
     {System.version(), List.to_string(:erlang.system_info(:otp_release)), mix_version}
   end
 
-  defp evaluate_at(stage, mix_env, mix_target) do
+  defp evaluate_at(stage, mix_env, mix_target, dependency_scope) do
     state = Path.join(stage.root, "state")
     home = Path.join(state, "home")
     mix_home = Path.join(state, "mix")
@@ -200,14 +286,33 @@ defmodule MixWorkspaceOps.Project do
            ],
            cd: stage.project_root,
            replace_env: true,
-           env: probe_environment(mix_env, mix_target, home, mix_home, hex_home, temporary, stage)
+           env:
+             probe_environment(
+               mix_env,
+               mix_target,
+               dependency_scope,
+               home,
+               mix_home,
+               hex_home,
+               temporary,
+               stage
+             )
          ) do
       {:ok, result} -> parse(result.output)
       {:error, result} -> {:error, {:command_failed, result.exit_code, result.output}}
     end
   end
 
-  defp probe_environment(mix_env, mix_target, home, mix_home, hex_home, temporary, stage) do
+  defp probe_environment(
+         mix_env,
+         mix_target,
+         dependency_scope,
+         home,
+         mix_home,
+         hex_home,
+         temporary,
+         stage
+       ) do
     [
       {"PATH", System.get_env("PATH") || "/usr/bin:/bin"},
       {"LANG", System.get_env("LANG") || "C"},
@@ -219,12 +324,17 @@ defmodule MixWorkspaceOps.Project do
       {"TMPDIR", temporary},
       {"MIX_ENV", mix_env},
       {"MIX_TARGET", mix_target},
+      {"MIX_WORKSPACE_OPS_DEPENDENCY_SCOPE", encode_dependency_scope(dependency_scope)},
       {"MIX_WORKSPACE_OPS_PROBE", "1"},
       {"MIX_WORKSPACE_OPS_PROBE_ROOT", stage.root}
     ]
   end
 
   defp state_parent(path), do: Path.dirname(path)
+
+  defp encode_dependency_scope(:active), do: "active"
+  defp encode_dependency_scope(:all), do: "all"
+  defp encode_dependency_scope({:only, envs}), do: "only:" <> Enum.join(envs, ",")
 
   defp timeout_executable, do: System.find_executable("timeout") || "timeout"
 

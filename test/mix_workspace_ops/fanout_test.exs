@@ -49,8 +49,10 @@ defmodule MixWorkspaceOps.FanoutTest do
     assert report.binding.max_concurrency == 2
     assert report.binding.binding_concurrency == 2
     assert report.binding.cache_concurrency == 1
-    assert report.binding.beam_schedulers == max(div(System.schedulers_online(), 2), 1)
-    assert report.binding.scheduler_budget == System.schedulers_online()
+    assert report.binding.beam_schedulers == max(div(report.binding.scheduler_budget, 2), 1)
+    assert report.binding.scheduler_budget == report.binding.resource_budget.cpu_slots
+    assert report.binding.resource_budget.worker_override
+    assert report.binding.resource_budget.workers == 2
 
     assert Enum.map(report.results, &{&1.id, &1.status}) == [
              {"alpha", :passed},
@@ -292,6 +294,29 @@ defmodule MixWorkspaceOps.FanoutTest do
       assert %{value: value} = Enum.find(unit.command.env, &(&1.name == "ERL_AFLAGS"))
       assert value =~ "+S 3:3"
     end
+  end
+
+  test "default fanout allocation comes from one reported host snapshot", context do
+    fixture = project_fixture(context)
+    assert {:ok, plan} = OperationPlan.build(fixture.registry, fixture.view, ["true"])
+
+    snapshot = %{
+      logical_schedulers: 24,
+      load_one: 0.08,
+      memory_total: 160 * 1024 * 1024 * 1024,
+      memory_available: 155 * 1024 * 1024 * 1024
+    }
+
+    assert {:ok, report} =
+             Fanout.run(plan, fixture.registry,
+               state_root: fixture.state_root,
+               resource_snapshot: snapshot
+             )
+
+    assert report.binding.max_concurrency == 2
+    assert report.binding.beam_schedulers == 11
+    assert report.binding.scheduler_budget == 22
+    refute report.binding.resource_budget.worker_override
   end
 
   test "a partial binding failure finalizes every lease already allocated", context do

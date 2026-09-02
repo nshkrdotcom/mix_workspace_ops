@@ -210,6 +210,20 @@ defmodule MixWorkspaceOpsBootstrap do
     end
   end
 
+  @doc "Applies the exact managed source decisions to the loaded root dependency list."
+  def install_source_projection! do
+    case overlay() do
+      nil ->
+        :ok
+
+      overlay ->
+        config = Mix.Project.config()
+        existing = Keyword.get(config, :deps, [])
+        projected = project_dependencies(existing, overlay.sources)
+        __MODULE__.LockfileCompat.merge!(deps: projected)
+    end
+  end
+
   # There is no public Mix environment variable for redirecting the project
   # lockfile while preserving arbitrary external Mix task semantics. Keep the
   # one required private API behind this deliberately tiny compatibility seam.
@@ -222,6 +236,15 @@ defmodule MixWorkspaceOpsBootstrap do
         :ok
       else
         raise "Mix.ProjectStack is unavailable; cannot install MWO private lockfile"
+      end
+    end
+
+    def merge!(config) do
+      if Process.whereis(Mix.ProjectStack) do
+        Mix.ProjectStack.merge_config(config)
+        :ok
+      else
+        raise "Mix.ProjectStack is unavailable; cannot install MWO source projection"
       end
     end
   end
@@ -264,6 +287,51 @@ defmodule MixWorkspaceOpsBootstrap do
   defp committed_application!(other) do
     raise "committed dependency must be an ordinary Mix dependency tuple, got: " <>
             inspect(other)
+  end
+
+  defp project_dependencies(existing, sources) do
+    {projected, present} =
+      Enum.map_reduce(existing, MapSet.new(), fn dependency, apps ->
+        app = committed_application!(dependency)
+        source = Map.get(sources, Atom.to_string(app))
+
+        projected =
+          if source,
+            do: dependency |> project_source(app, source) |> force_override(),
+            else: dependency
+
+        {projected, MapSet.put(apps, Atom.to_string(app))}
+      end)
+
+    inherited =
+      sources
+      |> Enum.reject(fn {app, _source} -> MapSet.member?(present, app) end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(fn {app, source} ->
+        app
+        |> dependency_atom!()
+        |> then(&overlay_tuple(&1, source, override: true, runtime: false))
+      end)
+
+    projected ++ inherited
+  end
+
+  defp project_source(committed, app, source),
+    do: overlay_tuple(app, source, committed_options!(committed))
+
+  defp force_override({app, requirement}) when is_binary(requirement),
+    do: {app, requirement, [override: true]}
+
+  defp force_override({app, requirement, opts}) when is_binary(requirement),
+    do: {app, requirement, Keyword.put(opts, :override, true)}
+
+  defp force_override({app, opts}) when is_list(opts),
+    do: {app, Keyword.put(opts, :override, true)}
+
+  defp dependency_atom!(name) do
+    if Regex.match?(~r/^[a-z][a-z0-9_]*$/, name) and byte_size(name) <= 255,
+      do: String.to_atom(name),
+      else: raise("invalid Mix Workspace Ops dependency application: #{inspect(name)}")
   end
 
   defp committed_options!({_app, requirement})

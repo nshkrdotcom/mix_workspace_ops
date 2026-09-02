@@ -14,7 +14,7 @@ defmodule MixWorkspaceOps.Runtime do
   """
 
   alias Mix.Sync.Lock, as: SyncLock
-  alias MixWorkspaceOps.{GitCache, Lockfile, Report, Toolchain}
+  alias MixWorkspaceOps.{GitCache, HexCache, Lockfile, Report, Toolchain}
 
   @state_marker "mix_workspace_ops.state/v1\n"
   @runtime_schema "mix_workspace_ops.runtime/v5"
@@ -220,6 +220,7 @@ defmodule MixWorkspaceOps.Runtime do
          finished_at = System.system_time(:second),
          status = finish_status(decision),
          {:ok, metadata} <- read_metadata(handle.metadata_path),
+         :ok <- capture_hex_objects(decision, handle, metadata),
          final =
            metadata
            |> Map.put("status", status)
@@ -250,13 +251,6 @@ defmodule MixWorkspaceOps.Runtime do
   @spec with_operation_lock(t(), (-> result)) :: result when result: term()
   def with_operation_lock(%__MODULE__{} = handle, operation) when is_function(operation, 0) do
     SyncLock.with_lock(operation_lock(handle), operation)
-  end
-
-  @doc false
-  @spec with_dependency_cache_lock(t(), (-> result)) :: result when result: term()
-  def with_dependency_cache_lock(%__MODULE__{} = handle, operation)
-      when is_function(operation, 0) do
-    SyncLock.with_lock("mix_workspace_ops:hex-cache:" <> handle.state_root, operation)
   end
 
   @doc "Lists every durable run and whether its lease is currently live."
@@ -351,8 +345,6 @@ defmodule MixWorkspaceOps.Runtime do
            record_preparation(diagnostic, "copy_archives", "running", %{path: paths.archives}),
          :ok <-
            copy_archives(paths.archives, Keyword.get(opts, :archives_source, archives_source())),
-         :ok <- record_preparation(diagnostic, "prepare_git_transport", "running"),
-         {:ok, cache_objects} <- prepare_git_transport(handle, lock_bytes, paths, opts),
          :ok <-
            record_preparation(diagnostic, "write_runtime_files", "running", %{path: handle.root}),
          :ok <- write_mix_wrapper(paths.mix_exs),
@@ -363,6 +355,11 @@ defmodule MixWorkspaceOps.Runtime do
            | lockfile: lockfile,
              operational_lock_digest: lock_digest(operational_lock)
          },
+         :ok <- record_preparation(diagnostic, "prepare_hex_transport", "running"),
+         {:ok, hex} <- prepare_hex_transport(handle, paths, opts),
+         :ok <- record_preparation(diagnostic, "prepare_git_transport", "running"),
+         {:ok, git_cache} <- prepare_git_transport(handle, lock_bytes, paths, opts),
+         cache_objects <- Map.put(git_cache, :hex, hex),
          metadata <- initial_metadata(handle, execution_inputs, paths, cache_objects),
          :ok <- write_report_private(handle.metadata_path, metadata),
          :ok <- record_preparation(diagnostic, "complete", "complete") do
@@ -676,13 +673,16 @@ defmodule MixWorkspaceOps.Runtime do
   defp runtime_paths(handle) do
     mix_cache = Path.join([handle.state_root, "cache", "mix", sha256(toolchain())])
 
+    dependency_cache =
+      Path.join([handle.state_root, "contexts", "transport", handle.dependency_identity])
+
     %{
       home: Path.join(handle.root, "home"),
       tmp: Path.join([handle.state_root, "cache", "tmp"]),
       config: Path.join(handle.root, "config"),
       mix_exs: Path.join(handle.root, "mix.exs"),
-      xdg_cache: Path.join([handle.state_root, "cache", "xdg"]),
-      hex_cache: Path.join([handle.state_root, "cache", "xdg", "hex"]),
+      xdg_cache: Path.join(dependency_cache, "xdg"),
+      hex_cache: Path.join([dependency_cache, "xdg", "hex"]),
       rebar: Path.join([handle.state_root, "cache", "rebar"]),
       mix: mix_cache,
       archives: Path.join(mix_cache, "archives"),
@@ -950,7 +950,20 @@ defmodule MixWorkspaceOps.Runtime do
     end
   end
 
-  defp empty_cache_objects, do: %{git: [], git_env: []}
+  defp prepare_hex_transport(handle, paths, opts) do
+    if Keyword.get(opts, :prepare_objects, false) do
+      HexCache.prepare(handle.state_root, paths.hex_cache, handle.lockfile,
+        env: hex_transport_environment(paths),
+        cd: handle.root,
+        max_concurrency: Keyword.get(opts, :cache_concurrency, System.schedulers_online()),
+        timeout: Keyword.get(opts, :cache_timeout, 120_000)
+      )
+    else
+      {:ok, []}
+    end
+  end
+
+  defp empty_cache_objects, do: %{git: [], hex: [], git_env: []}
 
   defp git_requests(objects, sources) do
     locked = MapSet.new(objects, & &1.app)
@@ -968,6 +981,7 @@ defmodule MixWorkspaceOps.Runtime do
       bootstrap = System.fetch_env!("MIX_WORKSPACE_OPS_BOOTSTRAP")
       Code.require_file(bootstrap)
       Code.compile_file(Path.join(root, "mix.exs"))
+      MixWorkspaceOpsBootstrap.install_source_projection!()
     else
       Code.compile_file(Path.join(current, "mix.exs"))
     end
@@ -1062,6 +1076,29 @@ defmodule MixWorkspaceOps.Runtime do
       |> Enum.map(&{&1, nil})
 
     (base ++ removed) |> Map.new() |> Enum.sort_by(&elem(&1, 0))
+  end
+
+  defp hex_transport_environment(paths) do
+    base = [
+      {"HOME", paths.home},
+      {"XDG_CONFIG_HOME", paths.config},
+      {"XDG_CACHE_HOME", paths.xdg_cache},
+      {"MIX_XDG", "1"},
+      {"MIX_HOME", paths.mix},
+      {"MIX_ARCHIVES", paths.archives},
+      {"HEX_HOME", nil},
+      {"REBAR_CACHE_DIR", paths.rebar},
+      {"TMPDIR", paths.tmp},
+      {"HEX_NO_UPDATE_CHECK", "1"},
+      {"ERL_AFLAGS", "+S 1:1"},
+      {"PATH", toolchain_path()},
+      {"GCM_INTERACTIVE", "never"},
+      {"GIT_TERMINAL_PROMPT", "0"}
+    ]
+
+    (base ++ Enum.map(publication_credential_keys(), &{&1, nil}))
+    |> Map.new()
+    |> Enum.sort_by(&elem(&1, 0))
   end
 
   defp git_transport_credential?(name) do
@@ -1199,6 +1236,17 @@ defmodule MixWorkspaceOps.Runtime do
       {:error, reason} -> {:error, {:runtime_final_lock, path, reason}}
     end
   end
+
+  defp capture_hex_objects(:complete, handle, metadata) when is_binary(handle.lockfile) do
+    paths = Map.get(metadata, "paths", Map.get(metadata, :paths, %{}))
+    cache_home = Map.get(paths, "hex_cache", Map.get(paths, :hex_cache))
+
+    if is_binary(cache_home),
+      do: HexCache.capture(handle.state_root, cache_home, handle.lockfile),
+      else: {:error, {:runtime_hex_cache_path, cache_home}}
+  end
+
+  defp capture_hex_objects(_decision, _handle, _metadata), do: :ok
 
   defp finish_decision(_handle, _final_lock, _final_digest, false), do: :complete
 

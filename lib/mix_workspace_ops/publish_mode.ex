@@ -82,6 +82,31 @@ defmodule MixWorkspaceOps.PublishMode do
 
   def task_argv([]), do: []
 
+  @doc "Dependency-environment scope required by the Mix command."
+  @spec dependency_scope([String.t()], String.t()) :: :active | :all | {:only, [String.t()]}
+  def dependency_scope(command, _mix_env) when is_list(command) do
+    scopes =
+      command
+      |> task_argv()
+      |> task_segments()
+      |> Enum.flat_map(fn
+        ["deps.get" | args] -> [only_scope(args)]
+        _other -> []
+      end)
+
+    cond do
+      scopes == [] ->
+        :active
+
+      :all in scopes ->
+        :all
+
+      true ->
+        {:only,
+         scopes |> Enum.flat_map(fn {:only, envs} -> envs end) |> Enum.uniq() |> Enum.sort()}
+    end
+  end
+
   # `elixir -S mix` asks the launcher to find `mix` on PATH and run it, so the
   # tokens after it are exactly what `mix` itself would have received.
   defp scripted_task_argv(argv) do
@@ -109,5 +134,42 @@ defmodule MixWorkspaceOps.PublishMode do
 
   defp collect_do([token | rest], acc, false) do
     collect_do(rest, acc, String.ends_with?(token, ","))
+  end
+
+  defp task_segments(["do" | argv]), do: split_do_segments(argv, [], []) |> Enum.reverse()
+  defp task_segments([]), do: []
+  defp task_segments(argv), do: [argv]
+
+  defp split_do_segments([], [], segments), do: segments
+  defp split_do_segments([], current, segments), do: [Enum.reverse(current) | segments]
+
+  defp split_do_segments([token | rest], current, segments) when token in [",", "+"] do
+    next = if current == [], do: segments, else: [Enum.reverse(current) | segments]
+    split_do_segments(rest, [], next)
+  end
+
+  defp split_do_segments([token | rest], current, segments) do
+    if String.ends_with?(token, ",") do
+      value = String.trim_trailing(token, ",")
+      current = if value == "", do: current, else: [value | current]
+      split_do_segments(rest, [], [Enum.reverse(current) | segments])
+    else
+      split_do_segments(rest, [token | current], segments)
+    end
+  end
+
+  defp only_scope(args) do
+    values =
+      args
+      |> Enum.with_index()
+      |> Enum.flat_map(fn
+        {"--only", index} -> Enum.slice(args, (index + 1)..(index + 1))
+        {"--only=" <> value, _index} -> [value]
+        _other -> []
+      end)
+      |> Enum.reject(&String.starts_with?(&1, "-"))
+      |> Enum.flat_map(&String.split(&1, ",", trim: true))
+
+    if values == [], do: :all, else: {:only, values}
   end
 end
