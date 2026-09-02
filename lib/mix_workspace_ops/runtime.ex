@@ -105,7 +105,6 @@ defmodule MixWorkspaceOps.Runtime do
     :ownership,
     :lease_path,
     :metadata_path,
-    :preparation_path,
     :source_lock_digest,
     :operational_lock_digest,
     :context_lockfile,
@@ -124,7 +123,6 @@ defmodule MixWorkspaceOps.Runtime do
     :ownership,
     :lease_path,
     :metadata_path,
-    :preparation_path,
     :source_lock_digest,
     :operational_lock_digest,
     :context_lockfile,
@@ -145,7 +143,6 @@ defmodule MixWorkspaceOps.Runtime do
           ownership: :managed | :delegated,
           lease_path: String.t(),
           metadata_path: String.t(),
-          preparation_path: String.t(),
           source_lock_digest: String.t(),
           operational_lock_digest: String.t(),
           context_lockfile: String.t(),
@@ -204,8 +201,7 @@ defmodule MixWorkspaceOps.Runtime do
                    binding_root: execution_inputs.binding_root,
                    ownership: ownership,
                    allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
-                   created_at: created_at,
-                   preparation_path: diagnostic.path
+                   created_at: created_at
                  }
                ) do
           prepare_run(handle, lock_bytes, context_lock.bytes, execution_inputs, diagnostic, opts)
@@ -334,63 +330,34 @@ defmodule MixWorkspaceOps.Runtime do
     paths = runtime_paths(handle)
 
     with :ok <-
-           preparation_step(diagnostic, "write_lease", %{path: handle.lease_path}, fn ->
-             write_lease(handle)
-           end),
+           record_preparation(diagnostic, "write_lease", "running", %{path: handle.lease_path}),
+         :ok <- write_lease(handle),
          reservation <- initial_metadata(handle, execution_inputs, paths, empty_cache_objects()),
          :ok <-
-           preparation_step(
-             diagnostic,
-             "write_initial_metadata",
-             %{path: handle.metadata_path},
-             fn -> write_report_private(handle.metadata_path, reservation) end
-           ),
-         {:ok, paths} <-
-           preparation_step(diagnostic, "create_state_directories", %{}, fn ->
-             create_state_directories(paths, handle.created_at, diagnostic)
-           end),
+           record_preparation(diagnostic, "write_metadata", "running", %{
+             path: handle.metadata_path
+           }),
+         :ok <- write_report_private(handle.metadata_path, reservation),
+         :ok <- record_preparation(diagnostic, "create_state_directories", "running"),
+         {:ok, paths} <- create_state_directories(paths, handle.created_at, diagnostic),
          :ok <-
-           preparation_step(diagnostic, "copy_archives", %{path: paths.archives}, fn ->
-             copy_archives(
-               paths.archives,
-               Keyword.get(opts, :archives_source, archives_source())
-             )
-           end),
-         {:ok, cache_objects} <-
-           preparation_step(diagnostic, "prepare_git_transport", %{}, fn ->
-             prepare_git_transport(handle, lock_bytes, paths, opts)
-           end),
+           record_preparation(diagnostic, "copy_archives", "running", %{path: paths.archives}),
          :ok <-
-           preparation_step(diagnostic, "write_mix_wrapper", %{path: paths.mix_exs}, fn ->
-             write_mix_wrapper(paths.mix_exs)
-           end),
+           copy_archives(paths.archives, Keyword.get(opts, :archives_source, archives_source())),
+         :ok <- record_preparation(diagnostic, "prepare_git_transport", "running"),
+         {:ok, cache_objects} <- prepare_git_transport(handle, lock_bytes, paths, opts),
          :ok <-
-           preparation_step(
-             diagnostic,
-             "write_source_lock",
-             %{path: Path.join(handle.root, "source.mix.lock")},
-             fn -> write_private(Path.join(handle.root, "source.mix.lock"), lock_bytes) end
-           ),
-         {:ok, lockfile} <-
-           preparation_step(
-             diagnostic,
-             "write_operational_lock",
-             %{path: Path.join(handle.root, "mix.lock")},
-             fn -> prepare_lockfile(handle, paths, operational_lock) end
-           ),
+           record_preparation(diagnostic, "write_runtime_files", "running", %{path: handle.root}),
+         :ok <- write_mix_wrapper(paths.mix_exs),
+         :ok <- write_private(Path.join(handle.root, "source.mix.lock"), lock_bytes),
+         {:ok, lockfile} <- prepare_lockfile(handle, paths, operational_lock),
          handle = %{
            handle
            | lockfile: lockfile,
              operational_lock_digest: lock_digest(operational_lock)
          },
          metadata <- initial_metadata(handle, execution_inputs, paths, cache_objects),
-         :ok <-
-           preparation_step(
-             diagnostic,
-             "write_final_metadata",
-             %{path: handle.metadata_path},
-             fn -> write_report_private(handle.metadata_path, metadata) end
-           ),
+         :ok <- write_report_private(handle.metadata_path, metadata),
          :ok <- record_preparation(diagnostic, "complete", "complete") do
       {:ok,
        %{
@@ -413,7 +380,6 @@ defmodule MixWorkspaceOps.Runtime do
       ownership: invocation.ownership,
       lease_path: Path.join(root, "lease.json"),
       metadata_path: Path.join(root, "runtime.json"),
-      preparation_path: invocation.preparation_path,
       source_lock_digest: lock_digest(lock_bytes),
       operational_lock_digest: lock_digest(context_lock.bytes),
       context_lockfile: context_lock.path,
@@ -595,38 +561,7 @@ defmodule MixWorkspaceOps.Runtime do
         details
       )
 
-    write_report_private(diagnostic.path, report)
-  end
-
-  defp record_preparation!(diagnostic, stage, status, details) do
-    case record_preparation(diagnostic, stage, status, details) do
-      :ok -> :ok
-      {:error, reason} -> throw({:preparation_diagnostic, diagnostic.path, reason})
-    end
-  end
-
-  defp preparation_step(diagnostic, stage, details, operation) do
-    with :ok <- record_preparation(diagnostic, stage, "running", details) do
-      result = operation.()
-
-      case result do
-        {:error, reason} = error ->
-          if Map.get(preparation_snapshot(diagnostic.path), "stage") == stage do
-            _ =
-              record_preparation(
-                diagnostic,
-                stage,
-                "failed",
-                Map.put(details, :reason, inspect(reason, limit: :infinity))
-              )
-          end
-
-          error
-
-        other ->
-          other
-      end
-    end
+    replace_progress(diagnostic.path, Report.encode(report) <> "\n")
   end
 
   defp bounded_preparation(diagnostic, operation, details, function) do
@@ -650,10 +585,8 @@ defmodule MixWorkspaceOps.Runtime do
         {:error, {:preparation_task_exit, operation, reason}}
 
       nil ->
-        # Do not wait in Task.shutdown/2: a task blocked in a filesystem NIF may
-        # not process its exit signal until the kernel call returns. Unlinking
-        # first lets the coordinator report the exact stalled stage promptly;
-        # the killed task cannot outlive this MWO OS process.
+        # Do not wait for a task blocked in a filesystem call. The caller gets a
+        # bounded, stage-specific failure; exiting MWO ends any such task.
         Process.unlink(task.pid)
         Process.exit(task.pid, :kill)
         Process.demonitor(task.ref, [:flush])
@@ -770,36 +703,19 @@ defmodule MixWorkspaceOps.Runtime do
     details = %{context: to_string(kind), path: path}
 
     bounded_preparation(diagnostic, operation, details, fn ->
-      with :ok <- record_preparation(diagnostic, operation <> "_lock", "waiting", details) do
-        SyncLock.with_lock(
-          context_lock(path),
-          fn ->
-            with :ok <-
-                   record_preparation(diagnostic, operation <> "_lock", "acquired", details),
-                 {:ok, hit} <-
-                   preparation_step(diagnostic, operation <> "_inspect", details, fn ->
-                     {:ok, populated_directory?(path)}
-                   end),
-                 :ok <-
-                   preparation_step(diagnostic, operation <> "_mkdir", details, fn ->
-                     mkdir_private(path)
-                   end),
-                 :ok <-
-                   preparation_step(diagnostic, operation <> "_touch", details, fn ->
-                     touch_context(path, timestamp)
-                   end) do
-              {:ok, hit}
-            end
-          end,
-          on_taken: fn owner ->
-            record_preparation!(
-              diagnostic,
-              operation <> "_lock",
-              "waiting",
-              Map.put(details, :lock_owner, owner)
-            )
-          end
-        )
+      prepare_context_locked(path, timestamp, diagnostic, operation, details)
+    end)
+  end
+
+  defp prepare_context_locked(path, timestamp, diagnostic, operation, details) do
+    with_preparation_lock(diagnostic, operation, details, context_lock(path), fn ->
+      with :ok <- record_preparation(diagnostic, operation <> "_inspect", "running", details),
+           hit <- populated_directory?(path),
+           :ok <- record_preparation(diagnostic, operation <> "_mkdir", "running", details),
+           :ok <- mkdir_private(path),
+           :ok <- record_preparation(diagnostic, operation <> "_touch", "running", details),
+           :ok <- touch_context(path, timestamp) do
+        {:ok, hit}
       end
     end)
   end
@@ -811,34 +727,36 @@ defmodule MixWorkspaceOps.Runtime do
     details = %{context: "deps", path: context, lockfile: path}
 
     bounded_preparation(diagnostic, operation, details, fn ->
-      with :ok <- record_preparation(diagnostic, operation <> "_lock", "waiting", details) do
-        SyncLock.with_lock(
-          context_lock(context),
-          fn ->
-            with :ok <-
-                   record_preparation(diagnostic, operation <> "_lock", "acquired", details),
-                 :ok <-
-                   preparation_step(diagnostic, operation <> "_mkdir", details, fn ->
-                     mkdir_private(context)
-                   end),
-                 {:ok, bytes, status} <-
-                   preparation_step(diagnostic, operation <> "_read", details, fn ->
-                     read_or_initialize_context_lock(path, initial_lock)
-                   end) do
-              {:ok, %{path: path, bytes: bytes, status: status}}
-            end
-          end,
-          on_taken: fn owner ->
-            record_preparation!(
-              diagnostic,
-              operation <> "_lock",
-              "waiting",
-              Map.put(details, :lock_owner, owner)
-            )
-          end
-        )
+      prepare_context_lock_locked(context, path, initial_lock, diagnostic, operation, details)
+    end)
+  end
+
+  defp prepare_context_lock_locked(context, path, initial_lock, diagnostic, operation, details) do
+    with_preparation_lock(diagnostic, operation, details, context_lock(context), fn ->
+      with :ok <- record_preparation(diagnostic, operation <> "_mkdir", "running", details),
+           :ok <- mkdir_private(context),
+           :ok <- record_preparation(diagnostic, operation <> "_read", "running", details),
+           {:ok, bytes, status} <- read_or_initialize_context_lock(path, initial_lock) do
+        {:ok, %{path: path, bytes: bytes, status: status}}
       end
     end)
+  end
+
+  defp with_preparation_lock(diagnostic, operation, details, lock, function) do
+    with :ok <- record_preparation(diagnostic, operation <> "_lock", "waiting", details) do
+      SyncLock.with_lock(lock, function,
+        on_taken: &record_lock_owner(diagnostic, operation, details, &1)
+      )
+    end
+  end
+
+  defp record_lock_owner(diagnostic, operation, details, owner) do
+    record_preparation(
+      diagnostic,
+      operation <> "_lock",
+      "waiting",
+      Map.put(details, :lock_owner, owner)
+    )
   end
 
   defp read_or_initialize_context_lock(path, initial_lock) do
@@ -891,7 +809,7 @@ defmodule MixWorkspaceOps.Runtime do
   defp touch_context(path, timestamp) do
     marker = Path.join(path, @access_marker)
 
-    with :ok <- File.write(marker, Integer.to_string(timestamp) <> "\n", [:sync]),
+    with :ok <- File.write(marker, Integer.to_string(timestamp) <> "\n"),
          do: File.chmod(marker, 0o600)
   end
 
@@ -1133,9 +1051,12 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   defp toolchain_path do
+    elixir_bin =
+      :elixir |> :code.lib_dir() |> Path.join("../../bin") |> Path.expand()
+
     erlang_bin = :code.root_dir() |> to_string() |> Path.join("bin")
 
-    [erlang_bin, System.get_env("PATH")]
+    [elixir_bin, erlang_bin, System.get_env("PATH")]
     |> Enum.reject(&(&1 in [nil, ""]))
     |> Enum.join(":")
   end
@@ -1204,7 +1125,7 @@ defmodule MixWorkspaceOps.Runtime do
       config_home: paths.config,
       source_lock: Path.join(handle.root, "source.mix.lock"),
       context_lockfile: handle.context_lockfile,
-      preparation: handle.preparation_path,
+      preparation: Path.join(handle.root, "preparation.json"),
       deps_path: paths.deps,
       build_root: paths.build,
       build_path: paths.build,
@@ -1227,7 +1148,6 @@ defmodule MixWorkspaceOps.Runtime do
       root: handle.root,
       lease: handle.lease_path,
       metadata: handle.metadata_path,
-      preparation: handle.preparation_path,
       created_at: value(metadata, "created_at"),
       finished_at: value(metadata, "finished_at"),
       status: value(metadata, "status"),
@@ -1683,6 +1603,20 @@ defmodule MixWorkspaceOps.Runtime do
         :ok -> File.rename(temporary, path)
         {:error, _reason} = error -> error
       end
+
+    if result != :ok, do: File.rm(temporary)
+    result
+  end
+
+  # Preparation progress is a crash diagnostic, not committed state. Atomic
+  # replacement keeps it readable without forcing every stage to stable storage.
+  defp replace_progress(path, bytes) do
+    temporary = path <> ".tmp-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    result =
+      with :ok <- File.write(temporary, bytes),
+           :ok <- File.chmod(temporary, 0o600),
+           do: File.rename(temporary, path)
 
     if result != :ok, do: File.rm(temporary)
     result

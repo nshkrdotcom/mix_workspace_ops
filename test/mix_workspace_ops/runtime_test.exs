@@ -1,6 +1,7 @@
 defmodule MixWorkspaceOps.RuntimeTest do
   use MixWorkspaceOps.WorkspaceCase, async: false
 
+  alias Mix.Sync.Lock, as: SyncLock
   alias MixWorkspaceOps.Runtime
 
   @cache_identity String.duplicate("a", 64)
@@ -58,7 +59,7 @@ defmodule MixWorkspaceOps.RuntimeTest do
 
     holder =
       Task.async(fn ->
-        Mix.Sync.Lock.with_lock(lock_key, fn ->
+        SyncLock.with_lock(lock_key, fn ->
           send(parent, :context_lock_held)
 
           receive do
@@ -367,8 +368,10 @@ defmodule MixWorkspaceOps.RuntimeTest do
     assert env["XDG_CACHE_HOME"] == runtime.report.xdg_cache_home
     refute env["XDG_CONFIG_HOME"] == env["XDG_CACHE_HOME"]
 
-    expected_erlang_bin = :code.root_dir() |> to_string() |> Path.join("bin")
-    assert env["PATH"] |> String.split(":") |> hd() == expected_erlang_bin
+    expected_elixir_bin =
+      :elixir |> :code.lib_dir() |> Path.join("../../bin") |> Path.expand()
+
+    assert env["PATH"] |> String.split(":") |> hd() == expected_elixir_bin
     assert File.stat!(runtime.report.root).mode |> Bitwise.band(0o777) == 0o700
     assert File.stat!(runtime.report.lease).mode |> Bitwise.band(0o777) == 0o600
     assert File.stat!(runtime.report.metadata).mode |> Bitwise.band(0o777) == 0o600
