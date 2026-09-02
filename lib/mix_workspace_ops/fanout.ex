@@ -75,6 +75,8 @@ defmodule MixWorkspaceOps.Fanout do
          preparation_timeout: preparation_timeout,
          state_root: state_root,
          allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
+         git_cache_memo:
+           :ets.new(GitCache, [:set, :public, read_concurrency: true, write_concurrency: true]),
          hex_cache_memo:
            :ets.new(HexCache, [:set, :public, read_concurrency: true, write_concurrency: true]),
          probe_memo: Keyword.get(opts, :probe_memo, ProbeMemo.new())
@@ -222,6 +224,7 @@ defmodule MixWorkspaceOps.Fanout do
       cache_concurrency: execution.cache_concurrency,
       preparation_timeout: execution.preparation_timeout,
       mix_state: :managed,
+      git_cache_memo: execution.git_cache_memo,
       probe_memo: execution.probe_memo,
       state_root: execution.state_root
     ]
@@ -284,6 +287,7 @@ defmodule MixWorkspaceOps.Fanout do
              mix_env: field(policy, :mix_env),
              mix_target: field(policy, :mix_target),
              prepare_objects: true,
+             git_cache_memo: execution.git_cache_memo,
              cache_concurrency: execution.cache_concurrency,
              preparation_timeout: execution.preparation_timeout,
              allow_lock_mutation: execution.allow_lock_mutation

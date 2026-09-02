@@ -74,9 +74,7 @@ defmodule MixWorkspaceOps.GitCache do
     started_at = System.monotonic_time()
 
     with {:ok, object} <- normalize_object(object) do
-      with_remote_lock(state_root, object.remote, started_at, fn state_root, remote_identity ->
-        ensure_locked(state_root, object, remote_identity, opts)
-      end)
+      ensure_object(state_root, object, opts, started_at)
     end
   end
 
@@ -88,13 +86,35 @@ defmodule MixWorkspaceOps.GitCache do
 
     case Map.get(source, :remote) do
       remote when is_binary(remote) ->
-        with_remote_lock(state_root, remote, started_at, fn state_root, remote_identity ->
-          ensure_resolved_source(state_root, remote_identity, source, opts)
-        end)
+        ensure_source_object(state_root, source, opts, started_at)
 
       invalid ->
         {:error, {:git_remote, invalid}}
     end
+  end
+
+  defp ensure_object(state_root, object, opts, started_at) do
+    state_root = Path.expand(state_root)
+    key = {:object, state_root, remote_identity(object.remote), object.commit}
+    memoized(opts, key, fn -> prepare_object(state_root, object, opts, started_at) end)
+  end
+
+  defp prepare_object(state_root, object, opts, started_at) do
+    with_remote_lock(state_root, object.remote, started_at, fn state_root, remote_identity ->
+      ensure_locked(state_root, object, remote_identity, opts)
+    end)
+  end
+
+  defp ensure_source_object(state_root, source, opts, started_at) do
+    state_root = Path.expand(state_root)
+    key = {:source, state_root, remote_identity(source.remote), Map.get(source, :revision)}
+    memoized(opts, key, fn -> prepare_source(state_root, source, opts, started_at) end)
+  end
+
+  defp prepare_source(state_root, source, opts, started_at) do
+    with_remote_lock(state_root, source.remote, started_at, fn state_root, remote_identity ->
+      ensure_resolved_source(state_root, remote_identity, source, opts)
+    end)
   end
 
   @doc "Git configuration that rewrites each declared remote to its local mirror."
@@ -438,6 +458,43 @@ defmodule MixWorkspaceOps.GitCache do
 
   defp with_duration(other, _started_at), do: other
 
+  defp memoized(opts, key, operation) do
+    case Keyword.get(opts, :memo) do
+      nil -> operation.()
+      memo -> fetch_memoized(memo, key, operation)
+    end
+  end
+
+  defp fetch_memoized(memo, key, operation) do
+    case :ets.lookup(memo, key) do
+      [{^key, report}] -> {:ok, memoized_report(report)}
+      [] -> fill_memo(memo, key, operation)
+    end
+  end
+
+  defp fill_memo(memo, key, operation) do
+    lock = "mix_workspace_ops:git-memo:" <> sha256(:erlang.term_to_binary(key, [:deterministic]))
+    SyncLock.with_lock(lock, fn -> fill_memo_locked(memo, key, operation) end)
+  end
+
+  defp fill_memo_locked(memo, key, operation) do
+    case :ets.lookup(memo, key) do
+      [{^key, report}] -> {:ok, memoized_report(report)}
+      [] -> store_memo_result(memo, key, operation.())
+    end
+  end
+
+  defp store_memo_result(memo, key, {:ok, report} = result) do
+    :ets.insert(memo, {key, report})
+    result
+  end
+
+  defp store_memo_result(_memo, _key, error), do: error
+
+  defp memoized_report(report) do
+    Map.merge(report, %{status: :hit, network: false, quarantine: nil, duration_ms: 0})
+  end
+
   defp with_remote_lock(state_root, remote, started_at, operation) do
     state_root = Path.expand(state_root)
     remote_identity = remote_identity(remote)
@@ -460,4 +517,6 @@ defmodule MixWorkspaceOps.GitCache do
 
   defp random_suffix,
     do: :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+
+  defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 end

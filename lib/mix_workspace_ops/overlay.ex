@@ -118,6 +118,7 @@ defmodule MixWorkspaceOps.Overlay do
              allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
              prepare_objects: Keyword.get(opts, :prepare_objects, false),
              managed_sources: Map.new(rows, fn [app, source | _rest] -> {app, source} end),
+             git_cache_memo: Keyword.get(opts, :git_cache_memo),
              git_sources: git_sources(attributed),
              path_apps: for([app, "local" | _rest] <- rows, do: app),
              cache_concurrency: Keyword.get(opts, :cache_concurrency, System.schedulers_online()),

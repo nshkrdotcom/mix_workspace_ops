@@ -981,7 +981,10 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   defp prepare_git_objects(handle, paths, objects, opts) do
-    git_opts = [env: cache_command_environment(paths)]
+    git_opts = [
+      env: cache_command_environment(paths),
+      memo: Keyword.get(opts, :git_cache_memo)
+    ]
 
     map_objects(objects, opts, fn
       {:locked, object} -> GitCache.ensure(handle.state_root, object, git_opts)

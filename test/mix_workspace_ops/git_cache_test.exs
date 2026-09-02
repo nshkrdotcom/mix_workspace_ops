@@ -77,6 +77,7 @@ defmodule MixWorkspaceOps.GitCacheTest do
     source = Path.join(root, "source")
     origin = Path.join(root, "origin.git")
     state_root = Path.join(root, "state")
+    memo = :ets.new(__MODULE__, [:set, :public])
     File.mkdir_p!(source)
     git!(source, ["init", "--quiet"])
     git!(source, ["config", "user.name", "P9"])
@@ -86,17 +87,39 @@ defmodule MixWorkspaceOps.GitCacheTest do
     git!(root, ["clone", "--quiet", "--bare", source, origin])
 
     assert {:ok, report} =
-             GitCache.ensure_source(state_root, %{
-               app: "private_dep",
-               remote: origin,
-               revision: {"branch", "main"}
-             })
+             GitCache.ensure_source(
+               state_root,
+               %{
+                 app: "private_dep",
+                 remote: origin,
+                 revision: {"branch", "main"}
+               },
+               memo: memo
+             )
 
     assert report.commit == commit
     assert report.status == :miss
 
     assert GitCache.environment([report]) |> Map.new() |> Map.fetch!("GIT_CONFIG_VALUE_0") ==
              origin
+
+    offline = origin <> ".offline"
+    File.rename!(origin, offline)
+
+    assert {:ok, cached} =
+             GitCache.ensure_source(
+               state_root,
+               %{
+                 app: "private_dep",
+                 remote: origin,
+                 revision: {"branch", "main"}
+               },
+               memo: memo
+             )
+
+    assert cached.status == :hit
+    assert cached.network == false
+    assert cached.duration_ms == 0
   end
 
   test "URL rewriting points at the mirror without changing the declared remote" do
