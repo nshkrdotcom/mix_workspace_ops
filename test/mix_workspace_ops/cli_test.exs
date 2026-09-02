@@ -568,7 +568,7 @@ defmodule MixWorkspaceOps.CLITest do
     assert report.schema == "mix_workspace_ops.seam/v1"
 
     assert report.lines == [
-             ~s|workspace_dep({:core, "~> 1.0", only: [:dev, :test], runtime: false})|,
+             ~s|workspace_dep({:core, "~> 1.0", only: [:dev, :test], override: true, runtime: false})|,
              ~s|workspace_dep({:third_party, [github: "example-org/third-party", | <>
                ~s|branch: "main", subdir: "core"]})|
            ]
@@ -609,7 +609,7 @@ defmodule MixWorkspaceOps.CLITest do
     Code.compile_string(source)
 
     assert module.deps() == [
-             {:core, "~> 1.0", [only: [:dev, :test], runtime: false]},
+             {:core, "~> 1.0", [only: [:dev, :test], override: true, runtime: false]},
              {:third_party, [github: "example-org/third-party", branch: "main", subdir: "core"]}
            ]
   end

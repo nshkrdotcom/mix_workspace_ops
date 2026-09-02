@@ -305,8 +305,9 @@ defmodule MixWorkspaceOps.Resolution do
   against each other.
 
   `only`, `optional`, `runtime` and `targets` decide whether a dependency exists
-  at the call site, so they are emitted as the call's own options. `override` is
-  a resolution fact and stays with the catalog.
+  at the call site, so they are emitted as the call's own options. `override`
+  remains catalog-owned, but is also emitted into the committed default because
+  standalone Mix may need it to replace a transitive path or source declaration.
 
   A publish order that resolves to a local checkout has no committed default —
   a path cannot be published — and is refused by name.
@@ -376,7 +377,7 @@ defmodule MixWorkspaceOps.Resolution do
   end
 
   defp call_site_options(opts),
-    do: Keyword.take(opts, [:hex, :only, :optional, :runtime, :targets])
+    do: Keyword.take(opts, [:hex, :only, :optional, :override, :runtime, :targets])
 
   defp render_options(opts),
     do: Enum.map_join(opts, ", ", fn {key, value} -> "#{key}: #{inspect(value)}" end)
