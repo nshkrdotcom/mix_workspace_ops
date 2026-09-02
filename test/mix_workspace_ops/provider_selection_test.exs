@@ -133,6 +133,40 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
     assert resolution.known_unselected == []
   end
 
+  test "an undeclared provider in the consumer repository retains its local identity", context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "workspace"))
+    File.mkdir_p!(Path.join(root, "workspace/consumer"))
+    File.mkdir_p!(Path.join(root, "workspace/shared"))
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("workspace",
+          projects: [
+            catalog_project("workspace.consumer", app: "consumer", path: "consumer"),
+            catalog_project("workspace.shared", app: "shared", path: "shared", kind: "package")
+          ]
+        )
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    reader = fn
+      %{id: "workspace.consumer"} -> {:ok, ["shared"]}
+      _project -> {:ok, []}
+    end
+
+    assert {:ok, resolution} =
+             Graph.resolve(registry, "workspace.consumer", dependency_reader: reader)
+
+    assert Enum.map(resolution.projects, & &1.id) ==
+             ["workspace.shared", "workspace.consumer"]
+
+    assert resolution.edges == [{"workspace.consumer", "workspace.shared"}]
+    assert resolution.external_dependencies == []
+  end
+
   test "one current provider settles an otherwise ambiguous application", context do
     root = temporary_directory!(context)
 

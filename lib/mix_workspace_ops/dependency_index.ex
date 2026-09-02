@@ -90,8 +90,27 @@ defmodule MixWorkspaceOps.DependencyIndex do
   end
 
   defp classify_dependency(registry, project, application) do
-    provider = Registry.declared_provider(registry, project, application)
+    case Map.fetch(Registry.dependency_sources(registry, project), application) do
+      {:ok, declaration} ->
+        classify_declared_dependency(registry, project, application, declaration.provider)
 
+      :error ->
+        classify_undeclared_dependency(registry, project, application)
+    end
+  end
+
+  defp classify_undeclared_dependency(registry, project, application) do
+    if Enum.any?(
+         Registry.providers(registry, application),
+         &(&1.repository == project.repository)
+       ) do
+      classify_declared_dependency(registry, project, application, nil)
+    else
+      {:ok, external_edge(project, application)}
+    end
+  end
+
+  defp classify_declared_dependency(registry, project, application, provider) do
     case Registry.resolve_dependency(registry, application, provider, project.repository) do
       {:ok, dependency} ->
         {:ok,
@@ -114,18 +133,21 @@ defmodule MixWorkspaceOps.DependencyIndex do
          }}
 
       :unknown ->
-        {:ok,
-         %{
-           consumer: project.id,
-           application: application,
-           classification: :external,
-           provider: nil,
-           candidates: []
-         }}
+        {:ok, external_edge(project, application)}
 
       {:error, reason} ->
         {:error, {:dependency_provider, project.id, application, reason}}
     end
+  end
+
+  defp external_edge(project, application) do
+    %{
+      consumer: project.id,
+      application: application,
+      classification: :external,
+      provider: nil,
+      candidates: []
+    }
   end
 
   @spec coverage(t()) :: map()

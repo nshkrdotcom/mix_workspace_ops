@@ -79,4 +79,60 @@ defmodule MixWorkspaceOps.DependencyIndexTest do
     assert index.absent_projects == ["core"]
     assert DependencyIndex.coverage(index).complete == false
   end
+
+  test "a catalogued application without a source declaration remains external", context do
+    root = temporary_directory!(context)
+    for id <- ~w(core consumer), do: File.mkdir_p!(Path.join(root, id))
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("core", projects: [catalog_project("core")]),
+        catalog_repository("consumer", projects: [catalog_project("consumer")])
+      ])
+      |> Registry.load!()
+      |> then(fn registry ->
+        %{registry | bindings: Map.new(~w(core consumer), &{&1, Path.join(root, &1)})}
+      end)
+
+    reader = fn
+      %{id: "consumer"}, _opts -> {:ok, ["core"]}
+      _project, _opts -> {:ok, []}
+    end
+
+    assert {:ok, index} = DependencyIndex.build(registry, dependency_reader: reader)
+
+    assert %{classification: :external, provider: nil} =
+             Enum.find(index.edges, &(&1.application == "core"))
+  end
+
+  test "an undeclared provider in the consumer repository keeps its managed identity", context do
+    root = temporary_directory!(context)
+    File.mkdir_p!(Path.join(root, "workspace"))
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("workspace",
+          projects: [
+            catalog_project("workspace.consumer", app: "consumer"),
+            catalog_project("workspace.core", app: "core")
+          ]
+        )
+      ])
+      |> Registry.load!()
+      |> then(fn registry ->
+        %{registry | bindings: %{"workspace" => Path.join(root, "workspace")}}
+      end)
+
+    reader = fn
+      %{id: "workspace.consumer"}, _opts -> {:ok, ["core"]}
+      _project, _opts -> {:ok, []}
+    end
+
+    assert {:ok, index} = DependencyIndex.build(registry, dependency_reader: reader)
+
+    assert %{classification: :managed, provider: "workspace.core"} =
+             Enum.find(index.edges, &(&1.application == "core"))
+  end
 end

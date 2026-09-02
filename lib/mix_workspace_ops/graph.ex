@@ -197,7 +197,25 @@ defmodule MixWorkspaceOps.Graph do
         )
 
       :error ->
-        reduce_external_dependency(project, dependency_app, current)
+        reduce_undeclared_dependency(registry, project, dependency_app, reader, current)
+    end
+  end
+
+  defp reduce_undeclared_dependency(registry, project, dependency_app, reader, current) do
+    if Enum.any?(
+         Registry.providers(registry, dependency_app),
+         &(&1.repository == project.repository)
+       ) do
+      reduce_declared_dependency(
+        registry,
+        project,
+        dependency_app,
+        nil,
+        reader,
+        current
+      )
+    else
+      reduce_external_dependency(project, dependency_app, current)
     end
   end
 
