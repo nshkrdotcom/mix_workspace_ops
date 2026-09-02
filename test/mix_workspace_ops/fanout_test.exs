@@ -51,6 +51,25 @@ defmodule MixWorkspaceOps.FanoutTest do
     refute Enum.any?(state.runs, & &1.leased)
   end
 
+  test "portable mix commands bind to a concrete toolchain outside the private home", context do
+    fixture = project_fixture(context)
+    assert {:ok, plan} = OperationPlan.build(fixture.registry, fixture.view, ["mix", "--version"])
+
+    assert {:ok, report} =
+             Fanout.run(plan, fixture.registry,
+               state_root: fixture.state_root,
+               max_concurrency: 2,
+               timeout: 10_000
+             )
+
+    assert Enum.all?(report.results, &(&1.status == :passed))
+
+    for unit <- report.binding.units do
+      assert Path.type(unit.command.executable) == :absolute
+      refute Path.basename(Path.dirname(unit.command.executable)) == "shims"
+    end
+  end
+
   test "continue starts unaffected units and fail-fast leaves them not run", context do
     continuing = project_fixture(context)
 

@@ -39,6 +39,55 @@ defmodule MixWorkspaceOps.RuntimeTest do
     second_paths = transient_paths(second.report)
     assert MapSet.disjoint?(MapSet.new(first_paths), MapSet.new(second_paths))
     assert Enum.all?(first_paths ++ second_paths, &String.starts_with?(&1, state_root))
+
+    preparation = first.report.preparation |> File.read!() |> :json.decode()
+    assert preparation["schema"] == "mix_workspace_ops.preparation/v1"
+    assert preparation["project_identity"] == String.duplicate("a", 64)
+    assert preparation["stage"] == "complete"
+    assert preparation["status"] == "complete"
+    assert File.stat!(first.report.preparation).mode |> Bitwise.band(0o777) == 0o600
+  end
+
+  test "a context lock wait times out with the unit, path, and lock owner", context do
+    state_root = temporary_directory!(context)
+    assert {:ok, initial} = Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts())
+    finish_and_release(initial.handle)
+
+    parent = self()
+    lock_key = "mix_workspace_ops:context:" <> Path.expand(initial.report.deps_path)
+
+    holder =
+      Task.async(fn ->
+        Mix.Sync.Lock.with_lock(lock_key, fn ->
+          send(parent, :context_lock_held)
+
+          receive do
+            :release_context_lock -> :ok
+          end
+        end)
+      end)
+
+    assert_receive :context_lock_held, 1_000
+
+    assert {:error,
+            {:runtime_preparation_failed, snapshot,
+             {:preparation_timeout, project_identity, "dependency_lockfile", 100, details}}} =
+             Runtime.prepare(
+               state_root,
+               @cache_identity,
+               @lock,
+               runtime_opts(preparation_timeout: 100)
+             )
+
+    assert project_identity == @cache_identity
+    assert snapshot["status"] == "timed_out"
+    assert snapshot["blocked_stage"] == "dependency_lockfile_lock"
+    assert snapshot["lock_owner"] == System.pid()
+    assert details.lock_owner == System.pid()
+    assert details.path == initial.report.deps_path
+
+    send(holder.pid, :release_context_lock)
+    assert :ok = Task.await(holder, 1_000)
   end
 
   test "target revisions, dirty source digests, and checkout roots reuse compatible contexts",
@@ -317,9 +366,67 @@ defmodule MixWorkspaceOps.RuntimeTest do
     assert env["XDG_CONFIG_HOME"] == runtime.report.config_home
     assert env["XDG_CACHE_HOME"] == runtime.report.xdg_cache_home
     refute env["XDG_CONFIG_HOME"] == env["XDG_CACHE_HOME"]
+
+    expected_erlang_bin = :code.root_dir() |> to_string() |> Path.join("bin")
+    assert env["PATH"] |> String.split(":") |> hd() == expected_erlang_bin
     assert File.stat!(runtime.report.root).mode |> Bitwise.band(0o777) == 0o700
     assert File.stat!(runtime.report.lease).mode |> Bitwise.band(0o777) == 0o600
     assert File.stat!(runtime.report.metadata).mode |> Bitwise.band(0o777) == 0o600
+  end
+
+  test "private Git source authentication is limited to the internal mirror transport", context do
+    root = temporary_directory!(context)
+    source = Path.join(root, "source")
+    origin = Path.join(root, "origin.git")
+    operator_home = Path.join(root, "operator-home")
+    state_root = Path.join(root, "state")
+    File.mkdir_p!(source)
+    File.mkdir_p!(operator_home)
+    git!(source, ["init", "--quiet"])
+    git!(source, ["config", "user.name", "P9"])
+    git!(source, ["config", "user.email", "p9@example.invalid"])
+    File.write!(Path.join(source, "value.txt"), "private source\n")
+    git!(source, ["add", "value.txt"])
+    git!(source, ["commit", "--quiet", "-m", "source"])
+    commit = git!(source, ["rev-parse", "HEAD"]) |> String.trim()
+    git!(root, ["clone", "--quiet", "--bare", source, origin])
+
+    private_remote = "https://private.example.invalid/source.git"
+
+    File.write!(
+      Path.join(operator_home, ".gitconfig"),
+      "[url \"file://#{origin}\"]\n\tinsteadOf = #{private_remote}\n"
+    )
+
+    previous_home = System.get_env("HOME")
+    previous_token = System.get_env("GH_TOKEN")
+    System.put_env("HOME", operator_home)
+    System.put_env("GH_TOKEN", "private-source-sentinel")
+
+    on_exit(fn ->
+      restore_env("HOME", previous_home)
+      restore_env("GH_TOKEN", previous_token)
+    end)
+
+    lock = inspect(%{"private_dep" => {:git, private_remote, commit, []}}) <> "\n"
+
+    assert {:ok, runtime} =
+             Runtime.prepare(
+               state_root,
+               @cache_identity,
+               lock,
+               runtime_opts(
+                 prepare_objects: true,
+                 managed_sources: %{"private_dep" => "github"}
+               )
+             )
+
+    on_exit(fn -> finish_and_release(runtime.handle) end)
+    assert [%{remote: ^private_remote, commit: ^commit}] = runtime.report.cache_objects.git
+    child_env = Map.new(runtime.env)
+    assert child_env["HOME"] == runtime.report.home
+    assert child_env["GH_TOKEN"] == nil
+    refute inspect(runtime.report) =~ "private-source-sentinel"
   end
 
   test "delegated units use external reusable Mix state and shield credentials", context do
@@ -473,5 +580,15 @@ defmodule MixWorkspaceOps.RuntimeTest do
   defp finish_and_release(handle) do
     Runtime.finish(handle)
     Runtime.release(handle)
+  end
+
+  defp restore_env(name, nil), do: System.delete_env(name)
+  defp restore_env(name, value), do: System.put_env(name, value)
+
+  defp git!(directory, args) do
+    case System.cmd("git", args, cd: directory, stderr_to_stdout: true) do
+      {output, 0} -> output
+      {output, status} -> flunk("git #{inspect(args)} exited #{status}: #{output}")
+    end
   end
 end

@@ -938,7 +938,7 @@ defmodule MixWorkspaceOps.OperationPlan do
   defp candidates?(values) when is_list(values) do
     Enum.all?(values, fn
       %{"source" => source, "outcome" => outcome} = candidate when map_size(candidate) == 2 ->
-        source in ~w(local github hex) and is_binary(outcome)
+        source in ~w(local github hex) and candidate_outcome?(outcome)
 
       _candidate ->
         false
@@ -946,6 +946,21 @@ defmodule MixWorkspaceOps.OperationPlan do
   end
 
   defp candidates?(_values), do: false
+
+  defp candidate_outcome?(outcome) when is_binary(outcome), do: true
+
+  defp candidate_outcome?(["known_unselected", project]) when is_map(project) do
+    keys = ~w(id app path kind provides current lineage dependency_sources repository)
+
+    Map.keys(project) |> Enum.sort() == Enum.sort(keys) and
+      Enum.all?(~w(id path kind repository), &is_binary(project[&1])) and
+      (is_nil(project["app"]) or is_binary(project["app"])) and
+      string_list?(project["provides"]) and is_boolean(project["current"]) and
+      (is_nil(project["lineage"]) or is_binary(project["lineage"])) and
+      is_map(project["dependency_sources"])
+  end
+
+  defp candidate_outcome?(_outcome), do: false
 
   defp options?(values) when is_list(values) do
     Enum.all?(values, fn

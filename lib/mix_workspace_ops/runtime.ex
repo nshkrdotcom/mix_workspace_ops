@@ -18,6 +18,7 @@ defmodule MixWorkspaceOps.Runtime do
 
   @state_marker "mix_workspace_ops.state/v1\n"
   @runtime_schema "mix_workspace_ops.runtime/v5"
+  @preparation_schema "mix_workspace_ops.preparation/v1"
   @list_schema "mix_workspace_ops.state_list/v3"
   @gc_schema "mix_workspace_ops.state_gc/v3"
   @access_marker ".mwo-access"
@@ -52,7 +53,8 @@ defmodule MixWorkspaceOps.Runtime do
     "build_path" => :build_path,
     "mix_exs" => :mix_exs,
     "lockfile" => :lockfile,
-    "context_lockfile" => :context_lockfile
+    "context_lockfile" => :context_lockfile,
+    "preparation" => :preparation
   }
   @publication_credentials ~w(
     GH_TOKEN
@@ -74,6 +76,23 @@ defmodule MixWorkspaceOps.Runtime do
     SSH_AGENT_PID
     SSH_AUTH_SOCK
   )
+  @git_transport_credentials ~w(
+    GH_TOKEN
+    GH_ENTERPRISE_TOKEN
+    GITHUB_TOKEN
+    GITHUB_ENTERPRISE_TOKEN
+    GIT_ASKPASS
+    GIT_CONFIG_GLOBAL
+    GIT_CONFIG_SYSTEM
+    GIT_CREDENTIAL_HELPER
+    GIT_SSH
+    GIT_SSH_COMMAND
+    NETRC
+    SSH_ASKPASS
+    SSH_ASKPASS_REQUIRE
+    SSH_AGENT_PID
+    SSH_AUTH_SOCK
+  )
 
   @enforce_keys [
     :root,
@@ -86,6 +105,7 @@ defmodule MixWorkspaceOps.Runtime do
     :ownership,
     :lease_path,
     :metadata_path,
+    :preparation_path,
     :source_lock_digest,
     :operational_lock_digest,
     :context_lockfile,
@@ -104,6 +124,7 @@ defmodule MixWorkspaceOps.Runtime do
     :ownership,
     :lease_path,
     :metadata_path,
+    :preparation_path,
     :source_lock_digest,
     :operational_lock_digest,
     :context_lockfile,
@@ -124,6 +145,7 @@ defmodule MixWorkspaceOps.Runtime do
           ownership: :managed | :delegated,
           lease_path: String.t(),
           metadata_path: String.t(),
+          preparation_path: String.t(),
           source_lock_digest: String.t(),
           operational_lock_digest: String.t(),
           context_lockfile: String.t(),
@@ -150,30 +172,46 @@ defmodule MixWorkspaceOps.Runtime do
            dependency_identity(cache_identity, projected_lock, execution_inputs),
          execution_identity <- execution_identity(dependency_identity, execution_inputs),
          :ok <- ensure_state_root(state_root),
-         {:ok, context_lock} <-
-           prepare_context_lock(state_root, dependency_identity, projected_lock),
-         {:ok, root, run_id} <- create_run_root(state_root, execution_identity),
-         identities <- %{
-           cache: cache_identity,
-           dependency: dependency_identity,
-           execution: execution_identity
-         },
-         handle <-
-           handle(
-             root,
-             state_root,
-             identities,
-             lock_bytes,
-             context_lock,
-             %{
-               run_id: run_id,
-               binding_root: execution_inputs.binding_root,
-               ownership: ownership,
-               allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
-               created_at: created_at
-             }
-           ) do
-      prepare_run(handle, lock_bytes, context_lock.bytes, execution_inputs, opts)
+         {:ok, preparation_timeout} <- preparation_timeout(opts),
+         {:ok, root, run_id} <- create_run_root(state_root, execution_identity) do
+      identities = %{
+        cache: cache_identity,
+        dependency: dependency_identity,
+        execution: execution_identity
+      }
+
+      diagnostic =
+        preparation_diagnostic(root, run_id, identities, execution_inputs, preparation_timeout)
+
+      result =
+        with :ok <- record_preparation(diagnostic, "starting", "running"),
+             {:ok, context_lock} <-
+               prepare_context_lock(
+                 state_root,
+                 dependency_identity,
+                 projected_lock,
+                 diagnostic
+               ),
+             handle <-
+               handle(
+                 root,
+                 state_root,
+                 identities,
+                 lock_bytes,
+                 context_lock,
+                 %{
+                   run_id: run_id,
+                   binding_root: execution_inputs.binding_root,
+                   ownership: ownership,
+                   allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
+                   created_at: created_at,
+                   preparation_path: diagnostic.path
+                 }
+               ) do
+          prepare_run(handle, lock_bytes, context_lock.bytes, execution_inputs, diagnostic, opts)
+        end
+
+      finish_preparation_attempt(root, diagnostic, result)
     end
   end
 
@@ -292,42 +330,74 @@ defmodule MixWorkspaceOps.Runtime do
 
   def parse_age(value), do: {:error, {:invalid_gc_age, value}}
 
-  defp prepare_run(handle, lock_bytes, operational_lock, execution_inputs, opts) do
+  defp prepare_run(handle, lock_bytes, operational_lock, execution_inputs, diagnostic, opts) do
     paths = runtime_paths(handle)
 
-    result =
-      with :ok <- write_lease(handle),
-           reservation <- initial_metadata(handle, execution_inputs, paths, empty_cache_objects()),
-           :ok <- write_report_private(handle.metadata_path, reservation),
-           {:ok, paths} <- create_state_directories(paths, handle.created_at),
-           :ok <-
-             copy_archives(paths.archives, Keyword.get(opts, :archives_source, archives_source())),
-           {:ok, cache_objects} <- prepare_git_transport(handle, lock_bytes, paths, opts),
-           :ok <- write_mix_wrapper(paths.mix_exs),
-           :ok <- write_private(Path.join(handle.root, "source.mix.lock"), lock_bytes),
-           {:ok, lockfile} <- prepare_lockfile(handle, paths, operational_lock),
-           handle = %{
-             handle
-             | lockfile: lockfile,
-               operational_lock_digest: lock_digest(operational_lock)
-           },
-           metadata <- initial_metadata(handle, execution_inputs, paths, cache_objects),
-           :ok <- write_report_private(handle.metadata_path, metadata) do
-        {:ok,
-         %{
-           env: runtime_environment(handle, paths, cache_objects),
-           report: runtime_report(handle, metadata),
-           handle: handle
-         }}
-      end
-
-    case result do
-      {:ok, _runtime} = ok ->
-        ok
-
-      error ->
-        File.rm_rf(handle.root)
-        error
+    with :ok <-
+           preparation_step(diagnostic, "write_lease", %{path: handle.lease_path}, fn ->
+             write_lease(handle)
+           end),
+         reservation <- initial_metadata(handle, execution_inputs, paths, empty_cache_objects()),
+         :ok <-
+           preparation_step(
+             diagnostic,
+             "write_initial_metadata",
+             %{path: handle.metadata_path},
+             fn -> write_report_private(handle.metadata_path, reservation) end
+           ),
+         {:ok, paths} <-
+           preparation_step(diagnostic, "create_state_directories", %{}, fn ->
+             create_state_directories(paths, handle.created_at, diagnostic)
+           end),
+         :ok <-
+           preparation_step(diagnostic, "copy_archives", %{path: paths.archives}, fn ->
+             copy_archives(
+               paths.archives,
+               Keyword.get(opts, :archives_source, archives_source())
+             )
+           end),
+         {:ok, cache_objects} <-
+           preparation_step(diagnostic, "prepare_git_transport", %{}, fn ->
+             prepare_git_transport(handle, lock_bytes, paths, opts)
+           end),
+         :ok <-
+           preparation_step(diagnostic, "write_mix_wrapper", %{path: paths.mix_exs}, fn ->
+             write_mix_wrapper(paths.mix_exs)
+           end),
+         :ok <-
+           preparation_step(
+             diagnostic,
+             "write_source_lock",
+             %{path: Path.join(handle.root, "source.mix.lock")},
+             fn -> write_private(Path.join(handle.root, "source.mix.lock"), lock_bytes) end
+           ),
+         {:ok, lockfile} <-
+           preparation_step(
+             diagnostic,
+             "write_operational_lock",
+             %{path: Path.join(handle.root, "mix.lock")},
+             fn -> prepare_lockfile(handle, paths, operational_lock) end
+           ),
+         handle = %{
+           handle
+           | lockfile: lockfile,
+             operational_lock_digest: lock_digest(operational_lock)
+         },
+         metadata <- initial_metadata(handle, execution_inputs, paths, cache_objects),
+         :ok <-
+           preparation_step(
+             diagnostic,
+             "write_final_metadata",
+             %{path: handle.metadata_path},
+             fn -> write_report_private(handle.metadata_path, metadata) end
+           ),
+         :ok <- record_preparation(diagnostic, "complete", "complete") do
+      {:ok,
+       %{
+         env: runtime_environment(handle, paths, cache_objects),
+         report: runtime_report(handle, metadata),
+         handle: handle
+       }}
     end
   end
 
@@ -343,6 +413,7 @@ defmodule MixWorkspaceOps.Runtime do
       ownership: invocation.ownership,
       lease_path: Path.join(root, "lease.json"),
       metadata_path: Path.join(root, "runtime.json"),
+      preparation_path: invocation.preparation_path,
       source_lock_digest: lock_digest(lock_bytes),
       operational_lock_digest: lock_digest(context_lock.bytes),
       context_lockfile: context_lock.path,
@@ -487,6 +558,153 @@ defmodule MixWorkspaceOps.Runtime do
     end
   end
 
+  defp preparation_timeout(opts) do
+    case Keyword.get(opts, :preparation_timeout, 120_000) do
+      timeout when is_integer(timeout) and timeout > 0 -> {:ok, timeout}
+      timeout -> {:error, {:invalid_preparation_timeout, timeout}}
+    end
+  end
+
+  defp preparation_diagnostic(root, run_id, identities, inputs, timeout) do
+    %{
+      path: Path.join(root, "preparation.json"),
+      run_id: run_id,
+      project_identity: inputs.project_identity,
+      dependency_identity: identities.dependency,
+      execution_identity: identities.execution,
+      timeout: timeout,
+      started_at: System.system_time(:millisecond)
+    }
+  end
+
+  defp record_preparation(diagnostic, stage, status, details \\ %{}) do
+    report =
+      Map.merge(
+        %{
+          schema: @preparation_schema,
+          run_id: diagnostic.run_id,
+          project_identity: diagnostic.project_identity,
+          dependency_identity: diagnostic.dependency_identity,
+          execution_identity: diagnostic.execution_identity,
+          stage: stage,
+          status: status,
+          started_at: diagnostic.started_at,
+          updated_at: System.system_time(:millisecond),
+          timeout_ms: diagnostic.timeout
+        },
+        details
+      )
+
+    write_report_private(diagnostic.path, report)
+  end
+
+  defp record_preparation!(diagnostic, stage, status, details) do
+    case record_preparation(diagnostic, stage, status, details) do
+      :ok -> :ok
+      {:error, reason} -> throw({:preparation_diagnostic, diagnostic.path, reason})
+    end
+  end
+
+  defp preparation_step(diagnostic, stage, details, operation) do
+    with :ok <- record_preparation(diagnostic, stage, "running", details) do
+      result = operation.()
+
+      case result do
+        {:error, reason} = error ->
+          if Map.get(preparation_snapshot(diagnostic.path), "stage") == stage do
+            _ =
+              record_preparation(
+                diagnostic,
+                stage,
+                "failed",
+                Map.put(details, :reason, inspect(reason, limit: :infinity))
+              )
+          end
+
+          error
+
+        other ->
+          other
+      end
+    end
+  end
+
+  defp bounded_preparation(diagnostic, operation, details, function) do
+    task =
+      Task.async(fn ->
+        try do
+          function.()
+        catch
+          kind, reason ->
+            {:error,
+             {:preparation_exception, operation, kind, reason,
+              Exception.format_stacktrace(__STACKTRACE__)}}
+        end
+      end)
+
+    case Task.yield(task, diagnostic.timeout) do
+      {:ok, result} ->
+        result
+
+      {:exit, reason} ->
+        {:error, {:preparation_task_exit, operation, reason}}
+
+      nil ->
+        # Do not wait in Task.shutdown/2: a task blocked in a filesystem NIF may
+        # not process its exit signal until the kernel call returns. Unlinking
+        # first lets the coordinator report the exact stalled stage promptly;
+        # the killed task cannot outlive this MWO OS process.
+        Process.unlink(task.pid)
+        Process.exit(task.pid, :kill)
+        Process.demonitor(task.ref, [:flush])
+
+        previous = preparation_snapshot(diagnostic.path)
+
+        timeout_details =
+          details
+          |> Map.put(:operation, operation)
+          |> Map.put(:blocked_stage, Map.get(previous, "stage"))
+          |> Map.put(:lock_owner, Map.get(previous, "lock_owner"))
+
+        _ = record_preparation(diagnostic, operation, "timed_out", timeout_details)
+
+        {:error,
+         {:preparation_timeout, diagnostic.project_identity, operation, diagnostic.timeout,
+          timeout_details}}
+    end
+  end
+
+  defp preparation_snapshot(path) do
+    with {:ok, bytes} <- File.read(path), value when is_map(value) <- :json.decode(bytes) do
+      value
+    else
+      _unavailable -> %{"stage" => "diagnostic_unavailable", "path" => path}
+    end
+  rescue
+    _invalid -> %{"stage" => "diagnostic_invalid", "path" => path}
+  end
+
+  defp finish_preparation_attempt(_root, _diagnostic, {:ok, _runtime} = ok), do: ok
+
+  defp finish_preparation_attempt(root, diagnostic, {:error, reason}) do
+    snapshot = preparation_snapshot(diagnostic.path)
+    File.rm_rf(root)
+
+    case reason do
+      {:preparation_timeout, _project, _operation, _timeout, _details} ->
+        {:error, {:runtime_preparation_failed, snapshot, reason}}
+
+      {:preparation_task_exit, _operation, _exit_reason} ->
+        {:error, {:runtime_preparation_failed, snapshot, reason}}
+
+      {:preparation_exception, _operation, _kind, _exception, _stacktrace} ->
+        {:error, {:runtime_preparation_failed, snapshot, reason}}
+
+      _ordinary_error ->
+        {:error, reason}
+    end
+  end
+
   defp create_invocation(_parent, 0), do: {:error, :runtime_invocation_collision}
 
   defp create_invocation(parent, attempts) do
@@ -534,38 +752,91 @@ defmodule MixWorkspaceOps.Runtime do
     |> Map.merge(%{deps_present: false, build_present: false})
   end
 
-  defp create_state_directories(paths, timestamp) do
+  defp create_state_directories(paths, timestamp, diagnostic) do
     ordinary_paths =
       paths
       |> Map.take([:home, :tmp, :config, :xdg_cache, :hex_cache, :rebar, :mix, :archives])
       |> Map.values()
 
     with :ok <- Enum.reduce_while(ordinary_paths, :ok, &mkdir_until_error/2),
-         {:ok, deps_present} <- prepare_context(paths.deps, timestamp),
-         {:ok, build_present} <- prepare_context(paths.build, timestamp) do
+         {:ok, deps_present} <- prepare_context(:deps, paths.deps, timestamp, diagnostic),
+         {:ok, build_present} <- prepare_context(:build, paths.build, timestamp, diagnostic) do
       {:ok, Map.merge(paths, %{deps_present: deps_present, build_present: build_present})}
     end
   end
 
-  defp prepare_context(path, timestamp) do
-    SyncLock.with_lock(context_lock(path), fn ->
-      hit = populated_directory?(path)
+  defp prepare_context(kind, path, timestamp, diagnostic) do
+    operation = "#{kind}_context"
+    details = %{context: to_string(kind), path: path}
 
-      with :ok <- mkdir_private(path),
-           :ok <- touch_context(path, timestamp) do
-        {:ok, hit}
+    bounded_preparation(diagnostic, operation, details, fn ->
+      with :ok <- record_preparation(diagnostic, operation <> "_lock", "waiting", details) do
+        SyncLock.with_lock(
+          context_lock(path),
+          fn ->
+            with :ok <-
+                   record_preparation(diagnostic, operation <> "_lock", "acquired", details),
+                 {:ok, hit} <-
+                   preparation_step(diagnostic, operation <> "_inspect", details, fn ->
+                     {:ok, populated_directory?(path)}
+                   end),
+                 :ok <-
+                   preparation_step(diagnostic, operation <> "_mkdir", details, fn ->
+                     mkdir_private(path)
+                   end),
+                 :ok <-
+                   preparation_step(diagnostic, operation <> "_touch", details, fn ->
+                     touch_context(path, timestamp)
+                   end) do
+              {:ok, hit}
+            end
+          end,
+          on_taken: fn owner ->
+            record_preparation!(
+              diagnostic,
+              operation <> "_lock",
+              "waiting",
+              Map.put(details, :lock_owner, owner)
+            )
+          end
+        )
       end
     end)
   end
 
-  defp prepare_context_lock(state_root, dependency_identity, initial_lock) do
+  defp prepare_context_lock(state_root, dependency_identity, initial_lock, diagnostic) do
     context = Path.join([state_root, "contexts", "deps", dependency_identity])
     path = Path.join(context, @context_lockfile)
+    operation = "dependency_lockfile"
+    details = %{context: "deps", path: context, lockfile: path}
 
-    SyncLock.with_lock(context_lock(context), fn ->
-      with :ok <- mkdir_private(context),
-           {:ok, bytes, status} <- read_or_initialize_context_lock(path, initial_lock) do
-        {:ok, %{path: path, bytes: bytes, status: status}}
+    bounded_preparation(diagnostic, operation, details, fn ->
+      with :ok <- record_preparation(diagnostic, operation <> "_lock", "waiting", details) do
+        SyncLock.with_lock(
+          context_lock(context),
+          fn ->
+            with :ok <-
+                   record_preparation(diagnostic, operation <> "_lock", "acquired", details),
+                 :ok <-
+                   preparation_step(diagnostic, operation <> "_mkdir", details, fn ->
+                     mkdir_private(context)
+                   end),
+                 {:ok, bytes, status} <-
+                   preparation_step(diagnostic, operation <> "_read", details, fn ->
+                     read_or_initialize_context_lock(path, initial_lock)
+                   end) do
+              {:ok, %{path: path, bytes: bytes, status: status}}
+            end
+          end,
+          on_taken: fn owner ->
+            record_preparation!(
+              diagnostic,
+              operation <> "_lock",
+              "waiting",
+              Map.put(details, :lock_owner, owner)
+            )
+          end
+        )
       end
     end)
   end
@@ -819,7 +1090,8 @@ defmodule MixWorkspaceOps.Runtime do
       {"MIX_BUILD_PATH", paths.build},
       {"MIX_EXS", paths.mix_exs},
       {"MIX_WORKSPACE_OPS_PROJECT_ROOT", handle.binding_root},
-      {"MIX_WORKSPACE_OPS_LOCKFILE", handle.lockfile}
+      {"MIX_WORKSPACE_OPS_LOCKFILE", handle.lockfile},
+      {"PATH", toolchain_path()}
     ]
 
     removed = Enum.map(publication_credential_keys(), &{&1, nil})
@@ -831,9 +1103,11 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   defp cache_command_environment(paths) do
+    # This environment is used only by MWO's fixed-argument Git mirror
+    # clone/fetch commands. It retains the operator's Git authentication and
+    # configuration so private source dependencies can be read. Arbitrary Mix
+    # children use runtime_environment/3 and remain credential-free.
     base = [
-      {"HOME", paths.home},
-      {"XDG_CONFIG_HOME", paths.config},
       {"XDG_CACHE_HOME", paths.xdg_cache},
       {"MIX_XDG", "1"},
       {"MIX_HOME", paths.mix},
@@ -845,8 +1119,25 @@ defmodule MixWorkspaceOps.Runtime do
       {"GIT_TERMINAL_PROMPT", "0"}
     ]
 
-    removed = Enum.map(publication_credential_keys(), &{&1, nil})
+    removed =
+      publication_credential_keys()
+      |> Enum.reject(&git_transport_credential?/1)
+      |> Enum.map(&{&1, nil})
+
     (base ++ removed) |> Map.new() |> Enum.sort_by(&elem(&1, 0))
+  end
+
+  defp git_transport_credential?(name) do
+    name in @git_transport_credentials or
+      Regex.match?(~r/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/, name)
+  end
+
+  defp toolchain_path do
+    erlang_bin = :code.root_dir() |> to_string() |> Path.join("bin")
+
+    [erlang_bin, System.get_env("PATH")]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join(":")
   end
 
   defp publication_credential_keys do
@@ -913,6 +1204,7 @@ defmodule MixWorkspaceOps.Runtime do
       config_home: paths.config,
       source_lock: Path.join(handle.root, "source.mix.lock"),
       context_lockfile: handle.context_lockfile,
+      preparation: handle.preparation_path,
       deps_path: paths.deps,
       build_root: paths.build,
       build_path: paths.build,
@@ -935,6 +1227,7 @@ defmodule MixWorkspaceOps.Runtime do
       root: handle.root,
       lease: handle.lease_path,
       metadata: handle.metadata_path,
+      preparation: handle.preparation_path,
       created_at: value(metadata, "created_at"),
       finished_at: value(metadata, "finished_at"),
       status: value(metadata, "status"),

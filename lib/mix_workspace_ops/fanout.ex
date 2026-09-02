@@ -23,6 +23,12 @@ defmodule MixWorkspaceOps.Fanout do
     started_at = System.system_time(:millisecond)
 
     with {:ok, execution} <- execution_options(opts),
+         execution <-
+           Map.put(
+             execution,
+             :command_executable,
+             bound_executable(plan |> field(:command) |> field(:executable))
+           ),
          execution <- binding_budget(plan, execution),
          :ok <- verify_all_units(plan, registry),
          {:ok, bound} <- bind_all(plan, registry, execution) do
@@ -43,6 +49,8 @@ defmodule MixWorkspaceOps.Fanout do
       Keyword.get_lazy(opts, :beam_schedulers, fn -> child_scheduler_budget(max_concurrency) end)
 
     timeout = Keyword.get(opts, :timeout, :infinity)
+    binding_timeout = Keyword.get(opts, :binding_timeout, 300_000)
+    preparation_timeout = Keyword.get(opts, :preparation_timeout, 120_000)
 
     with true <-
            (is_integer(max_concurrency) and max_concurrency > 0) ||
@@ -50,6 +58,12 @@ defmodule MixWorkspaceOps.Fanout do
          true <-
            (timeout == :infinity or (is_integer(timeout) and timeout > 0)) ||
              {:error, {:invalid_timeout, timeout}},
+         true <-
+           (is_integer(binding_timeout) and binding_timeout > 0) ||
+             {:error, {:invalid_binding_timeout, binding_timeout}},
+         true <-
+           (is_integer(preparation_timeout) and preparation_timeout > 0) ||
+             {:error, {:invalid_preparation_timeout, preparation_timeout}},
          true <-
            (is_integer(beam_schedulers) and beam_schedulers > 0) ||
              {:error, {:invalid_beam_schedulers, beam_schedulers}},
@@ -60,6 +74,8 @@ defmodule MixWorkspaceOps.Fanout do
          max_concurrency: max_concurrency,
          beam_schedulers: beam_schedulers,
          timeout: timeout,
+         binding_timeout: binding_timeout,
+         preparation_timeout: preparation_timeout,
          state_root: state_root,
          allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
          probe_memo: Keyword.get(opts, :probe_memo, ProbeMemo.new())
@@ -137,11 +153,21 @@ defmodule MixWorkspaceOps.Fanout do
       |> Task.async_stream(&safe_bind_unit(plan, &1, registry, execution),
         max_concurrency: execution.binding_concurrency,
         ordered: true,
-        timeout: :infinity
+        timeout: execution.binding_timeout,
+        on_timeout: :kill_task,
+        zip_input_on_exit: true
       )
       |> Enum.map(fn
-        {:ok, result} -> result
-        {:exit, reason} -> {:error, {:binding_task_exit, reason}}
+        {:ok, result} ->
+          result
+
+        {:exit, {unit, :timeout}} ->
+          {:error,
+           {:binding_timeout, field(unit, :id), execution.binding_timeout,
+            preparation_for_unit(execution.state_root, unit)}}
+
+        {:exit, {unit, reason}} ->
+          {:error, {:binding_task_exit, field(unit, :id), reason}}
       end)
 
     bound = for {:ok, item} <- results, not is_nil(item), do: item
@@ -191,6 +217,8 @@ defmodule MixWorkspaceOps.Fanout do
       allow_lock_mutation: execution.allow_lock_mutation,
       prepare_objects: true,
       cache_concurrency: execution.cache_concurrency,
+      binding_timeout: execution.binding_timeout,
+      preparation_timeout: execution.preparation_timeout,
       mix_state: :managed,
       probe_memo: execution.probe_memo,
       state_root: execution.state_root
@@ -208,9 +236,12 @@ defmodule MixWorkspaceOps.Fanout do
                  plan,
                  unit,
                  root,
-                 scheduler_environment(activation.env, execution),
+                 activation.env
+                 |> scheduler_environment(execution)
+                 |> command_environment(execution),
                  activation,
-                 :overlay
+                 :overlay,
+                 execution.command_executable
                )}
 
             {:error, reason} ->
@@ -255,6 +286,7 @@ defmodule MixWorkspaceOps.Fanout do
              mix_target: field(policy, :mix_target),
              prepare_objects: true,
              cache_concurrency: execution.cache_concurrency,
+             preparation_timeout: execution.preparation_timeout,
              allow_lock_mutation: execution.allow_lock_mutation
            ) do
       env =
@@ -272,9 +304,10 @@ defmodule MixWorkspaceOps.Fanout do
            plan,
            unit,
            root,
-           scheduler_environment(env, execution),
+           env |> scheduler_environment(execution) |> command_environment(execution),
            activation,
-           :runtime
+           :runtime,
+           execution.command_executable
          )}
       catch
         kind, reason ->
@@ -287,13 +320,13 @@ defmodule MixWorkspaceOps.Fanout do
     end
   end
 
-  defp bound_item(plan, unit, root, env, activation, activation_kind) do
+  defp bound_item(plan, unit, root, env, activation, activation_kind, executable) do
     command = field(plan, :command)
 
     blitz =
       Blitz.command(%{
         id: field(unit, :id),
-        command: field(command, :executable),
+        command: executable,
         args: field(command, :args),
         cd: root,
         env: env
@@ -710,7 +743,9 @@ defmodule MixWorkspaceOps.Fanout do
           Keyword.get_lazy(opts, :beam_schedulers, fn ->
             child_scheduler_budget(max_concurrency)
           end),
-        timeout: Keyword.get(opts, :timeout, :infinity)
+        timeout: Keyword.get(opts, :timeout, :infinity),
+        binding_timeout: Keyword.get(opts, :binding_timeout, 300_000),
+        preparation_timeout: Keyword.get(opts, :preparation_timeout, 120_000)
       })
 
     binding = binding_report(plan, finalized, execution, started_at, finished_at)
@@ -743,6 +778,49 @@ defmodule MixWorkspaceOps.Fanout do
     }
   end
 
+  # A portable plan names `mix`, but binding must not resolve that name through
+  # a version-manager shim that depends on the operator HOME hidden from the
+  # child. Use the exact toolchain already running MWO; its bin directory is
+  # part of the child PATH so the mix script's `env elixir` shebang agrees.
+  defp bound_executable(executable) when executable in ["mix", "elixir", "iex"] do
+    executable
+    |> System.find_executable()
+    |> resolve_asdf_executable(executable)
+  end
+
+  defp bound_executable(executable), do: executable
+
+  defp resolve_asdf_executable(nil, executable), do: executable
+
+  defp resolve_asdf_executable(candidate, executable) do
+    if Path.basename(Path.dirname(candidate)) == "shims" and asdf_shim?(candidate) do
+      case System.find_executable("asdf") do
+        nil -> candidate
+        asdf -> asdf_which(asdf, executable, candidate)
+      end
+    else
+      candidate
+    end
+  end
+
+  defp asdf_shim?(path) do
+    case File.read(path) do
+      {:ok, bytes} -> String.contains?(bytes, "asdf exec")
+      {:error, _reason} -> false
+    end
+  end
+
+  defp asdf_which(asdf, executable, fallback) do
+    case System.cmd(asdf, ["which", executable], stderr_to_stdout: true) do
+      {output, 0} ->
+        path = String.trim(output)
+        if Path.type(path) == :absolute and File.regular?(path), do: path, else: fallback
+
+      {_output, _status} ->
+        fallback
+    end
+  end
+
   defp source_lock(root) do
     case File.read(Path.join(root, "mix.lock")) do
       {:ok, bytes} -> {:ok, bytes}
@@ -763,6 +841,37 @@ defmodule MixWorkspaceOps.Fanout do
 
   defp current_state(root) do
     %{head: Git.head!(root), source_digest: Git.source_digest(root), clean: Git.clean?(root)}
+  end
+
+  defp preparation_for_unit(state_root, unit) do
+    project_identity = field(unit, :id)
+
+    state_root
+    |> Path.expand()
+    |> Path.join("runs/*/*/preparation.json")
+    |> Path.wildcard()
+    |> Enum.flat_map(fn path ->
+      case preparation_report(path, project_identity) do
+        nil -> []
+        report -> [report]
+      end
+    end)
+    |> Enum.max_by(
+      &Map.get(&1, "updated_at", 0),
+      fn -> %{project_identity: project_identity, stage: "not_recorded"} end
+    )
+  end
+
+  defp preparation_report(path, project_identity) do
+    with {:ok, bytes} <- File.read(path),
+         report when is_map(report) <- :json.decode(bytes),
+         true <- report["project_identity"] == project_identity do
+      Map.put(report, "path", path)
+    else
+      _unavailable -> nil
+    end
+  rescue
+    _invalid -> nil
   end
 
   defp source_mode(value) when is_atom(value), do: value
@@ -799,6 +908,19 @@ defmodule MixWorkspaceOps.Fanout do
     |> Map.new()
     |> Map.put("ERL_AFLAGS", flags)
     |> Enum.sort_by(&elem(&1, 0))
+  end
+
+  defp command_environment(env, %{command_executable: executable}) do
+    if Path.type(executable) == :absolute do
+      current = Map.new(env)["PATH"] || System.get_env("PATH", "")
+
+      env
+      |> Map.new()
+      |> Map.put("PATH", Path.dirname(executable) <> ":" <> current)
+      |> Enum.sort_by(&elem(&1, 0))
+    else
+      env
+    end
   end
 
   defp child_scheduler_budget(max_concurrency) do

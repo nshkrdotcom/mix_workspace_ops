@@ -71,6 +71,32 @@ defmodule MixWorkspaceOps.OperationPlanTest do
              {:error, {:nonportable_command_segment, "OUT=/tmp/result"}}
   end
 
+  test "loads a plan whose local candidate names a known unselected provider", context do
+    fixture = fixture(context)
+
+    view_path =
+      write_catalog_view!(fixture.root, "consumer_only", %{"repository_ids" => ["alpha"]})
+
+    {:ok, view} = View.load(view_path)
+    registry = select_and_bind(fixture.catalog_registry, view, fixture.root)
+
+    assert {:ok, plan} = OperationPlan.build(registry, view, ["true"])
+
+    assert [
+             %{
+               considered: [
+                 %{source: "local", outcome: {:known_unselected, %{id: "beta"}}},
+                 %{source: "github", outcome: :chosen},
+                 %{source: "hex", outcome: :not_reached}
+               ]
+             }
+           ] = hd(plan.units).sources
+
+    path = Path.join(fixture.root, "known-unselected-plan.json")
+    assert :ok = OperationPlan.write(path, plan)
+    assert {:ok, _loaded} = OperationPlan.load(path)
+  end
+
   test "replay names revision, dirty-byte, view, toolchain, and requested-policy drift",
        context do
     fixture = fixture(context)

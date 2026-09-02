@@ -119,7 +119,8 @@ defmodule MixWorkspaceOps.Overlay do
              prepare_objects: Keyword.get(opts, :prepare_objects, false),
              managed_sources: Map.new(rows, fn [app, source | _rest] -> {app, source} end),
              path_apps: for([app, "local" | _rest] <- rows, do: app),
-             cache_concurrency: Keyword.get(opts, :cache_concurrency, System.schedulers_online())
+             cache_concurrency: Keyword.get(opts, :cache_concurrency, System.schedulers_online()),
+             preparation_timeout: Keyword.get(opts, :preparation_timeout, 120_000)
            ) do
       env =
         [
