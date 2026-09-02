@@ -3,6 +3,26 @@ defmodule MixWorkspaceOps.FanoutTest do
 
   alias MixWorkspaceOps.{Fanout, OperationPlan, Registry, Runtime, View}
 
+  test "portable Mix commands bind to the active toolchain outside the private home", context do
+    fixture = project_fixture(context)
+    assert {:ok, plan} = OperationPlan.build(fixture.registry, fixture.view, ["mix", "--version"])
+
+    assert {:ok, report} =
+             Fanout.run(plan, fixture.registry,
+               state_root: fixture.state_root,
+               max_concurrency: 2,
+               timeout: 10_000
+             )
+
+    assert Enum.all?(report.results, &(&1.status == :passed))
+    assert Enum.all?(report.results, &Enum.any?(&1.output_tail, fn line -> line =~ "Mix " end))
+
+    for unit <- report.binding.units do
+      assert Path.type(unit.command.executable) == :absolute
+      refute Path.basename(Path.dirname(unit.command.executable)) == "shims"
+    end
+  end
+
   test "project units overlap through Blitz and results retain plan order", context do
     fixture = project_fixture(context)
 

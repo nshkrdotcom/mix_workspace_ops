@@ -9,7 +9,7 @@ defmodule MixWorkspaceOps.Project do
   by parsing.
   """
 
-  alias MixWorkspaceOps.{Command, MixInputs, Registry}
+  alias MixWorkspaceOps.{Command, MixInputs, Registry, Toolchain}
   alias MixWorkspaceOps.Project.{ProbeMemo, ProbeTree}
 
   @marker "__MIX_WORKSPACE_OPS_METADATA__"
@@ -228,26 +228,9 @@ defmodule MixWorkspaceOps.Project do
 
   defp timeout_executable, do: System.find_executable("timeout") || "timeout"
 
-  # Use the executable of the running toolchain rather than a version-manager
-  # shim that re-resolves from the probed project's working directory. A
-  # project's partial `.tool-versions` must not silently change which Elixir
+  # A project's partial `.tool-versions` must not silently change which Elixir
   # the memo key says evaluated it.
-  defp elixir_executable do
-    candidate =
-      :elixir
-      |> :code.lib_dir()
-      |> Path.join("../../bin/elixir")
-      |> Path.expand()
-
-    if File.regular?(candidate), do: candidate, else: version_manager_elixir()
-  end
-
-  defp version_manager_elixir do
-    case Command.run("asdf", ["which", "elixir"], cd: System.tmp_dir!()) do
-      {:ok, result} -> String.trim(result.output)
-      {:error, _result} -> System.find_executable("elixir") || "elixir"
-    end
-  end
+  defp elixir_executable, do: Toolchain.executable("elixir")
 
   @doc """
   The version a project's `mix.exs` declares, read by parsing it.

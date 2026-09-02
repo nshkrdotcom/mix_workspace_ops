@@ -14,7 +14,7 @@ defmodule MixWorkspaceOps.Runtime do
   """
 
   alias Mix.Sync.Lock, as: SyncLock
-  alias MixWorkspaceOps.{GitCache, Lockfile, Report}
+  alias MixWorkspaceOps.{GitCache, Lockfile, Report, Toolchain}
 
   @state_marker "mix_workspace_ops.state/v1\n"
   @runtime_schema "mix_workspace_ops.runtime/v5"
@@ -250,6 +250,13 @@ defmodule MixWorkspaceOps.Runtime do
   @spec with_operation_lock(t(), (-> result)) :: result when result: term()
   def with_operation_lock(%__MODULE__{} = handle, operation) when is_function(operation, 0) do
     SyncLock.with_lock(operation_lock(handle), operation)
+  end
+
+  @doc false
+  @spec with_dependency_cache_lock(t(), (-> result)) :: result when result: term()
+  def with_dependency_cache_lock(%__MODULE__{} = handle, operation)
+      when is_function(operation, 0) do
+    SyncLock.with_lock("mix_workspace_ops:hex-cache:" <> handle.state_root, operation)
   end
 
   @doc "Lists every durable run and whether its lease is currently live."
@@ -934,7 +941,8 @@ defmodule MixWorkspaceOps.Runtime do
       managed_sources = Keyword.get(opts, :managed_sources, %{})
 
       with {:ok, objects} <- GitCache.objects_from_lock(lock_bytes, managed_sources),
-           {:ok, git} <- prepare_git_objects(handle, paths, objects, opts) do
+           requests <- git_requests(objects, Keyword.get(opts, :git_sources, [])),
+           {:ok, git} <- prepare_git_objects(handle, paths, requests, opts) do
         {:ok, %{git: git, git_env: GitCache.environment(git)}}
       end
     else
@@ -943,6 +951,13 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   defp empty_cache_objects, do: %{git: [], git_env: []}
+
+  defp git_requests(objects, sources) do
+    locked = MapSet.new(objects, & &1.app)
+
+    Enum.map(objects, &{:locked, &1}) ++
+      for(source <- sources, not MapSet.member?(locked, source.app), do: {:source, source})
+  end
 
   defp write_mix_wrapper(path) do
     contents = """
@@ -968,8 +983,9 @@ defmodule MixWorkspaceOps.Runtime do
   defp prepare_git_objects(handle, paths, objects, opts) do
     git_opts = [env: cache_command_environment(paths)]
 
-    map_objects(objects, opts, fn object ->
-      GitCache.ensure(handle.state_root, object, git_opts)
+    map_objects(objects, opts, fn
+      {:locked, object} -> GitCache.ensure(handle.state_root, object, git_opts)
+      {:source, source} -> GitCache.ensure_source(handle.state_root, source, git_opts)
     end)
   end
 
@@ -1051,9 +1067,7 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   defp toolchain_path do
-    elixir_bin =
-      :elixir |> :code.lib_dir() |> Path.join("../../bin") |> Path.expand()
-
+    elixir_bin = Toolchain.executable("elixir") |> Path.dirname()
     erlang_bin = :code.root_dir() |> to_string() |> Path.join("bin")
 
     [elixir_bin, erlang_bin, System.get_env("PATH")]

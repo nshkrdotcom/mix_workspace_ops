@@ -9,7 +9,19 @@ defmodule MixWorkspaceOps.Fanout do
   returns, including after a failed command or a partial binding failure.
   """
 
-  alias MixWorkspaceOps.{Binding, Git, OperationPlan, Overlay, Registry, Report, Runtime}
+  alias MixWorkspaceOps.{
+    Binding,
+    Git,
+    HexCache,
+    OperationPlan,
+    Overlay,
+    PublishMode,
+    Registry,
+    Report,
+    Runtime,
+    Toolchain
+  }
+
   alias MixWorkspaceOps.Project.ProbeMemo
 
   @binding_schema "mix_workspace_ops.binding/v1"
@@ -23,6 +35,7 @@ defmodule MixWorkspaceOps.Fanout do
     started_at = System.system_time(:millisecond)
 
     with {:ok, execution} <- execution_options(opts),
+         execution <- Map.put(execution, :dependency_fetch?, dependency_fetch?(plan)),
          execution <- binding_budget(plan, execution),
          :ok <- verify_all_units(plan, registry),
          {:ok, bound} <- bind_all(plan, registry, execution) do
@@ -62,6 +75,8 @@ defmodule MixWorkspaceOps.Fanout do
          preparation_timeout: preparation_timeout,
          state_root: state_root,
          allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
+         hex_cache_memo:
+           :ets.new(HexCache, [:set, :public, read_concurrency: true, write_concurrency: true]),
          probe_memo: Keyword.get(opts, :probe_memo, ProbeMemo.new())
        }}
     end
@@ -309,7 +324,7 @@ defmodule MixWorkspaceOps.Fanout do
     blitz =
       Blitz.command(%{
         id: field(unit, :id),
-        command: field(command, :executable),
+        command: command |> field(:executable) |> bound_executable(),
         args: field(command, :args),
         cd: root,
         env: env
@@ -577,12 +592,65 @@ defmodule MixWorkspaceOps.Fanout do
   end
 
   defp execute_item(item, execution) do
-    Runtime.with_operation_lock(item.activation.runtime_handle, fn ->
-      case Blitz.run([item.blitz], blitz_options(execution)) do
-        {:ok, [result]} -> result
-        {:error, %Blitz.Error{results: [result]}} -> result
-      end
+    operation = fn ->
+      Runtime.with_operation_lock(item.activation.runtime_handle, fn ->
+        run_item(item, execution)
+      end)
+    end
+
+    if execution.dependency_fetch?,
+      do: dependency_fetch(item, execution, operation),
+      else: operation.()
+  end
+
+  defp dependency_fetch(item, execution, operation) do
+    runtime = item.binding.runtime
+    handle = item.activation.runtime_handle
+
+    if HexCache.complete?(runtime.hex_cache, handle.lockfile, execution.hex_cache_memo) do
+      operation.()
+    else
+      serialized_dependency_fetch(runtime, handle, execution, operation)
+    end
+  end
+
+  defp serialized_dependency_fetch(runtime, handle, execution, operation) do
+    handle
+    |> Runtime.with_dependency_cache_lock(fn ->
+      execute_if_cache_incomplete(runtime, handle, execution, operation)
     end)
+    |> continue_after_cache_check(operation)
+  end
+
+  defp execute_if_cache_incomplete(runtime, handle, execution, operation) do
+    if HexCache.complete?(runtime.hex_cache, handle.lockfile, execution.hex_cache_memo),
+      do: :cache_ready,
+      else: {:executed, operation.()}
+  end
+
+  defp continue_after_cache_check(:cache_ready, operation), do: operation.()
+  defp continue_after_cache_check({:executed, result}, _operation), do: result
+
+  defp run_item(item, execution) do
+    case Blitz.run([item.blitz], blitz_options(execution)) do
+      {:ok, [result]} -> result
+      {:error, %Blitz.Error{results: [result]}} -> result
+    end
+  end
+
+  defp bound_executable(executable) when executable in ["elixir", "iex", "mix"],
+    do: Toolchain.executable(executable)
+
+  defp bound_executable(executable), do: executable
+
+  defp dependency_fetch?(plan) do
+    command = field(plan, :command)
+
+    command
+    |> then(&[field(&1, :executable) | field(&1, :args)])
+    |> PublishMode.task_argv()
+    |> PublishMode.task_tokens()
+    |> Enum.any?(&(&1 in ["deps.get", "deps.update"]))
   end
 
   defp blitz_options(execution) do

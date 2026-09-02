@@ -72,6 +72,33 @@ defmodule MixWorkspaceOps.GitCacheTest do
     assert Enum.count(reports, &match?({:ok, %{status: :hit}}, &1)) == 5
   end
 
+  test "an unlocked branch source is resolved and mirrored before Mix receives it", context do
+    root = temporary_directory!(context)
+    source = Path.join(root, "source")
+    origin = Path.join(root, "origin.git")
+    state_root = Path.join(root, "state")
+    File.mkdir_p!(source)
+    git!(source, ["init", "--quiet"])
+    git!(source, ["config", "user.name", "P9"])
+    git!(source, ["config", "user.email", "p9@example.invalid"])
+    commit = commit!(source, "value.txt", "one\n", "one")
+    git!(source, ["branch", "-M", "main"])
+    git!(root, ["clone", "--quiet", "--bare", source, origin])
+
+    assert {:ok, report} =
+             GitCache.ensure_source(state_root, %{
+               app: "private_dep",
+               remote: origin,
+               revision: {"branch", "main"}
+             })
+
+    assert report.commit == commit
+    assert report.status == :miss
+
+    assert GitCache.environment([report]) |> Map.new() |> Map.fetch!("GIT_CONFIG_VALUE_0") ==
+             origin
+  end
+
   test "URL rewriting points at the mirror without changing the declared remote" do
     reports = [
       %{

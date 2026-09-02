@@ -118,6 +118,7 @@ defmodule MixWorkspaceOps.Overlay do
              allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
              prepare_objects: Keyword.get(opts, :prepare_objects, false),
              managed_sources: Map.new(rows, fn [app, source | _rest] -> {app, source} end),
+             git_sources: git_sources(attributed),
              path_apps: for([app, "local" | _rest] <- rows, do: app),
              cache_concurrency: Keyword.get(opts, :cache_concurrency, System.schedulers_online()),
              preparation_timeout: Keyword.get(opts, :preparation_timeout, 120_000)
@@ -308,6 +309,16 @@ defmodule MixWorkspaceOps.Overlay do
         value -> {key, value}
       end
     end)
+  end
+
+  defp git_sources(attributed) do
+    for {%{source: "github", location: coordinates} = decision, _row} <- attributed do
+      %{
+        app: decision.application,
+        remote: "https://github.com/#{coordinates.repo}.git",
+        revision: revision(coordinates)
+      }
+    end
   end
 
   defp collect_rows(rows) do

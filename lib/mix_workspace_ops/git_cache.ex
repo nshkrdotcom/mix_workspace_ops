@@ -74,15 +74,26 @@ defmodule MixWorkspaceOps.GitCache do
     started_at = System.monotonic_time()
 
     with {:ok, object} <- normalize_object(object) do
-      state_root = Path.expand(state_root)
-      remote_identity = remote_identity(object.remote)
-      lock = "mix_workspace_ops:git:" <> remote_identity
-
-      lock
-      |> SyncLock.with_lock(fn ->
+      with_remote_lock(state_root, object.remote, started_at, fn state_root, remote_identity ->
         ensure_locked(state_root, object, remote_identity, opts)
       end)
-      |> with_duration(started_at)
+    end
+  end
+
+  @doc false
+  @spec ensure_source(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def ensure_source(state_root, source, opts \\ [])
+      when is_binary(state_root) and is_map(source) do
+    started_at = System.monotonic_time()
+
+    case Map.get(source, :remote) do
+      remote when is_binary(remote) ->
+        with_remote_lock(state_root, remote, started_at, fn state_root, remote_identity ->
+          ensure_resolved_source(state_root, remote_identity, source, opts)
+        end)
+
+      invalid ->
+        {:error, {:git_remote, invalid}}
     end
   end
 
@@ -281,6 +292,76 @@ defmodule MixWorkspaceOps.GitCache do
     error -> {:error, {:git_command, args, error.__struct__, Exception.message(error)}}
   end
 
+  defp ensure_resolved_source(state_root, remote_identity, source, opts) do
+    with {:ok, commit} <- resolve_source(source, opts),
+         {:ok, object} <-
+           source
+           |> Map.put(:commit, commit)
+           |> Map.put_new(:options, [])
+           |> normalize_object() do
+      ensure_locked(state_root, object, remote_identity, opts)
+    end
+  end
+
+  defp resolve_source(%{remote: remote, revision: {"branch", value}}, opts)
+       when is_binary(remote) and is_binary(value),
+       do: resolve_remote_ref(remote, ["refs/heads/#{value}"], opts)
+
+  defp resolve_source(%{remote: remote, revision: {"tag", value}}, opts)
+       when is_binary(remote) and is_binary(value),
+       do: resolve_remote_ref(remote, ["refs/tags/#{value}", "refs/tags/#{value}^{}"], opts)
+
+  defp resolve_source(%{remote: remote, revision: {"ref", value}}, opts)
+       when is_binary(remote) and is_binary(value) do
+    value = String.downcase(value)
+
+    if Regex.match?(@commit, value),
+      do: {:ok, value},
+      else: resolve_remote_ref(remote, [value], opts)
+  end
+
+  defp resolve_source(%{remote: remote, revision: {"-", "-"}}, opts) when is_binary(remote),
+    do: resolve_remote_ref(remote, ["HEAD"], opts)
+
+  defp resolve_source(%{remote: remote, revision: {kind, value}}, _opts)
+       when is_binary(remote),
+       do: {:error, {:git_source_revision, remote, kind, value}}
+
+  defp resolve_source(source, _opts), do: {:error, {:git_source, source}}
+
+  defp resolve_remote_ref(remote, refs, opts) do
+    with {:ok, output} <- git(["ls-remote", remote | refs], opts),
+         {:ok, commit} <- resolved_commit(output, remote, refs) do
+      {:ok, commit}
+    else
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp resolved_commit(output, remote, refs) do
+    rows =
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.map(&String.split(&1, "\t", parts: 2))
+
+    row = Enum.find(rows, &peeled_tag?/1) || List.first(rows)
+
+    case row do
+      [commit, _ref] ->
+        commit = String.downcase(commit)
+
+        if Regex.match?(@commit, commit),
+          do: {:ok, commit},
+          else: {:error, {:git_source_revision, remote, refs}}
+
+      _missing ->
+        {:error, {:git_source_revision, remote, refs}}
+    end
+  end
+
+  defp peeled_tag?([_commit, ref]), do: String.ends_with?(ref, "^{}")
+  defp peeled_tag?(_row), do: false
+
   defp normalize_object(object) do
     with true <- is_binary(object[:remote]) || {:error, {:git_remote, object[:remote]}},
          true <- is_binary(object[:commit]) || {:error, {:git_commit, object[:commit]}},
@@ -356,6 +437,15 @@ defmodule MixWorkspaceOps.GitCache do
   end
 
   defp with_duration(other, _started_at), do: other
+
+  defp with_remote_lock(state_root, remote, started_at, operation) do
+    state_root = Path.expand(state_root)
+    remote_identity = remote_identity(remote)
+
+    ("mix_workspace_ops:git:" <> remote_identity)
+    |> SyncLock.with_lock(fn -> operation.(state_root, remote_identity) end)
+    |> with_duration(started_at)
+  end
 
   defp mirrors_root(state_root), do: Path.join([state_root, "cache", "git"])
 

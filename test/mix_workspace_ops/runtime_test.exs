@@ -2,7 +2,7 @@ defmodule MixWorkspaceOps.RuntimeTest do
   use MixWorkspaceOps.WorkspaceCase, async: false
 
   alias Mix.Sync.Lock, as: SyncLock
-  alias MixWorkspaceOps.Runtime
+  alias MixWorkspaceOps.{Runtime, Toolchain}
 
   @cache_identity String.duplicate("a", 64)
   @lock ~S|%{"alpha" => {:hex, :alpha, "1.0.0"}}| <> "\n"
@@ -368,10 +368,17 @@ defmodule MixWorkspaceOps.RuntimeTest do
     assert env["XDG_CACHE_HOME"] == runtime.report.xdg_cache_home
     refute env["XDG_CONFIG_HOME"] == env["XDG_CACHE_HOME"]
 
-    expected_elixir_bin =
-      :elixir |> :code.lib_dir() |> Path.join("../../bin") |> Path.expand()
-
+    expected_elixir_bin = Toolchain.executable("elixir") |> Path.dirname()
     assert env["PATH"] |> String.split(":") |> hd() == expected_elixir_bin
+
+    assert {version, 0} =
+             System.cmd(Toolchain.executable("mix"), ["--version"],
+               cd: state_root,
+               env: runtime.env,
+               stderr_to_stdout: true
+             )
+
+    assert version =~ "Mix #{System.version()}"
     assert File.stat!(runtime.report.root).mode |> Bitwise.band(0o777) == 0o700
     assert File.stat!(runtime.report.lease).mode |> Bitwise.band(0o777) == 0o600
     assert File.stat!(runtime.report.metadata).mode |> Bitwise.band(0o777) == 0o600
@@ -430,6 +437,98 @@ defmodule MixWorkspaceOps.RuntimeTest do
     assert child_env["HOME"] == runtime.report.home
     assert child_env["GH_TOKEN"] == nil
     refute inspect(runtime.report) =~ "private-source-sentinel"
+  end
+
+  test "an unlocked private Git source is mirrored before the isolated child runs", context do
+    root = temporary_directory!(context)
+    source = Path.join(root, "source")
+    origin = Path.join(root, "origin.git")
+    operator_home = Path.join(root, "operator-home")
+    state_root = Path.join(root, "state")
+    File.mkdir_p!(source)
+    File.mkdir_p!(operator_home)
+    git!(source, ["init", "--quiet"])
+    git!(source, ["config", "user.name", "P9"])
+    git!(source, ["config", "user.email", "p9@example.invalid"])
+    File.write!(Path.join(source, "value.txt"), "private source\n")
+    git!(source, ["add", "value.txt"])
+    git!(source, ["commit", "--quiet", "-m", "source"])
+    commit = git!(source, ["rev-parse", "HEAD"]) |> String.trim()
+    git!(source, ["branch", "-M", "main"])
+    git!(root, ["clone", "--quiet", "--bare", source, origin])
+
+    private_remote = "https://private.example.invalid/source.git"
+
+    File.write!(
+      Path.join(operator_home, ".gitconfig"),
+      "[url \"file://#{origin}\"]\n\tinsteadOf = #{private_remote}\n"
+    )
+
+    previous_home = System.get_env("HOME")
+    System.put_env("HOME", operator_home)
+    on_exit(fn -> restore_env("HOME", previous_home) end)
+
+    assert {:ok, runtime} =
+             Runtime.prepare(
+               state_root,
+               @cache_identity,
+               "%{}\n",
+               runtime_opts(
+                 prepare_objects: true,
+                 git_sources: [
+                   %{
+                     app: "private_dep",
+                     remote: private_remote,
+                     revision: {"branch", "main"}
+                   }
+                 ]
+               )
+             )
+
+    on_exit(fn -> finish_and_release(runtime.handle) end)
+    assert [%{remote: ^private_remote, commit: ^commit}] = runtime.report.cache_objects.git
+    assert Map.new(runtime.env)["HOME"] == runtime.report.home
+  end
+
+  test "dependency-cache mutation is serialized across different project contexts", context do
+    state_root = temporary_directory!(context)
+
+    assert {:ok, first} =
+             Runtime.prepare(
+               state_root,
+               String.duplicate("a", 64),
+               "%{}\n",
+               runtime_opts(project_identity: "first")
+             )
+
+    assert {:ok, second} =
+             Runtime.prepare(
+               state_root,
+               String.duplicate("b", 64),
+               "%{}\n",
+               runtime_opts(project_identity: "second")
+             )
+
+    on_exit(fn -> finish_and_release(first.handle) end)
+    on_exit(fn -> finish_and_release(second.handle) end)
+
+    active = :atomics.new(1, [])
+    parent = self()
+
+    tasks =
+      for handle <- [first.handle, second.handle] do
+        Task.async(fn ->
+          Runtime.with_dependency_cache_lock(handle, fn ->
+            send(parent, {:entered, :atomics.add_get(active, 1, 1)})
+            Process.sleep(100)
+            :atomics.sub_get(active, 1, 1)
+          end)
+        end)
+      end
+
+    assert_receive {:entered, 1}, 1_000
+    assert_receive {:entered, 1}, 1_000
+    Enum.each(tasks, &Task.await(&1, 1_000))
   end
 
   test "delegated units use external reusable Mix state and shield credentials", context do
