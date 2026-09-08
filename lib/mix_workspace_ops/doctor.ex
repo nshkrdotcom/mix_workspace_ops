@@ -14,8 +14,8 @@ defmodule MixWorkspaceOps.Doctor do
   alias MixWorkspaceOps.{Binding, Git, Project, Registry}
   alias MixWorkspaceOps.Project.ProbeMemo
 
-  @spec inspect(Registry.t()) :: map()
-  def inspect(registry) do
+  @spec inspect(Registry.t(), keyword()) :: map()
+  def inspect(registry, opts \\ []) do
     catalogued = Binding.catalogued_identities(registry)
 
     projects =
@@ -24,7 +24,8 @@ defmodule MixWorkspaceOps.Doctor do
       |> Enum.filter(&match?({:bound, _root}, Registry.checkout(registry, &1)))
       |> Enum.flat_map(& &1.projects)
 
-    metadata = registry |> Project.prewarm(projects, ProbeMemo.new()) |> Map.new()
+    memo = Keyword.get(opts, :probe_memo, ProbeMemo.new())
+    metadata = registry |> Project.prewarm(projects, memo) |> Map.new()
 
     repositories =
       registry

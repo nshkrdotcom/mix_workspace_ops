@@ -379,7 +379,9 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
                application: "shared",
                classification: :managed,
                provider: "provider.bundle",
-               candidates: []
+               candidates: [],
+               requirement: nil,
+               options: %{}
              }
            ]
 
@@ -387,6 +389,176 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
              Resolution.resolve(registry, "consumer", dependency_reader: reader)
 
     assert Enum.map(report.decisions, & &1.application) == ["shared"]
+  end
+
+  test "a transitive optional dependency is projected only when another path fulfills it",
+       context do
+    root = temporary_directory!(context)
+
+    for repository <- ~w(consumer middle leaf) do
+      initialize_repository!(Path.join(root, repository))
+    end
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("consumer",
+          projects: [
+            catalog_project("consumer",
+              dependency_sources: %{
+                "middle" => %{"hex" => "~> 0.1"},
+                "leaf" => %{"hex" => "~> 1.0"}
+              }
+            )
+          ]
+        ),
+        catalog_repository("middle",
+          projects: [
+            catalog_project("middle",
+              dependency_sources: %{"leaf" => %{"hex" => "~> 1.0"}}
+            )
+          ]
+        ),
+        catalog_repository("leaf", projects: [catalog_project("leaf")])
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    optional_leaf = %{
+      application: "leaf",
+      requirement: %{kind: "string", value: "~> 1.0"},
+      options: %{"optional" => true}
+    }
+
+    reader = fn
+      %{id: "consumer"} -> {:ok, ["middle"]}
+      %{id: "middle"} -> {:ok, [optional_leaf]}
+      _project -> {:ok, []}
+    end
+
+    assert {:ok, unfulfilled} =
+             Graph.resolve(registry, "consumer", dependency_reader: reader)
+
+    assert unfulfilled.edges == [{"consumer", "middle"}]
+    refute Enum.any?(unfulfilled.dependency_applications, &(&1.application == "leaf"))
+
+    fulfilled_reader = fn
+      %{id: "consumer"} -> {:ok, ["middle", "leaf"]}
+      %{id: "middle"} -> {:ok, [optional_leaf]}
+      _project -> {:ok, []}
+    end
+
+    assert {:ok, fulfilled} =
+             Graph.resolve(registry, "consumer", dependency_reader: fulfilled_reader)
+
+    assert {"middle", "leaf"} in fulfilled.edges
+
+    assert Enum.any?(fulfilled.dependency_applications, fn use ->
+             use.consumer == "middle" and use.application == "leaf" and
+               use.options == %{"optional" => true}
+           end)
+  end
+
+  test "the root application does not fulfill a transitive optional dependency", context do
+    root = temporary_directory!(context)
+
+    for repository <- ~w(consumer middle) do
+      initialize_repository!(Path.join(root, repository))
+    end
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("consumer",
+          projects: [
+            catalog_project("consumer",
+              dependency_sources: %{"middle" => %{"hex" => "~> 0.1"}}
+            )
+          ]
+        ),
+        catalog_repository("middle",
+          projects: [
+            catalog_project("middle",
+              dependency_sources: %{"consumer" => %{"hex" => "~> 0.1"}}
+            )
+          ]
+        )
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    optional_consumer = %{
+      application: "consumer",
+      requirement: %{kind: "string", value: "~> 0.1"},
+      options: %{"optional" => true}
+    }
+
+    reader = fn
+      %{id: "consumer"} -> {:ok, ["middle"]}
+      %{id: "middle"} -> {:ok, [optional_consumer]}
+    end
+
+    assert {:ok, graph} = Graph.resolve(registry, "consumer", dependency_reader: reader)
+    assert graph.edges == [{"consumer", "middle"}]
+    refute Enum.any?(graph.dependency_applications, &(&1.consumer == "middle"))
+  end
+
+  test "fulfilled optional dependencies cannot introduce a cycle", context do
+    root = temporary_directory!(context)
+
+    for repository <- ~w(consumer alpha beta) do
+      initialize_repository!(Path.join(root, repository))
+    end
+
+    registry =
+      root
+      |> write_catalog!([
+        catalog_repository("consumer",
+          projects: [
+            catalog_project("consumer",
+              dependency_sources: %{
+                "alpha" => %{"hex" => "~> 0.1"},
+                "beta" => %{"hex" => "~> 0.1"}
+              }
+            )
+          ]
+        ),
+        catalog_repository("alpha",
+          projects: [
+            catalog_project("alpha",
+              dependency_sources: %{"beta" => %{"hex" => "~> 0.1"}}
+            )
+          ]
+        ),
+        catalog_repository("beta",
+          projects: [
+            catalog_project("beta",
+              dependency_sources: %{"alpha" => %{"hex" => "~> 0.1"}}
+            )
+          ]
+        )
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    optional = fn application ->
+      %{
+        application: application,
+        requirement: %{kind: "string", value: "~> 0.1"},
+        options: %{"optional" => true}
+      }
+    end
+
+    reader = fn
+      %{id: "consumer"} -> {:ok, ["alpha", "beta"]}
+      %{id: "alpha"} -> {:ok, [optional.("beta")]}
+      %{id: "beta"} -> {:ok, [optional.("alpha")]}
+    end
+
+    assert {:error, {:dependency_cycle, project}} =
+             Graph.resolve(registry, "consumer", dependency_reader: reader)
+
+    assert project in ["alpha", "beta"]
   end
 
   test "one application cannot carry conflicting provider identities in one graph", context do
@@ -462,6 +634,26 @@ defmodule MixWorkspaceOps.ProviderSelectionTest do
 
     assert Resolution.explain({:conflicting_dependency_identities, "shared", uses}) =~
              "a_consumer=excluded_provider (known_unselected)"
+
+    optional_reader = fn
+      %{id: "a_consumer"} ->
+        {:ok, [%{application: "shared", requirement: nil, options: %{"optional" => true}}]}
+
+      project ->
+        reader.(project)
+    end
+
+    assert {:ok, optional_graph} =
+             Graph.resolve(registry, "z_target", dependency_reader: optional_reader)
+
+    visited = MapSet.new(optional_graph.projects, & &1.id)
+    assert Enum.all?(optional_graph.edges, fn {_, dependency} -> dependency in visited end)
+
+    assert {:error, {:conflicting_dependency_identities, "shared", _uses}} =
+             Resolution.resolve(registry, "z_target",
+               closure: optional_graph,
+               dependency_reader: optional_reader
+             )
   end
 
   # A pruned catalog could change which project an application resolved to,

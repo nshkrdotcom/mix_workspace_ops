@@ -39,7 +39,7 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
     %{core: core, consumer: consumer, activation: activation} = activated(context)
 
     # The overlay decides, and the options the call site gave survive it.
-    assert deps(consumer, activation.env) == [{:example_core, [path: core]}]
+    assert deps(consumer, activation.env) == [{:example_core, "~> 1.0", [path: core]}]
 
     # With no bootstrap the committed default stands — and still carries the
     # call-site options, which the printed fallback used to drop entirely.
@@ -51,7 +51,7 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
     File.write!(Path.join(consumer, "mix.exs"), mixfile(whole_table_seam(seam(hd(@documents)))))
 
     assert deps(consumer, activation.env) == [
-             {:example_core, [path: core]},
+             {:example_core, "~> 1.0", [path: core]},
              {:example_edge,
               [github: "example-org/example_edge", branch: "main", only: [:dev, :test]]}
            ]
@@ -73,7 +73,7 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
              Command.run("mix", ["deps.sources"], cd: consumer, env: activation.env)
 
     assert result.output =~ "dependency sources:"
-    assert result.output =~ "example_core -> local (#{core}) -> 0.1.0"
+    assert result.output =~ "example_core -> local (#{core}) -> 1.0.0"
     refute result.output =~ "example_edge"
   end
 
@@ -98,6 +98,7 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
   defp activated(context) do
     root = temporary_directory!(context)
     core = initialize_repository!(Path.join(root, "example_core"))
+    set_version!(core, "1.0.0")
     consumer = initialize_repository!(Path.join(root, "consumer"))
     File.write!(Path.join(consumer, "mix.exs"), mixfile(seam(hd(@documents))))
 
@@ -177,4 +178,23 @@ defmodule MixWorkspaceOps.DocumentedSeamTest do
   end
 
   defp elixir_block(_fenced), do: nil
+
+  defp set_version!(repository, version) do
+    path = Path.join(repository, "mix.exs")
+
+    File.write!(
+      path,
+      path
+      |> File.read!()
+      |> String.replace(~s(version: "0.1.0"), ~s(version: #{inspect(version)}))
+    )
+
+    {_, 0} = System.cmd("git", ["add", "mix.exs"], cd: repository, stderr_to_stdout: true)
+
+    {_, 0} =
+      System.cmd("git", ["commit", "--quiet", "-m", "set fixture version"],
+        cd: repository,
+        stderr_to_stdout: true
+      )
+  end
 end

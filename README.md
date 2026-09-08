@@ -220,11 +220,14 @@ candidates.
 ```
 
 Ordinary Hex dependencies are resolved/materialized by standard Mix/Hex. MWO
-does not install a custom Hex SCM or retain its own Hex package object store.
-Bare Git mirrors are retained only as a transport optimization; Mix still owns
-Git dependency checkout and lock semantics.
+does not install a custom Hex SCM. It retains only checksum-addressed package
+archives that Hex fetched and whose locked outer checksum MWO independently
+verified; each dependency context receives an ordinary native Hex cache view.
+This preserves exact republished bytes without reimplementing resolution or
+extraction. Bare Git mirrors are retained only as a transport optimization;
+Mix still owns Git dependency checkout and lock semantics.
 
-## Portable plan v2 and strict replay
+## Portable plan v3 and strict replay
 
 `plan` computes semantic intent but never executes the requested command:
 
@@ -238,7 +241,7 @@ Git dependency checkout and lock semantics.
   -- mix test
 ```
 
-The portable artifact is `mix_workspace_ops.plan/v2`. It is self-digested and
+The portable artifact is `mix_workspace_ops.plan/v3`. It is self-digested and
 contains no local checkout/runtime paths or credentials. It binds registry/view
 identity, normalized scope, Mix inputs, command/policy/toolchain, unit source
 state, source decisions, and dependency-index/impact facts where applicable.
@@ -258,6 +261,22 @@ There is no generic force-through-drift mode. Produce a new plan when the
 intended operation changes.
 
 ## Execution, runtime contexts, and lock isolation
+
+The normal lifecycle commands encode dependency population and its barrier:
+
+```bash
+./mix_workspace_ops setup   --registry /portfolio/registry.json --checkout-root ~/src --view /portfolio/governed-stack.json
+./mix_workspace_ops compile --registry /portfolio/registry.json --checkout-root ~/src --view /portfolio/governed-stack.json
+./mix_workspace_ops test    --registry /portfolio/registry.json --checkout-root ~/src --view /portfolio/governed-stack.json
+```
+
+`setup` populates each distinct dependency context once. `compile` and `test`
+perform the required setup first, wait for every required context, then execute
+independent project/build contexts in dependency order and in parallel. `test`
+defaults to `MIX_ENV=test`; an explicit `--mix-env` wins. The low-level
+`run ... -- <command>` form remains an arbitrary-command escape hatch. It does
+not infer a lifecycle barrier inside a composite user command, so it is not the
+normal way to spell cold setup plus compilation.
 
 Project units are the default; repository units remain available where useful.
 Blitz owns bounded concurrency. Continue-on-failure is the default and
@@ -279,8 +298,19 @@ MWO keeps generated state outside managed repositories:
 - invocation-private HOME/config/report/lease state;
 - an invocation-private working copy of the context lock;
 - content-addressed source overlays/bootstrap state;
-- credential-free shared Hex/Rebar/archive caches;
+- checksum-addressed verified Hex archives and per-context native cache views;
+- shared Rebar and Mix archive caches;
 - Git mirrors.
+
+Project metadata is cached persistently by exact repository source identity,
+project-relative path, `mix.exs` digest, effective dependency scope,
+environment/target, toolchain, and schema. A clean repository commit or a dirty
+repository source digest is the conservative source boundary. When allowed
+Git-ignored source exists, the exact staged source digest is used as well:
+arbitrary `mix.exs` code may read repository-relative support files. Prewarming
+retains one source snapshot per repository for the invocation. A change therefore
+re-probes the Mix projects in that repository, never the whole portfolio; all
+unchanged repositories launch zero probe subprocesses.
 
 Reusable dependency/build identity excludes the absolute checkout root and does
 not create a new build directory just because the target project's HEAD or dirty

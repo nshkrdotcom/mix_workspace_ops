@@ -149,7 +149,10 @@ defmodule MixWorkspaceOps.Integration.SharedRuntimeCacheTest do
 
     first_env = [{"MIX_WORKSPACE_OPS_BOOTSTRAP", bootstrap}, {"ERL_AFLAGS", "+S 2:2"} | first.env]
     assert mix!(consumer, ["deps.get"], first_env) =~ "* Getting git_dep"
-    assert {:ok, %{lock_mutated: true}} = Runtime.finish(first.handle)
+
+    assert {:ok, %{lock_mutated: true}} =
+             Runtime.finish(first.handle, accept_lock_mutation: true)
+
     assert :ok = Runtime.release(first.handle)
     assert File.read!(Path.join(consumer, "mix.lock")) == source_lock
 

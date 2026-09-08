@@ -88,7 +88,16 @@ defmodule MixWorkspaceOps.Resolution do
   disagreement is visible rather than silently resolved.
   """
 
-  alias MixWorkspaceOps.{Graph, MixInputs, OperatorPaths, Project, Registry, SourcePreferences}
+  alias MixWorkspaceOps.{
+    DependencyRequirement,
+    Graph,
+    MixInputs,
+    OperatorPaths,
+    Project,
+    Registry,
+    SourcePreferences
+  }
+
   alias MixWorkspaceOps.Registry.Source
 
   @local "local"
@@ -177,7 +186,8 @@ defmodule MixWorkspaceOps.Resolution do
            opts
            |> Keyword.put(:consumer_root, consumer_root)
            |> Keyword.put(:preferences, preferences),
-         {:ok, decisions} <- decide_all(registry, target, closure, opts) do
+         {:ok, decisions} <- decide_all(registry, target, closure, opts),
+         :ok <- validate_selected_versions(registry, closure, decisions, opts) do
       {:ok,
        %{
          target: target,
@@ -475,6 +485,11 @@ defmodule MixWorkspaceOps.Resolution do
 
     "dependency #{app} has conflicting catalog identities in one graph: #{rendered}. " <>
       "One Mix application can have only one source; align the provider declarations."
+  end
+
+  def explain({:dependency_requirement_mismatch, app, consumer, requirement, provider, version}) do
+    "#{consumer} requires #{app} #{requirement}, but catalog provider #{provider} declares " <>
+      "version #{inspect(version)}. Correct the declaration or select a compatible provider."
   end
 
   def explain(_other), do: nil
@@ -1139,6 +1154,60 @@ defmodule MixWorkspaceOps.Resolution do
         {:error, {:conflicting_dependency_identities, app, reported}}
     end
   end
+
+  defp validate_selected_versions(registry, closure, decisions, opts) do
+    decisions
+    |> Enum.reduce_while(:ok, &validate_selected_version(&1, registry, closure, opts, &2))
+  end
+
+  defp validate_selected_version(decision, registry, closure, opts, :ok) do
+    uses =
+      Enum.filter(
+        closure.dependency_applications,
+        &(&1.application == decision.application and not is_nil(Map.get(&1, :requirement)))
+      )
+
+    decision
+    |> selected_version_result(registry, uses, opts)
+    |> continue_validation(decision, uses)
+  end
+
+  defp selected_version_result(_decision, _registry, [], _opts), do: :not_locally_verifiable
+
+  defp selected_version_result(decision, registry, _uses, opts),
+    do: selected_provider_version(registry, decision, opts)
+
+  defp continue_validation({:ok, version, provider}, decision, uses) do
+    case DependencyRequirement.validate_version(decision.application, provider, version, uses) do
+      :ok -> {:cont, :ok}
+      {:error, _reason} = error -> {:halt, error}
+    end
+  end
+
+  defp continue_validation(:not_locally_verifiable, _decision, _uses), do: {:cont, :ok}
+  defp continue_validation({:error, _reason} = error, _decision, _uses), do: {:halt, error}
+
+  defp selected_provider_version(
+         registry,
+         %{source: source, provider_project_id: provider},
+         opts
+       )
+       when source in [@local, @github] and is_binary(provider) do
+    project = Registry.project!(registry, provider)
+
+    case Registry.checkout(registry, project.repository) do
+      {:bound, _root} ->
+        case Project.metadata(registry, project, opts) do
+          {:ok, metadata} -> {:ok, metadata.version, provider}
+          {:error, reason} -> {:error, {:dependency_provider_version, provider, reason}}
+        end
+
+      _absent_or_unknown ->
+        :not_locally_verifiable
+    end
+  end
+
+  defp selected_provider_version(_registry, _decision, _opts), do: :not_locally_verifiable
 
   defp direct_dependencies(registry, target, opts) do
     project = Registry.project!(registry, target)

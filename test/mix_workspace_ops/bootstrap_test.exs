@@ -103,7 +103,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
   end
 
   describe "an overlay row decides" do
-    test "a local row emits a path dependency with no requirement", context do
+    test "a local row changes only the source and preserves the requirement", context do
       root = temporary_directory!(context)
       dependency = Path.join(root, "example_core")
       initialize_repository!(dependency)
@@ -115,7 +115,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
 
       assert capture_io(fn ->
                assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
-                        {:example_core, [path: dependency]}
+                        {:example_core, "~> 1.0", [path: dependency]}
              end) =~ "local path source in use for: example_core"
     end
 
@@ -133,7 +133,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
 
       capture_io(fn ->
         assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
-                 {:example_core, [path: dependency, override: true]}
+                 {:example_core, "~> 1.0", [path: dependency, override: true]}
       end)
     end
 
@@ -148,7 +148,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
       assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
-               {:example_core,
+               {:example_core, "~> 1.0",
                 [
                   github: "example-org/example_core",
                   branch: "main",
@@ -163,10 +163,10 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
       assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
-               {:example_core, [github: "example-org/example_core"]}
+               {:example_core, "~> 1.0", [github: "example-org/example_core"]}
     end
 
-    test "a hex row is two elements without options and three with them", context do
+    test "a hex row supplies coordinates but cannot replace a call-site requirement", context do
       root = temporary_directory!(context)
 
       path =
@@ -179,13 +179,13 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
       assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
-               {:example_core, "~> 2.0"}
+               {:example_core, "~> 1.0"}
 
       assert MixWorkspaceOpsBootstrap.dep({:example_edge, "~> 1.0"}, root) ==
-               {:example_edge, "~> 0.8.2", [only: [:dev, :test], runtime: false]}
+               {:example_edge, "~> 1.0", [only: [:dev, :test], runtime: false]}
 
       assert MixWorkspaceOpsBootstrap.dep({:example_shape, "~> 1.0"}, root) ==
-               {:example_shape, "~> 3.0", [hex: :shape_fork]}
+               {:example_shape, "~> 1.0", [hex: :shape_fork]}
     end
 
     test "call-site options win over the ones the overlay carries", context do
@@ -194,7 +194,40 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
       assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0", runtime: true}, root) ==
-               {:example_core, "~> 2.0", [runtime: true]}
+               {:example_core, "~> 1.0", [runtime: true]}
+    end
+
+    test "call-site filtering and runtime semantics survive source substitution", context do
+      root = temporary_directory!(context)
+      dependency = Path.join(root, "example_core")
+      initialize_repository!(dependency)
+
+      path =
+        write_overlay!(root, [
+          "example_core\tlocal\t#{dependency}\trevision\tsource\toptional=false,runtime=true"
+        ])
+
+      System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
+
+      committed =
+        {:example_core, ~r/^1\./,
+         only: [:dev, :test], optional: true, runtime: false, targets: [:host]}
+
+      assert capture_io(fn ->
+               assert {:example_core, requirement, options} =
+                        MixWorkspaceOpsBootstrap.dep(committed, root)
+
+               assert Regex.source(requirement) == "^1\\."
+               assert Regex.opts(requirement) == []
+
+               assert Keyword.equal?(options,
+                        path: dependency,
+                        only: [:dev, :test],
+                        optional: true,
+                        runtime: false,
+                        targets: [:host]
+                      )
+             end) =~ "local path source in use for: example_core"
     end
 
     test "an application the overlay does not carry keeps its committed default", context do
@@ -277,7 +310,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.argv(["hex.publish"])
 
       assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
-               {:example_core, [github: "example-org/example_core", branch: "main"]}
+               {:example_core, "~> 1.0", [github: "example-org/example_core", branch: "main"]}
     end
 
     test "reads task position, so an argument is not a publication", context do
@@ -287,7 +320,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.argv(["run", "--arg", "hex.publish"])
 
       assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
-               {:example_core, "~> 2.0"}
+               {:example_core, "~> 1.0"}
     end
   end
 
@@ -298,12 +331,12 @@ defmodule MixWorkspaceOps.BootstrapTest do
       System.put_env("MIX_WORKSPACE_OPS_OVERLAY", path)
 
       assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
-               {:example_core, "~> 2.0"}
+               {:example_core, "~> 1.0"}
 
       File.rm!(path)
 
       assert MixWorkspaceOpsBootstrap.dep({:example_core, "~> 1.0"}, root) ==
-               {:example_core, "~> 2.0"}
+               {:example_core, "~> 1.0"}
 
       assert {:ok, bootstrap} = Bootstrap.materialize(Path.join(root, "operator-state"))
 
@@ -459,7 +492,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
                  location: "example-org/example_edge",
                  version: "branch main"
                },
-               %{app: :example_shape, source: "hex", location: "hex", version: "~> 2.0"}
+               %{app: :example_shape, source: "hex", location: "hex", version: "~> 0.1.0"}
              ]
 
       report =
@@ -470,7 +503,7 @@ defmodule MixWorkspaceOps.BootstrapTest do
                "  example_committed -> hex (hex) -> ~> 9.9",
                "  example_core -> local (#{sibling}) -> 4.5.6",
                "  example_edge -> github (example-org/example_edge) -> branch main",
-               "  example_shape -> hex (hex) -> ~> 2.0"
+               "  example_shape -> hex (hex) -> ~> 0.1.0"
              ]
 
       assert MixWorkspaceOpsBootstrap.format_sources([]) ==

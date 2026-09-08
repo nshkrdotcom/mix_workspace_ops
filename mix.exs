@@ -25,7 +25,10 @@ defmodule MixWorkspaceOps.MixProject do
 
   defp deps do
     [
-      {:blitz, "== 0.4.1", runtime: false},
+      {:blitz,
+       github: "nshkrdotcom/blitz",
+       ref: "5dfbeae6a75ea91ca0b05239c0bad98614861f19",
+       runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: :dev, runtime: false},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false}

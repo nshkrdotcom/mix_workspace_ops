@@ -93,6 +93,45 @@ defmodule MixWorkspaceOps.ProbeContainmentTest do
     assert Bitwise.band(File.stat!(stage.root).mode, 0o777) == 0o700
   end
 
+  test "non-secret Git-ignored source is staged and changes its persistent identity", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "alpha"))
+    ignored = Path.join(repository, "local.flag")
+    counter = Path.join(root, "ignored-probes")
+    cache = Path.join(root, "metadata")
+
+    File.write!(Path.join(repository, ".gitignore"), "local.flag\n")
+
+    File.write!(Path.join(repository, "mix.exs"), """
+    File.write!(#{inspect(counter)}, "x", [:append])
+
+    defmodule Alpha.MixProject do
+      use Mix.Project
+
+      def project do
+        version = File.read!("local.flag")
+        [app: :alpha, version: version, deps: []]
+      end
+    end
+    """)
+
+    git_ok!(repository, ["add", ".gitignore", "mix.exs"])
+    git_ok!(repository, ["commit", "--quiet", "-m", "define probe surface"])
+    File.write!(ignored, "0.1.0")
+
+    assert {:ok, true} = ProbeTree.extended_source?(repository)
+
+    first = ProbeMemo.new(cache)
+    assert {:ok, %{version: "0.1.0"}} = Project.metadata_at(repository, probe_memo: first)
+    assert ProbeMemo.stats(first) == %{disk_hits: 0, memory_hits: 0, misses: 1}
+
+    File.write!(ignored, "0.2.0")
+    second = ProbeMemo.new(cache)
+    assert {:ok, %{version: "0.2.0"}} = Project.metadata_at(repository, probe_memo: second)
+    assert ProbeMemo.stats(second) == %{disk_hits: 0, memory_hits: 0, misses: 1}
+    assert File.read!(counter) == "xx"
+  end
+
   test "permission-only source changes invalidate the invocation memo", context do
     root = temporary_directory!(context)
     repository = initialize_repository!(Path.join(root, "alpha"))
@@ -188,4 +227,8 @@ defmodule MixWorkspaceOps.ProbeContainmentTest do
 
   defp restore_env(name, nil), do: System.delete_env(name)
   defp restore_env(name, value), do: System.put_env(name, value)
+
+  defp git_ok!(repository, args) do
+    assert {_output, 0} = System.cmd("git", args, cd: repository, stderr_to_stdout: true)
+  end
 end

@@ -36,7 +36,7 @@ defmodule MixWorkspaceOps.Overlay do
   @env "MIX_WORKSPACE_OPS_OVERLAY"
   @context_env "MIX_WORKSPACE_OPS_CONTEXT_DIGEST"
   @header "mix_workspace_ops.overlay/v3"
-  @context_header "mix_workspace_ops.context/v3"
+  @context_header "mix_workspace_ops.context/v4"
   @maximum_bytes 16 * 1024 * 1024
   @modes ~w(auto local git hex)
   @absent "-"
@@ -79,15 +79,17 @@ defmodule MixWorkspaceOps.Overlay do
          :ok <- known_mode(mode),
          {:ok, resolution} <- Graph.resolve(registry, target, opts),
          {:ok, decided} <- decide(registry, target, resolution, mode, opts),
-         {:ok, attributed} <- source_rows(decided),
+         repository_state_memo <- Keyword.get(opts, :repository_state_memo),
+         {:ok, attributed} <- source_rows(decided, repository_state_memo),
          rows <- Enum.map(attributed, &elem(&1, 1)),
          :ok <- printable(rows),
          target_project <- Registry.project!(registry, target),
          target_root <- Registry.project_root(registry, target_project),
          {:ok, target_metadata} <- Project.metadata(registry, target_project, opts),
          {:ok, lock_bytes} <- source_lock(target_root),
-         target_head <- Git.head!(target_root),
-         target_source_digest <- Git.source_digest(target_root),
+         target_state_snapshot <- Git.state(target_root, repository_state_memo),
+         target_head <- target_state_snapshot.head,
+         target_source_digest <- target_state_snapshot.source_digest,
          context <-
            context_contents(
              registry,
@@ -119,6 +121,9 @@ defmodule MixWorkspaceOps.Overlay do
              prepare_objects: Keyword.get(opts, :prepare_objects, false),
              managed_sources: Map.new(rows, fn [app, source | _rest] -> {app, source} end),
              git_cache_memo: Keyword.get(opts, :git_cache_memo),
+             hex_cache_memo: Keyword.get(opts, :hex_cache_memo),
+             transport_cache_memo: Keyword.get(opts, :transport_cache_memo),
+             archive_cache_memo: Keyword.get(opts, :archive_cache_memo),
              git_sources: git_sources(attributed),
              path_apps: for([app, "local" | _rest] <- rows, do: app),
              cache_concurrency: Keyword.get(opts, :cache_concurrency, System.schedulers_online()),
@@ -178,9 +183,9 @@ defmodule MixWorkspaceOps.Overlay do
   end
 
   @doc "Finalizes and releases an activation created by `activate/3`."
-  @spec deactivate(map()) :: {:ok, map()} | {:error, term()}
-  def deactivate(%{runtime_handle: handle}) do
-    result = Runtime.finish(handle)
+  @spec deactivate(map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def deactivate(%{runtime_handle: handle}, opts \\ []) do
+    result = Runtime.finish(handle, opts)
 
     case Runtime.release(handle) do
       :ok -> result
@@ -260,22 +265,24 @@ defmodule MixWorkspaceOps.Overlay do
   defp resolution_mode(:git), do: "github"
   defp resolution_mode(mode), do: to_string(mode)
 
-  defp source_rows(decided) do
+  defp source_rows(decided, repository_state_memo) do
     decided.decisions
-    |> Enum.map(&source_row/1)
+    |> Enum.map(&source_row(&1, repository_state_memo))
     |> collect_rows()
   end
 
-  defp source_row(%{source: "local", location: path} = decision) do
+  defp source_row(%{source: "local", location: path} = decision, repository_state_memo) do
     if File.regular?(Path.join(path, "mix.exs")) do
+      state = Git.state(path, repository_state_memo)
+
       {:ok,
        {decision,
         [
           decision.application,
           "local",
           path,
-          Git.head!(path),
-          Git.source_digest(path),
+          state.head,
+          state.source_digest,
           encode_options(decision.opts)
         ]}}
     else
@@ -283,7 +290,7 @@ defmodule MixWorkspaceOps.Overlay do
     end
   end
 
-  defp source_row(%{source: "github", location: coordinates} = decision) do
+  defp source_row(%{source: "github", location: coordinates} = decision, _memo) do
     {kind, value} = revision(coordinates)
 
     {:ok,
@@ -299,7 +306,7 @@ defmodule MixWorkspaceOps.Overlay do
       ]}}
   end
 
-  defp source_row(%{source: "hex", location: requirement} = decision) do
+  defp source_row(%{source: "hex", location: requirement} = decision, _memo) do
     {:ok, {decision, [decision.application, "hex", requirement, encode_options(decision.opts)]}}
   end
 
@@ -381,6 +388,7 @@ defmodule MixWorkspaceOps.Overlay do
       "mix_env\t#{decided.mix_env}",
       "mix_target\t#{decided.mix_target}",
       "dependency_declarations\t#{dependency_fingerprint}",
+      "closure_declarations\t#{closure_declaration_digest(decided.closure)}",
       "toolchain\telixir-#{System.version()}-otp-#{:erlang.system_info(:otp_release)}"
     ]
 
@@ -392,6 +400,18 @@ defmodule MixWorkspaceOps.Overlay do
     (metadata ++ sources)
     |> Enum.join("\n")
     |> Kernel.<>("\n")
+  end
+
+  defp closure_declaration_digest(closure) do
+    closure.dependency_applications
+    |> Enum.map(&Map.take(&1, [:application, :classification, :provider, :requirement, :options]))
+    |> Enum.uniq()
+    |> Enum.sort_by(fn dependency ->
+      {dependency.application, dependency.provider || "", inspect(dependency.requirement),
+       inspect(dependency.options)}
+    end)
+    |> :erlang.term_to_binary([:deterministic])
+    |> digest()
   end
 
   # Local source content is deliberately not a cache-identity input. The
@@ -656,14 +676,15 @@ defmodule MixWorkspaceOps.Overlay do
 
   defp execute_activation(activation, function) do
     result = function.(activation.report, activation.env)
+    accept_lock_mutation? = not match?({:error, _reason}, result)
 
-    case deactivate(activation) do
+    case deactivate(activation, accept_lock_mutation: accept_lock_mutation?) do
       {:ok, runtime_report} -> attach_runtime(result, runtime_report)
       {:error, reason} -> {:error, reason}
     end
   catch
     kind, reason ->
-      deactivate(activation)
+      deactivate(activation, accept_lock_mutation: false)
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
 

@@ -63,5 +63,5 @@ When coverage is incomplete, MWO widens automatically to the full base view and
 records `dependency_index_incomplete` as the fallback reason.
 
 The same scope and dependency-index facts are frozen into
-`mix_workspace_ops.plan/v2`. Replay therefore refuses dependency/coverage drift
+`mix_workspace_ops.plan/v3`. Replay therefore refuses dependency/coverage drift
 instead of silently producing a different affected set.

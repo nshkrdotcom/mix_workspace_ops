@@ -69,7 +69,7 @@ defmodule MixWorkspaceOpsBootstrap do
   `[github: "example-org/example_core", branch: "main"]`.
 
   With an overlay carrying the application, its row replaces only the source;
-  the dependency options from the committed tuple still win.
+  the dependency requirement and options from the committed tuple still win.
   """
   def dep(committed, project_root) do
     app = committed_application!(committed)
@@ -77,10 +77,7 @@ defmodule MixWorkspaceOpsBootstrap do
     notify_local_paths(project_root, overlay)
     source = overlay_source(overlay, Atom.to_string(app))
 
-    selected =
-      if source,
-        do: overlay_tuple(app, source, committed_options!(committed)),
-        else: committed
+    selected = if source, do: project_source(committed, app, source), else: committed
 
     record_source(project_root, selected)
     selected
@@ -136,13 +133,22 @@ defmodule MixWorkspaceOpsBootstrap do
     :ok
   end
 
-  defp source_entry({app, requirement}) when is_binary(requirement),
-    do: %{app: app, source: "hex", location: "hex", version: requirement}
+  defp source_entry({app, requirement})
+       when is_binary(requirement) or is_struct(requirement, Regex),
+       do: %{app: app, source: "hex", location: "hex", version: requirement_label(requirement)}
 
-  defp source_entry({app, requirement, _opts}) when is_binary(requirement),
-    do: %{app: app, source: "hex", location: "hex", version: requirement}
+  defp source_entry({app, requirement, opts})
+       when (is_binary(requirement) or is_struct(requirement, Regex)) and is_list(opts),
+       do: source_entry_from_options(app, opts, requirement)
 
-  defp source_entry({app, opts}) when is_list(opts) do
+  defp source_entry({app, opts}) when is_list(opts),
+    do: source_entry_from_options(app, opts, nil)
+
+  defp source_entry(tuple) do
+    %{app: elem(tuple, 0), source: "unknown", location: "?", version: nil}
+  end
+
+  defp source_entry_from_options(app, opts, requirement) do
     cond do
       path = Keyword.get(opts, :path) ->
         %{app: app, source: "local", location: path, version: declared_version(path)}
@@ -153,14 +159,16 @@ defmodule MixWorkspaceOpsBootstrap do
       repo = Keyword.get(opts, :git) ->
         %{app: app, source: "git", location: repo, version: revision_label(opts)}
 
+      requirement ->
+        %{app: app, source: "hex", location: "hex", version: requirement_label(requirement)}
+
       true ->
         %{app: app, source: "unknown", location: "?", version: nil}
     end
   end
 
-  defp source_entry(tuple) do
-    %{app: elem(tuple, 0), source: "unknown", location: "?", version: nil}
-  end
+  defp requirement_label(requirement) when is_binary(requirement), do: requirement
+  defp requirement_label(%Regex{} = requirement), do: inspect(requirement)
 
   defp revision_label(opts) do
     Enum.find_value([:ref, :tag, :branch], fn key ->
@@ -316,14 +324,39 @@ defmodule MixWorkspaceOpsBootstrap do
     projected ++ inherited
   end
 
-  defp project_source(committed, app, source),
-    do: overlay_tuple(app, source, committed_options!(committed))
+  defp project_source(committed, app, source) do
+    app
+    |> overlay_tuple(source, committed_options!(committed))
+    |> preserve_requirement(committed_requirement(committed))
+  end
 
-  defp force_override({app, requirement}) when is_binary(requirement),
-    do: {app, requirement, [override: true]}
+  defp committed_requirement({_app, requirement})
+       when is_binary(requirement) or is_struct(requirement, Regex),
+       do: requirement
 
-  defp force_override({app, requirement, opts}) when is_binary(requirement),
-    do: {app, requirement, Keyword.put(opts, :override, true)}
+  defp committed_requirement({_app, requirement, _options})
+       when is_binary(requirement) or is_struct(requirement, Regex),
+       do: requirement
+
+  defp committed_requirement(_coordinates), do: nil
+
+  defp preserve_requirement(tuple, nil), do: tuple
+
+  defp preserve_requirement({app, options}, requirement) when is_list(options),
+    do: {app, requirement, options}
+
+  defp preserve_requirement({app, _source_requirement}, requirement), do: {app, requirement}
+
+  defp preserve_requirement({app, _source_requirement, options}, requirement),
+    do: {app, requirement, options}
+
+  defp force_override({app, requirement})
+       when is_binary(requirement) or is_struct(requirement, Regex),
+       do: {app, requirement, [override: true]}
+
+  defp force_override({app, requirement, opts})
+       when is_binary(requirement) or is_struct(requirement, Regex),
+       do: {app, requirement, Keyword.put(opts, :override, true)}
 
   defp force_override({app, opts}) when is_list(opts),
     do: {app, Keyword.put(opts, :override, true)}

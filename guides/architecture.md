@@ -57,8 +57,16 @@ with explicit Mix env/target. The tree contains incidental dependency/build/conf
 writes so the source checkout stays clean. It is not a security sandbox; project
 code executes with the operator's OS authority.
 
-One invocation can memoize probe results so dependency indexing, planning, and
-related queries do not repeatedly evaluate the same project.
+An invocation coalesces equal probe questions, and exact successful metadata is
+retained between invocations. The key includes repository source identity,
+project-relative path, `mix.exs` digest, effective dependency scope,
+environment/target, toolchain, and schema. Because arbitrary `mix.exs` code may
+read repository-relative files, a repository source change conservatively
+invalidates that repository's project probes; unchanged repositories launch no
+probe subprocesses. Allowed Git-ignored files participate in the staged source
+digest; excluded build, dependency and credential trees are pruned before Git
+enumerates ignored source. Prewarming stages a repository once and retains its
+exact source digest for subsequent reads in that invocation.
 
 ## DependencyIndex and Impact
 
@@ -109,9 +117,11 @@ defp workspace_dep(committed) do
 end
 ```
 
-MWO does not implement package materialization. Standard Mix/Hex resolves Hex
-dependencies. Git mirrors are only transport rewrites; Mix still creates and owns
-Git dependency checkouts.
+MWO does not implement package resolution or extraction. Standard Mix/Hex
+performs both. MWO retains checksum-addressed archives returned by native Hex,
+independently verifies the locked checksum, and projects them into each exact
+dependency context's native cache view. Git mirrors are only transport rewrites;
+Mix still creates and owns Git dependency checkouts.
 
 The source checkout's `mix.lock` is never modified. `Lockfile` safely parses only
 a literal top-level lock map, removes entries for dependencies actively replaced
@@ -131,10 +141,11 @@ API.
 
 ## Plans and execution
 
-Direct `run` is a current-state operation. `OperationPlan` v2 is the portable
+Direct `run` is a current-state operation. `OperationPlan` v3 is the portable
 frozen handoff/replay boundary. It binds registry/view identity, normalized scope,
-command/policy, toolchain, units, source decisions, and dependency-index/impact
-facts under one document digest. It contains no local paths or credentials.
+command/policy, toolchain, units, their dependency edges, source decisions, and
+dependency-index/impact facts under one document digest. It contains no local
+paths or credentials.
 
 Replay rebuilds current semantics and compares named dimensions. Material drift
 is a refusal; a new operation requires a new plan.
@@ -142,6 +153,14 @@ is a refusal; a new operation requires a new plan.
 `Fanout` binds portable units to local runtime state and delegates concurrency to
 Blitz. Results retain deterministic logical-unit ordering even when jobs finish
 out of order. A failed fan-out still emits the complete known report.
+
+First-class `setup`, `compile`, and `test` operations prepare each unique
+dependency context once. Compile/test wait at the population barrier and then
+execute ready project contexts in dependency waves. Independent failures remain
+isolated; the strict operation still exits nonzero and reports one deduplicated
+cause with affected units and durable log paths. Arbitrary `run -- <command>` is
+the low-level escape hatch and does not infer barriers within a user-supplied
+composite command.
 
 ## Runtime contexts
 

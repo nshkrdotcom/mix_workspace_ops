@@ -248,7 +248,9 @@ defmodule MixWorkspaceOps.WorkspaceMembershipTest do
                candidates: [],
                classification: :managed,
                consumer: "plane",
-               provider: "support"
+               provider: "support",
+               requirement: nil,
+               options: %{}
              }
            ]
 
@@ -257,5 +259,39 @@ defmodule MixWorkspaceOps.WorkspaceMembershipTest do
 
     assert [%{application: "support", source: "local"}] =
              Enum.map(Resolution.sources(report), &Map.take(&1, [:application, :source]))
+  end
+
+  test "an explicitly seeded workspace member fulfills a transitive optional use", context do
+    root = temporary_directory!(context)
+    initialize_repository!(Path.join(root, "plane"))
+
+    registry =
+      root
+      |> workspace_catalog(%{"kind" => "umbrella"}, [
+        catalog_project("plane", app: nil, kind: "workspace_root"),
+        catalog_project("plane.middle", app: "middle", path: "apps/middle", kind: "package"),
+        catalog_project("plane.leaf", app: "leaf", path: "apps/leaf", kind: "package")
+      ])
+      |> Registry.load!()
+      |> bind!(root)
+
+    optional_leaf = %{
+      application: "leaf",
+      requirement: %{kind: "string", value: "~> 1.0"},
+      options: %{"optional" => true}
+    }
+
+    reader = fn
+      %{id: "plane.middle"} -> {:ok, [optional_leaf]}
+      _project -> {:ok, []}
+    end
+
+    assert {:ok, resolution} = Graph.resolve(registry, "plane", dependency_reader: reader)
+    assert {"plane.middle", "plane.leaf"} in resolution.edges
+
+    assert Enum.any?(resolution.dependency_applications, fn use ->
+             use.consumer == "plane.middle" and use.application == "leaf" and
+               use.options == %{"optional" => true}
+           end)
   end
 end

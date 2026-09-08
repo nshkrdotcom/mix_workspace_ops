@@ -26,7 +26,7 @@ defmodule MixWorkspaceOps.MixInputsTest do
 
     declarations =
       Map.new(~w(alpha beta gamma delta), fn app ->
-        {app, %{"github" => %{}, "hex" => "~> 1.0"}}
+        {app, %{"github" => %{}, "hex" => "~> 0.1"}}
       end)
 
     registry_path =
@@ -234,7 +234,7 @@ defmodule MixWorkspaceOps.MixInputsTest do
             {:test, :embedded} -> :delta
           end
 
-        [app: :consumer, version: "0.1.0", deps: [{dependency, "~> 1.0"}]]
+        [app: :consumer, version: "0.1.0", deps: [{dependency, "~> 0.1"}]]
       end
     end
     """

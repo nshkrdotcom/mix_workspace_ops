@@ -14,6 +14,7 @@ defmodule MixWorkspaceOps.CLI do
     Registry,
     Report,
     Resolution,
+    RunReport,
     Runtime,
     SourcePreferences,
     View
@@ -34,23 +35,35 @@ defmodule MixWorkspaceOps.CLI do
     registry chain --registry PATH [--package APP]
     registry discover --checkout-root PATH --github-owner OWNER [--output PATH]
     registry drift --registry PATH --checkout-root PATH [--ledger PATH] [--output PATH]
-    doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH]
+    doctor --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] [--state-root PATH]
     plan --registry PATH --checkout-root PATH [--view PATH | --project ID] [--affected TARGET] [--binding PATH] \
       [--unit project|repository] [--dirty-policy require-clean|allow-recorded] \
       [--mix-env ENV] [--mix-target TARGET] [--mode auto|local|git|hex] \
       [--source APP=SOURCE] [--fail-fast] [--state-root PATH] [--output PATH] -- COMMAND [ARG ...]
     sources --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
       [--mix-env ENV] [--mix-target TARGET] \
-      [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false]
-    why APP [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
+      [--mode auto|local|git|hex] [--source APP=SOURCE] [--as-publish true|false] [--state-root PATH]
+    why APP [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH] [--state-root PATH]
     use APP SOURCE [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
     use --clear [APP] [--project ID] [--registry PATH] [--checkout-root PATH] [--view PATH] [--binding PATH]
     seam --project ID --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
-      [--mix-env ENV] [--mix-target TARGET]
+      [--mix-env ENV] [--mix-target TARGET] [--state-root PATH]
     impact TARGET --registry PATH --checkout-root PATH [--view PATH] [--binding PATH] \
-      [--mix-env ENV] [--mix-target TARGET]
+      [--mix-env ENV] [--mix-target TARGET] [--state-root PATH]
     state list [--state-root PATH]
     state gc --older-than N[s|m|h|d] [--dry-run] [--state-root PATH]
+    setup --registry PATH --checkout-root PATH [--view PATH | --project ID] [--affected TARGET] [--binding PATH] \
+      [--dirty-policy require-clean|allow-recorded] [--mix-env ENV] [--mix-target TARGET] \
+      [--mode auto|local|git|hex] [--source APP=SOURCE] \
+      [--fail-fast] [--max-concurrency N] [--beam-schedulers N] [--timeout N[s|m|h]] [--state-root PATH]
+    compile --registry PATH --checkout-root PATH [--view PATH | --project ID] [--affected TARGET] [--binding PATH] \
+      [--dirty-policy require-clean|allow-recorded] [--mix-env ENV] [--mix-target TARGET] \
+      [--mode auto|local|git|hex] [--source APP=SOURCE] \
+      [--fail-fast] [--max-concurrency N] [--beam-schedulers N] [--timeout N[s|m|h]] [--state-root PATH]
+    test --registry PATH --checkout-root PATH [--view PATH | --project ID] [--affected TARGET] [--binding PATH] \
+      [--dirty-policy require-clean|allow-recorded] [--mix-env ENV] [--mix-target TARGET] \
+      [--mode auto|local|git|hex] [--source APP=SOURCE] \
+      [--fail-fast] [--max-concurrency N] [--beam-schedulers N] [--timeout N[s|m|h]] [--state-root PATH]
     run --registry PATH --checkout-root PATH [--view PATH | --project ID] [--affected TARGET] [--binding PATH] \
       [--unit project|repository] [--dirty-policy require-clean|allow-recorded] \
       [--mix-env ENV] [--mix-target TARGET] [--mode auto|local|git|hex] \
@@ -77,7 +90,7 @@ defmodule MixWorkspaceOps.CLI do
     ["registry", "chain"] => [:registry, :package],
     ["registry", "discover"] => [:checkout_root, :github_owner, :output],
     ["registry", "drift"] => [:registry, :checkout_root, :ledger, :output],
-    ["doctor"] => [:registry, :checkout_root, :view, :binding],
+    ["doctor"] => [:registry, :checkout_root, :view, :binding, :state_root],
     ["plan"] => [
       :project,
       :affected,
@@ -105,9 +118,10 @@ defmodule MixWorkspaceOps.CLI do
       :mix_target,
       :mode,
       :source,
-      :as_publish
+      :as_publish,
+      :state_root
     ],
-    ["why"] => [:project, :registry, :checkout_root, :view, :binding],
+    ["why"] => [:project, :registry, :checkout_root, :view, :binding, :state_root],
     ["use"] => [:clear, :project, :registry, :checkout_root, :view, :binding],
     ["seam"] => [
       :project,
@@ -116,11 +130,74 @@ defmodule MixWorkspaceOps.CLI do
       :view,
       :binding,
       :mix_env,
-      :mix_target
+      :mix_target,
+      :state_root
     ],
-    ["impact"] => [:registry, :checkout_root, :view, :binding, :mix_env, :mix_target],
+    ["impact"] => [
+      :registry,
+      :checkout_root,
+      :view,
+      :binding,
+      :mix_env,
+      :mix_target,
+      :state_root
+    ],
     ["state", "list"] => [:state_root],
     ["state", "gc"] => [:state_root, :older_than, :dry_run],
+    ["setup"] => [
+      :project,
+      :affected,
+      :mode,
+      :source,
+      :dirty_policy,
+      :fail_fast,
+      :max_concurrency,
+      :beam_schedulers,
+      :timeout,
+      :registry,
+      :checkout_root,
+      :view,
+      :binding,
+      :mix_env,
+      :mix_target,
+      :state_root
+    ],
+    ["compile"] => [
+      :project,
+      :affected,
+      :mode,
+      :source,
+      :dirty_policy,
+      :fail_fast,
+      :max_concurrency,
+      :beam_schedulers,
+      :timeout,
+      :registry,
+      :checkout_root,
+      :view,
+      :binding,
+      :mix_env,
+      :mix_target,
+      :state_root
+    ],
+    ["test"] => [
+      :project,
+      :affected,
+      :mode,
+      :source,
+      :dirty_policy,
+      :fail_fast,
+      :max_concurrency,
+      :beam_schedulers,
+      :timeout,
+      :registry,
+      :checkout_root,
+      :view,
+      :binding,
+      :mix_env,
+      :mix_target,
+      :state_root
+    ],
     ["run"] => [
       :project,
       :affected,
@@ -178,13 +255,18 @@ defmodule MixWorkspaceOps.CLI do
   defp exit_status(:usage), do: usage()
   defp exit_status({:ok, nil}), do: 0
 
+  defp exit_status({:ok, %{schema: "mix_workspace_ops.run/v1"} = value}) do
+    IO.puts(value |> RunReport.summary() |> Report.encode())
+    0
+  end
+
   defp exit_status({:ok, value}) do
     IO.puts(Report.encode(value))
     0
   end
 
   defp exit_status({:error, {:fanout_failed, report}}) do
-    IO.puts(Report.encode(report))
+    IO.puts(report |> RunReport.summary() |> Report.encode())
     1
   end
 
@@ -311,7 +393,7 @@ defmodule MixWorkspaceOps.CLI do
   def dispatch(["doctor" | args]) do
     with {:ok, options, []} <- options(["doctor"], args),
          {:ok, registry} <- load_bound_registry(options) do
-      report = Doctor.inspect(registry)
+      report = Doctor.inspect(registry, probe_memo: probe_memo(options))
       if report.healthy, do: {:ok, report}, else: {:error, {:unhealthy_workspace, report}}
     end
   end
@@ -357,8 +439,9 @@ defmodule MixWorkspaceOps.CLI do
          {:ok, registry} <- load_bound_registry(options),
          {:ok, project} <- project_here(registry, options.project),
          :ok <- ensure_project_in_view(registry, %{options | project: project}),
+         memo <- probe_memo(options),
          {:ok, explanation} <-
-           Resolution.why(registry, project, application, probe_memo: ProbeMemo.new()) do
+           Resolution.why(registry, project, application, probe_memo: memo) do
       {:ok, explanation}
     else
       {:ok, _options, positional} ->
@@ -383,12 +466,13 @@ defmodule MixWorkspaceOps.CLI do
          :ok <- require_option(options, :project),
          {:ok, registry} <- load_bound_registry(options),
          :ok <- ensure_project_in_view(registry, options),
+         memo <- probe_memo(options),
          {:ok, decided} <-
            Resolution.resolve(registry, options.project,
              publish?: true,
              mix_env: options.mix_env,
              mix_target: options.mix_target,
-             probe_memo: ProbeMemo.new()
+             probe_memo: memo
            ),
          {:ok, lines} <- Resolution.seam_lines(decided) do
       {:ok,
@@ -408,7 +492,7 @@ defmodule MixWorkspaceOps.CLI do
   def dispatch(["impact" | args]) do
     with {:ok, options, [target]} <- options(["impact"], args),
          {:ok, registry} <- load_bound_registry(options),
-         memo = ProbeMemo.new(),
+         memo = probe_memo(options),
          {:ok, index} <-
            DependencyIndex.build(registry,
              mix_env: options.mix_env,
@@ -458,6 +542,10 @@ defmodule MixWorkspaceOps.CLI do
       error ->
         error
     end
+  end
+
+  def dispatch([lifecycle | args]) when lifecycle in ["setup", "compile", "test"] do
+    run_lifecycle(String.to_atom(lifecycle), args)
   end
 
   def dispatch(["run" | args]) do
@@ -512,6 +600,40 @@ defmodule MixWorkspaceOps.CLI do
     end
   end
 
+  defp run_lifecycle(lifecycle, args) do
+    command_name = [Atom.to_string(lifecycle)]
+
+    with {:ok, options, []} <- options(command_name, args),
+         options <- lifecycle_defaults(options, lifecycle, args),
+         :ok <- require_fanout_scope(options),
+         {:ok, registry, view} <- load_fanout_context(options),
+         memo <- probe_memo(options),
+         {:ok, build_opts} <- semantic_options(options, memo),
+         build_opts <- Keyword.put(build_opts, :lifecycle, lifecycle),
+         {:ok, plan} <-
+           OperationPlan.build(registry, view, lifecycle_command(lifecycle), build_opts),
+         {:ok, execution_opts} <- execution_options(options, memo) do
+      Fanout.run(plan, registry, execution_opts)
+    else
+      {:ok, _options, positional} ->
+        {:usage_error, "#{lifecycle} expects no positional arguments, got #{inspect(positional)}"}
+
+      error ->
+        error
+    end
+  end
+
+  defp lifecycle_defaults(options, :test, args) do
+    options = Map.put(options, :unit, "project")
+    if "--mix-env" in args, do: options, else: %{options | mix_env: "test"}
+  end
+
+  defp lifecycle_defaults(options, _lifecycle, _args), do: Map.put(options, :unit, "project")
+
+  defp lifecycle_command(:setup), do: ["mix", "deps.get"]
+  defp lifecycle_command(:compile), do: ["mix", "compile"]
+  defp lifecycle_command(:test), do: ["mix", "test"]
+
   defp run_replay(option_args) do
     with {:ok, options, []} <- options(["run"], option_args),
          :ok <- require_option(options, :plan),
@@ -562,7 +684,7 @@ defmodule MixWorkspaceOps.CLI do
          {:ok, mode} <- source_mode(options.mode),
          {:ok, sources} <- source_overrides(options.source),
          {:ok, publish?} <- publish_option(Map.get(options, :as_publish)),
-         memo <- ProbeMemo.new(),
+         memo <- probe_memo(options),
          {:ok, decided} <-
            Resolution.resolve(registry, options.project,
              mode: resolution_mode(mode),
@@ -913,7 +1035,7 @@ defmodule MixWorkspaceOps.CLI do
          beam_schedulers: beam_schedulers,
          timeout: timeout,
          state_root: options.state_root,
-         allow_lock_mutation: options.allow_lock_mutation,
+         allow_lock_mutation: Map.get(options, :allow_lock_mutation, false),
          probe_memo: memo
        ]}
       |> drop_nil_options()
@@ -926,7 +1048,8 @@ defmodule MixWorkspaceOps.CLI do
   defp drop_nil_options({:ok, options}), do: {:ok, Enum.reject(options, &(elem(&1, 1) == nil))}
 
   defp probe_memo(options) do
-    ProbeMemo.new(Path.join(options.state_root, "metadata/probes"))
+    state_root = options.state_root || default_state_root()
+    ProbeMemo.new(Path.join(state_root, "metadata/probes"))
   end
 
   defp unit_kind("project"), do: {:ok, :project}

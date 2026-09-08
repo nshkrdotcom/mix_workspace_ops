@@ -56,6 +56,7 @@ defmodule MixWorkspaceOps.CLITest do
     documented = documented_options()
 
     assert Enum.map(documented, &elem(&1, 0)) |> Enum.uniq() |> Enum.sort() == [
+             ["compile"],
              ["doctor"],
              ["impact"],
              ["plan"],
@@ -69,9 +70,11 @@ defmodule MixWorkspaceOps.CLITest do
              ["release", "plan"],
              ["run"],
              ["seam"],
+             ["setup"],
              ["sources"],
              ["state", "gc"],
              ["state", "list"],
+             ["test"],
              ["use"],
              ["why"]
            ]
@@ -304,7 +307,7 @@ defmodule MixWorkspaceOps.CLITest do
                "true"
              ])
 
-    assert report.schema == "mix_workspace_ops.plan/v2"
+    assert report.schema == "mix_workspace_ops.plan/v3"
     assert report.command == %{executable: "true", args: []}
     assert report.policy.unit_kind == :project
     assert report.policy.source_mode == :auto
@@ -548,6 +551,41 @@ defmodule MixWorkspaceOps.CLITest do
     assert report.sets.catalogued.repositories == 2
   end
 
+  test "read-only metadata commands reuse the exact persistent probe cache", context do
+    %{root: root, catalog: catalog} = workspace!(context)
+    project = Path.join(root, "alpha")
+    mix_exs = Path.join(project, "mix.exs")
+    counter = Path.join(root, "probe-counter")
+    state_root = Path.join(root, "operator-state")
+
+    File.write!(
+      mix_exs,
+      "File.write!(#{inspect(counter)}, \"x\", [:append])\n" <> File.read!(mix_exs)
+    )
+
+    assert {"", 0} = System.cmd("git", ["add", "mix.exs"], cd: project)
+
+    assert {"", 0} =
+             System.cmd("git", ["commit", "--quiet", "-m", "instrument metadata"], cd: project)
+
+    args = [
+      "sources",
+      "--project",
+      "alpha",
+      "--registry",
+      catalog,
+      "--checkout-root",
+      root,
+      "--state-root",
+      state_root
+    ]
+
+    assert {:ok, _first} = CLI.dispatch(args)
+    assert {:ok, _second} = CLI.dispatch(args)
+    assert File.read!(counter) == "x"
+    assert File.dir?(Path.join(state_root, "metadata/probes"))
+  end
+
   # The committed default and the catalog both name a source coordinate and a
   # published requirement, and nothing compared them. The rule is that the
   # committed default is the tuple publish resolution produces, and this is what
@@ -706,7 +744,7 @@ defmodule MixWorkspaceOps.CLITest do
                "true"
              ])
 
-    assert plan.schema == "mix_workspace_ops.plan/v2"
+    assert plan.schema == "mix_workspace_ops.plan/v3"
     assert plan.scope.kind == :affected
     assert plan.scope.impact_complete
     refute plan.scope.fallback_to_full_scope
@@ -1267,6 +1305,33 @@ defmodule MixWorkspaceOps.CLITest do
     assert binding.runtime.lock_mutated
     assert binding.runtime.allow_lock_mutation
     assert File.read!(project_lock) == "%{}\n"
+  end
+
+  test "first-class setup and compile use the managed lifecycle", context do
+    %{root: root, catalog: catalog} = sibling_workspace!(context)
+    state = Path.join(root, "lifecycle-state")
+
+    common = [
+      "--project",
+      "alpha",
+      "--registry",
+      catalog,
+      "--checkout-root",
+      root,
+      "--state-root",
+      state
+    ]
+
+    assert {:ok, setup} = CLI.dispatch(["setup" | common])
+    assert setup.plan.policy.lifecycle == :setup
+    assert [%{name: :bind}, %{name: :populate, passed: 1, failed: 0}] = setup.binding.phases
+
+    assert {:ok, compiled} = CLI.dispatch(["compile" | common])
+    assert compiled.plan.policy.lifecycle == :compile
+    assert Enum.map(compiled.binding.phases, & &1.name) == [:bind, :populate, :execute]
+    assert [%{id: "alpha", status: :passed}] = compiled.results
+    refute File.exists?(Path.join(root, "alpha/deps"))
+    refute File.exists?(Path.join(root, "alpha/_build"))
   end
 
   test "run refuses a source override that does not name an application", context do

@@ -18,19 +18,21 @@ defmodule MixWorkspaceOps.OperationPlan do
     Registry,
     Report,
     Resolution,
+    ResourceBudget,
     Selection,
     StrictJSON
   }
 
   alias MixWorkspaceOps.Project.ProbeMemo
 
-  @schema "mix_workspace_ops.plan/v2"
+  @schema "mix_workspace_ops.plan/v3"
   @policy_version "mix_workspace_ops.command_policy/v1"
   @maximum_bytes 16 * 1024 * 1024
   @top_keys ~w(schema digest registry view selection_digest sets scope dependency_index command policy toolchain units)
   @unit_kinds [:project, :repository]
   @dirty_policies [:require_clean, :allow_recorded]
   @failure_policies [:continue, :fail_fast]
+  @lifecycles [:run, :setup, :compile, :test]
 
   @type plan :: map()
 
@@ -40,6 +42,7 @@ defmodule MixWorkspaceOps.OperationPlan do
   def build(registry, view, command, opts \\ []) do
     with {:ok, normalized} <- normalize_options(command, opts),
          :ok <- portable_command(command),
+         :ok <- lifecycle_command(normalized.lifecycle, command),
          {:ok, normalized, scope, dependency_index} <- prepare_scope(registry, view, normalized),
          {:ok, units} <- units(registry, normalized),
          base <- %{
@@ -131,6 +134,7 @@ defmodule MixWorkspaceOps.OperationPlan do
       unit_kind: Keyword.get(opts, :unit_kind, :project),
       dirty_policy: Keyword.get(opts, :dirty_policy, :require_clean),
       failure_policy: Keyword.get(opts, :failure_policy, :continue),
+      lifecycle: Keyword.get(opts, :lifecycle, :run),
       mode: Keyword.get(opts, :mode, :auto),
       sources: Keyword.get(opts, :sources, %{}),
       mix_env: mix_env,
@@ -151,6 +155,9 @@ defmodule MixWorkspaceOps.OperationPlan do
          true <-
            values.failure_policy in @failure_policies ||
              {:error, {:invalid_failure_policy, values.failure_policy}},
+         true <-
+           values.lifecycle in @lifecycles ||
+             {:error, {:invalid_lifecycle, values.lifecycle}},
          true <- is_map(values.sources) || {:error, :invalid_source_overrides} do
       {:ok, values}
     end
@@ -299,11 +306,21 @@ defmodule MixWorkspaceOps.OperationPlan do
   end
 
   defp repository_states(repositories, registry, dirty_policy) do
-    Enum.reduce_while(repositories, {:ok, []}, fn repository, {:ok, acc} ->
-      case repository_unit(registry, repository, dirty_policy) do
-        {:ok, unit} -> {:cont, {:ok, [unit | acc]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
+    concurrency =
+      ResourceBudget.snapshot()
+      |> ResourceBudget.allocate(:transport, length(repositories))
+      |> Map.fetch!(:workers)
+
+    repositories
+    |> Task.async_stream(&repository_unit(registry, &1, dirty_policy),
+      max_concurrency: concurrency,
+      ordered: true,
+      timeout: :infinity
+    )
+    |> Enum.reduce_while({:ok, []}, fn
+      {:ok, {:ok, unit}}, {:ok, acc} -> {:cont, {:ok, [unit | acc]}}
+      {:ok, {:error, reason}}, _acc -> {:halt, {:error, reason}}
+      {:exit, reason}, _acc -> {:halt, {:error, {:repository_inspection_exit, reason}}}
     end)
     |> reverse_ok()
   end
@@ -322,6 +339,7 @@ defmodule MixWorkspaceOps.OperationPlan do
            status: :absent,
            expected: nil,
            graph_digest: nil,
+           dependencies: [],
            sources: []
          }}
 
@@ -338,6 +356,7 @@ defmodule MixWorkspaceOps.OperationPlan do
              status: :planned,
              expected: expected,
              graph_digest: nil,
+             dependencies: [],
              sources: []
            }}
         end
@@ -371,6 +390,7 @@ defmodule MixWorkspaceOps.OperationPlan do
        status: :absent,
        expected: nil,
        graph_digest: nil,
+       dependencies: [],
        sources: []
      }}
   end
@@ -398,9 +418,21 @@ defmodule MixWorkspaceOps.OperationPlan do
          status: :planned,
          expected: state.expected,
          graph_digest: resolved.closure.digest,
+         dependencies: direct_selected_dependencies(registry, project.id, resolved.closure.edges),
          sources: sources
        }}
     end
+  end
+
+  defp direct_selected_dependencies(registry, project_id, edges) do
+    edges
+    |> Enum.flat_map(fn
+      {^project_id, dependency_id} -> [dependency_id]
+      {_consumer_id, _dependency_id} -> []
+    end)
+    |> Enum.filter(&Registry.selected?(registry, &1))
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
   defp portable_sources(registry, decisions, dirty_policy) do
@@ -503,9 +535,7 @@ defmodule MixWorkspaceOps.OperationPlan do
     }
   end
 
-  defp expected_state(root) do
-    %{head: Git.head!(root), source_digest: Git.source_digest(root), clean: Git.clean?(root)}
-  end
+  defp expected_state(root), do: Git.state(root)
 
   defp acceptable_dirty(_identity, %{clean: true}, _policy), do: :ok
   defp acceptable_dirty(_identity, _expected, :allow_recorded), do: :ok
@@ -519,6 +549,7 @@ defmodule MixWorkspaceOps.OperationPlan do
       unit_kind: opts.unit_kind,
       dirty_state: opts.dirty_policy,
       failure: opts.failure_policy,
+      lifecycle: opts.lifecycle,
       source_mode: opts.mode,
       source_overrides: opts.sources,
       mix_env: opts.mix_env,
@@ -571,6 +602,11 @@ defmodule MixWorkspaceOps.OperationPlan do
          :ok <- validate_dependency_index(decoded["dependency_index"]),
          :ok <- validate_command(decoded["command"]),
          :ok <- validate_policy(decoded["policy"]),
+         :ok <-
+           lifecycle_command(
+             existing_atom(decoded["policy"]["lifecycle"], @lifecycles),
+             command_argv(decoded)
+           ),
          :ok <- validate_toolchain(decoded["toolchain"]),
          :ok <- validate_units(decoded["units"]),
          :ok <- portable_command(command_argv(decoded)),
@@ -727,9 +763,17 @@ defmodule MixWorkspaceOps.OperationPlan do
 
   defp validate_command(_command), do: {:error, :invalid_operation_plan_command}
 
+  defp lifecycle_command(:run, _command), do: :ok
+  defp lifecycle_command(:setup, ["mix", "deps.get"]), do: :ok
+  defp lifecycle_command(:compile, ["mix", "compile"]), do: :ok
+  defp lifecycle_command(:test, ["mix", "test"]), do: :ok
+
+  defp lifecycle_command(lifecycle, command),
+    do: {:error, {:invalid_lifecycle_command, lifecycle, command}}
+
   defp validate_policy(policy) when is_map(policy) do
     keys =
-      ~w(version unit_kind dirty_state failure source_mode source_overrides mix_env mix_target project)
+      ~w(version unit_kind dirty_state failure lifecycle source_mode source_overrides mix_env mix_target project)
 
     with :ok <- exact_keys(policy, keys),
          true <- policy["version"] == @policy_version || {:error, :unsupported_command_policy},
@@ -744,6 +788,7 @@ defmodule MixWorkspaceOps.OperationPlan do
       policy["unit_kind"] in ~w(project repository) and
         policy["dirty_state"] in ~w(require_clean allow_recorded) and
         policy["failure"] in ~w(continue fail_fast) and
+        policy["lifecycle"] in ~w(run setup compile test) and
         policy["source_mode"] in ~w(auto local git hex)
 
     if valid?, do: :ok, else: {:error, :invalid_operation_plan_policy}
@@ -775,22 +820,67 @@ defmodule MixWorkspaceOps.OperationPlan do
              {:error, :invalid_operation_plan_units},
          ids = Enum.map(units, & &1["id"]),
          true <- length(ids) == length(Enum.uniq(ids)) || {:error, :duplicate_operation_units} do
-      :ok
+      validate_dependency_graph(units, ids)
     end
   end
 
   defp validate_units(_units), do: {:error, :invalid_operation_plan_units}
 
+  defp validate_dependency_graph(units, ids) do
+    known = MapSet.new(ids)
+
+    graph =
+      Map.new(units, fn unit ->
+        {unit["id"], MapSet.new(unit["dependencies"])}
+      end)
+
+    cond do
+      Enum.any?(units, fn unit ->
+        dependencies = unit["dependencies"]
+        dependencies != Enum.sort(Enum.uniq(dependencies))
+      end) ->
+        {:error, :noncanonical_operation_plan_dependencies}
+
+      Enum.any?(graph, fn {id, dependencies} ->
+        MapSet.member?(dependencies, id) or not MapSet.subset?(dependencies, known)
+      end) ->
+        {:error, :invalid_operation_plan_dependency}
+
+      acyclic_dependencies?(graph) ->
+        :ok
+
+      true ->
+        {:error, :operation_plan_dependency_cycle}
+    end
+  end
+
+  defp acyclic_dependencies?(graph) when map_size(graph) == 0, do: true
+
+  defp acyclic_dependencies?(graph) do
+    ready = for {id, dependencies} <- graph, MapSet.size(dependencies) == 0, do: id
+
+    if ready == [] do
+      false
+    else
+      removed = MapSet.new(ready)
+
+      graph
+      |> Map.drop(ready)
+      |> Map.new(fn {id, dependencies} -> {id, MapSet.difference(dependencies, removed)} end)
+      |> acyclic_dependencies?()
+    end
+  end
+
   defp validate_unit(%{"kind" => "repository"} = unit) do
     with :ok <-
            exact_keys(
              unit,
-             ~w(id kind identity repository status expected graph_digest sources)
+             ~w(id kind identity repository status expected graph_digest dependencies sources)
            ),
          :ok <- validate_unit_common(unit),
          true <- unit["identity"] == unit["id"] || {:error, :invalid_operation_plan_unit},
          true <-
-           (is_nil(unit["graph_digest"]) and unit["sources"] == []) ||
+           (is_nil(unit["graph_digest"]) and unit["dependencies"] == [] and unit["sources"] == []) ||
              {:error, :invalid_operation_plan_unit} do
       :ok
     end
@@ -800,7 +890,7 @@ defmodule MixWorkspaceOps.OperationPlan do
     with :ok <-
            exact_keys(
              unit,
-             ~w(id kind identity repository project status expected graph_digest sources)
+             ~w(id kind identity repository project status expected graph_digest dependencies sources)
            ),
          :ok <- validate_unit_common(unit),
          true <- unit["identity"] == unit["id"] || {:error, :invalid_operation_plan_unit},
@@ -815,13 +905,14 @@ defmodule MixWorkspaceOps.OperationPlan do
          true <- unit["status"] in ~w(planned absent) || {:error, :invalid_operation_plan_unit},
          :ok <- validate_repository_identity(unit["repository"]),
          :ok <- validate_expected_for_status(unit["status"], unit["expected"]),
+         true <- string_list?(unit["dependencies"]) || {:error, :invalid_operation_plan_unit},
          true <- is_list(unit["sources"]) || {:error, :invalid_operation_plan_unit} do
       :ok
     end
   end
 
   defp validate_project_state(%{"status" => "absent"} = unit) do
-    if is_nil(unit["graph_digest"]) and unit["sources"] == [],
+    if is_nil(unit["graph_digest"]) and unit["dependencies"] == [] and unit["sources"] == [],
       do: :ok,
       else: {:error, :invalid_operation_plan_unit}
   end
@@ -1046,6 +1137,7 @@ defmodule MixWorkspaceOps.OperationPlan do
       unit_kind: existing_atom(field(policy, :unit_kind), @unit_kinds),
       dirty_policy: existing_atom(field(policy, :dirty_state), @dirty_policies),
       failure_policy: existing_atom(field(policy, :failure), @failure_policies),
+      lifecycle: existing_atom(field(policy, :lifecycle), @lifecycles),
       mode: source_mode(field(policy, :source_mode)),
       sources: field(policy, :source_overrides),
       mix_env: field(policy, :mix_env),
@@ -1062,6 +1154,7 @@ defmodule MixWorkspaceOps.OperationPlan do
 
     comparisons = [
       {:failure_policy, field(policy, :failure), Keyword.get(opts, :failure_policy)},
+      {:lifecycle, field(policy, :lifecycle), Keyword.get(opts, :lifecycle)},
       {:dirty_policy, field(policy, :dirty_state), Keyword.get(opts, :dirty_policy)},
       {:unit_kind, field(policy, :unit_kind), Keyword.get(opts, :unit_kind)}
     ]

@@ -12,7 +12,7 @@ defmodule MixWorkspaceOps.Lockfile do
 
   @spec parse_map(binary()) :: {:ok, map()} | {:error, term()}
   def parse_map(bytes) when is_binary(bytes) and byte_size(bytes) <= @maximum_bytes do
-    with {:ok, quoted} <- Code.string_to_quoted(bytes, file: "mix.lock"),
+    with {:ok, quoted} <- Code.string_to_quoted(bytes, file: "mix.lock", emit_warnings: false),
          {:ok, lock} <- literal(quoted),
          true <- is_map(lock) || {:error, {:lock_literal, :root_not_map}} do
       {:ok, lock}
@@ -33,17 +33,21 @@ defmodule MixWorkspaceOps.Lockfile do
   def project_path_apps(bytes, applications) when is_binary(bytes) and is_list(applications) do
     dropped = applications |> Enum.map(&to_string/1) |> MapSet.new()
 
-    if MapSet.size(dropped) == 0 do
-      with {:ok, _lock} <- parse_map(bytes), do: {:ok, bytes}
-    else
-      with {:ok, lock} <- parse_map(bytes) do
-        {:ok, project_lock(lock, dropped)}
-      end
+    with {:ok, lock} <- parse_map(bytes) do
+      {:ok, project_lock(lock, dropped)}
     end
   end
 
   def project_path_apps(bytes, applications),
     do: {:error, {:lock_projection, bytes, applications}}
+
+  @doc "Returns the canonical, warning-free form of a validated lock map."
+  @spec canonicalize(binary()) :: {:ok, binary()} | {:error, term()}
+  def canonicalize(bytes) when is_binary(bytes) do
+    with {:ok, lock} <- parse_map(bytes), do: {:ok, render(lock)}
+  end
+
+  def canonicalize(value), do: {:error, {:lock_bytes, value}}
 
   @doc "Returns a SHA-256 digest after validating that the bytes are a literal lock map."
   @spec digest(binary()) :: {:ok, String.t()} | {:error, term()}

@@ -42,6 +42,17 @@ defmodule MixWorkspaceOps.DependencyIndex do
       selected = Registry.selected_projects(registry)
       selected_ids = Enum.map(selected, & &1.id)
 
+      bound =
+        Enum.filter(selected, &match?({:bound, _}, Registry.checkout(registry, &1.repository)))
+
+      if is_nil(Keyword.get(opts, :dependency_reader)) do
+        Project.prewarm(registry, bound, memo,
+          mix_env: inputs.mix_env,
+          mix_target: inputs.mix_target,
+          dependency_scope: Keyword.get(opts, :dependency_scope, :active)
+        )
+      end
+
       state = %{
         probed: [],
         absent: [],

@@ -28,7 +28,12 @@ defmodule MixWorkspaceOps.Graph do
           application: String.t(),
           classification: :managed | :known_unselected | :external,
           provider: String.t() | nil,
-          candidates: [String.t()]
+          candidates: [String.t()],
+          requirement:
+            nil
+            | %{kind: String.t(), value: String.t()}
+            | %{kind: String.t(), value: String.t(), opts: String.t()},
+          options: map()
         }
 
   @spec resolve(Registry.t(), String.t() | atom(), keyword()) ::
@@ -38,11 +43,18 @@ defmodule MixWorkspaceOps.Graph do
 
     with {:ok, inputs} <- MixInputs.normalize(opts),
          opts = MixInputs.put(opts, inputs),
-         reader = Keyword.get(opts, :dependency_reader, &Project.dependencies(registry, &1, opts)),
-         state = initial_state(),
+         reader =
+           Keyword.get(
+             opts,
+             :dependency_reader,
+             &Project.dependency_declarations(registry, &1, opts)
+           ),
          {:ok, seeds} <- seed_projects(registry, target),
+         state = initial_state(seeds),
          :ok <- require_target_checkout(registry, target),
-         {:ok, final} <- visit_seeds(registry, seeds, reader, state) do
+         {:ok, walked} <- visit_seeds(registry, seeds, reader, state),
+         {:ok, final} <- include_fulfilled_optional(walked),
+         :ok <- validate_acyclic(final.edges) do
       projects = Enum.reverse(final.ordered)
       edges = final.edges |> Enum.uniq() |> Enum.sort()
 
@@ -78,16 +90,34 @@ defmodule MixWorkspaceOps.Graph do
     error in ArgumentError -> {:error, {:registry_target, Exception.message(error)}}
   end
 
-  defp initial_state do
+  defp initial_state(seeds) do
     %{
+      seeds: MapSet.new(seeds, & &1.id),
       visiting: MapSet.new(),
       visited: MapSet.new(),
+      included_applications: initially_included_applications(seeds),
+      optional: [],
       ordered: [],
       edges: [],
       dependency_applications: [],
       external: [],
       known_unselected: []
     }
+  end
+
+  # Mix begins optional convergence with top-level dependency applications, not
+  # the root project's own application. Workspace members are the exception:
+  # Mix treats them as already present (`from_umbrella`) even when one member's
+  # declaration is optional.
+  defp initially_included_applications(seeds) do
+    if Enum.any?(seeds, &(&1.kind == "workspace_root")) do
+      seeds
+      |> Enum.reject(&(&1.kind == "workspace_root"))
+      |> Enum.flat_map(& &1.provides)
+      |> MapSet.new()
+    else
+      MapSet.new()
+    end
   end
 
   # Requirement is the operation's question, not the catalog's. The one
@@ -176,32 +206,177 @@ defmodule MixWorkspaceOps.Graph do
   end
 
   defp visit_dependencies(registry, project, dependencies, reader, state) do
-    Enum.reduce_while(dependencies, {:ok, state}, fn dependency_app, {:ok, current} ->
-      reduce_dependency(registry, project, dependency_app, reader, current)
+    Enum.reduce_while(dependencies, {:ok, state}, fn dependency, {:ok, current} ->
+      {dependency_app, requirement, options} = dependency_declaration(dependency)
+      reduce_dependency(registry, project, dependency_app, requirement, options, reader, current)
     end)
   end
+
+  defp dependency_declaration(%{application: app, requirement: requirement, options: options}),
+    do: {app, requirement, options}
+
+  defp dependency_declaration(app) when is_binary(app), do: {app, nil, %{}}
 
   # A dependency resolves through the declaring project's own dependency-source
   # table, so a declared `provider` selects among several catalogued providers
   # instead of the closure refusing an ambiguity the catalog already answered.
-  defp reduce_dependency(registry, project, dependency_app, reader, current) do
+  defp reduce_dependency(
+         registry,
+         project,
+         dependency_app,
+         requirement,
+         options,
+         reader,
+         current
+       ) do
+    if optional_transitive?(project, options, current) do
+      defer_optional(registry, project, dependency_app, requirement, options, current)
+    else
+      reduce_required_dependency(
+        registry,
+        project,
+        dependency_app,
+        requirement,
+        options,
+        reader,
+        current
+      )
+    end
+  end
+
+  defp reduce_required_dependency(
+         registry,
+         project,
+         dependency_app,
+         requirement,
+         options,
+         reader,
+         current
+       ) do
     case Map.fetch(Registry.dependency_sources(registry, project), dependency_app) do
       {:ok, declaration} ->
         reduce_declared_dependency(
           registry,
           project,
           dependency_app,
+          requirement,
+          options,
           declaration.provider,
           reader,
           current
         )
 
       :error ->
-        reduce_undeclared_dependency(registry, project, dependency_app, reader, current)
+        reduce_undeclared_dependency(
+          registry,
+          project,
+          dependency_app,
+          requirement,
+          options,
+          reader,
+          current
+        )
     end
   end
 
-  defp reduce_undeclared_dependency(registry, project, dependency_app, reader, current) do
+  defp optional_transitive?(project, options, state),
+    do: options["optional"] == true and not MapSet.member?(state.seeds, project.id)
+
+  defp defer_optional(registry, project, dependency_app, requirement, options, current) do
+    optional = optional_dependency(registry, project, dependency_app, requirement, options)
+    {:cont, {:ok, %{current | optional: [optional | current.optional]}}}
+  end
+
+  defp optional_dependency(registry, project, dependency_app, requirement, options) do
+    declaration = Map.get(Registry.dependency_sources(registry, project), dependency_app)
+    provider = if declaration, do: declaration.provider, else: nil
+
+    resolution =
+      if declaration ||
+           Enum.any?(
+             Registry.providers(registry, dependency_app),
+             &(&1.repository == project.repository)
+           ) do
+        Registry.resolve_dependency(registry, dependency_app, provider, project.repository)
+      else
+        :unknown
+      end
+
+    case resolution do
+      {:ok, dependency} ->
+        %{
+          edge: {project.id, dependency.id},
+          application:
+            dependency_application(
+              project,
+              dependency_app,
+              requirement,
+              options,
+              :managed,
+              dependency.id,
+              []
+            ),
+          external: nil,
+          known_unselected: nil
+        }
+
+      {:known_unselected, candidates} ->
+        %{
+          edge: nil,
+          application:
+            dependency_application(
+              project,
+              dependency_app,
+              requirement,
+              options,
+              :known_unselected,
+              List.first(candidates),
+              candidates
+            ),
+          external: nil,
+          known_unselected: {project.id, dependency_app, candidates}
+        }
+
+      {:error, reason} ->
+        %{
+          application_name: dependency_app,
+          error: optional_resolution_error(reason, project.id)
+        }
+
+      :unknown ->
+        %{
+          edge: nil,
+          application:
+            dependency_application(
+              project,
+              dependency_app,
+              requirement,
+              options,
+              :external,
+              nil,
+              []
+            ),
+          external: {project.id, dependency_app},
+          known_unselected: nil
+        }
+    end
+  end
+
+  defp optional_resolution_error({:ambiguous_application, app, candidates}, consumer),
+    do: {:ambiguous_application, app, candidates, consumer}
+
+  defp optional_resolution_error(reason, consumer),
+    do: {:dependency_provider, consumer, reason}
+
+  defp reduce_undeclared_dependency(
+         registry,
+         project,
+         dependency_app,
+         requirement,
+         options,
+         reader,
+         current
+       ) do
     if Enum.any?(
          Registry.providers(registry, dependency_app),
          &(&1.repository == project.repository)
@@ -210,12 +385,14 @@ defmodule MixWorkspaceOps.Graph do
         registry,
         project,
         dependency_app,
+        requirement,
+        options,
         nil,
         reader,
         current
       )
     else
-      reduce_external_dependency(project, dependency_app, current)
+      reduce_external_dependency(project, dependency_app, requirement, options, current)
     end
   end
 
@@ -223,6 +400,8 @@ defmodule MixWorkspaceOps.Graph do
          registry,
          project,
          dependency_app,
+         requirement,
+         options,
          provider,
          reader,
          current
@@ -233,13 +412,22 @@ defmodule MixWorkspaceOps.Graph do
           registry,
           project,
           dependency_app,
+          requirement,
+          options,
           dependency,
           reader,
           current
         )
 
       {:known_unselected, candidates} ->
-        reduce_known_unselected(project, dependency_app, candidates, current)
+        reduce_known_unselected(
+          project,
+          dependency_app,
+          requirement,
+          options,
+          candidates,
+          current
+        )
 
       {:error, {:ambiguous_application, app, candidates}} ->
         {:halt, {:error, {:ambiguous_application, app, candidates, project.id}}}
@@ -248,7 +436,7 @@ defmodule MixWorkspaceOps.Graph do
         {:halt, {:error, {:dependency_provider, project.id, reason}}}
 
       :unknown ->
-        reduce_external_dependency(project, dependency_app, current)
+        reduce_external_dependency(project, dependency_app, requirement, options, current)
     end
   end
 
@@ -256,16 +444,27 @@ defmodule MixWorkspaceOps.Graph do
          registry,
          project,
          dependency_app,
+         requirement,
+         options,
          dependency,
          reader,
          current
        ) do
     application =
-      dependency_application(project, dependency_app, :managed, dependency.id, [])
+      dependency_application(
+        project,
+        dependency_app,
+        requirement,
+        options,
+        :managed,
+        dependency.id,
+        []
+      )
 
     current = %{
       current
       | edges: [{project.id, dependency.id} | current.edges],
+        included_applications: MapSet.put(current.included_applications, dependency_app),
         dependency_applications: [application | current.dependency_applications]
     }
 
@@ -275,12 +474,14 @@ defmodule MixWorkspaceOps.Graph do
     end
   end
 
-  defp reduce_external_dependency(project, dependency_app, current) do
-    application = dependency_application(project, dependency_app, :external, nil, [])
+  defp reduce_external_dependency(project, dependency_app, requirement, options, current) do
+    application =
+      dependency_application(project, dependency_app, requirement, options, :external, nil, [])
 
     next = %{
       current
       | external: [{project.id, dependency_app} | current.external],
+        included_applications: MapSet.put(current.included_applications, dependency_app),
         dependency_applications: [application | current.dependency_applications]
     }
 
@@ -291,13 +492,22 @@ defmodule MixWorkspaceOps.Graph do
   # reported under its own classification and never joins the external packages,
   # which is what makes a known internal dependency impossible to mistake for a
   # Hex package.
-  defp reduce_known_unselected(project, dependency_app, candidates, current) do
+  defp reduce_known_unselected(
+         project,
+         dependency_app,
+         requirement,
+         options,
+         candidates,
+         current
+       ) do
     entry = {project.id, dependency_app, candidates}
 
     application =
       dependency_application(
         project,
         dependency_app,
+        requirement,
+        options,
         :known_unselected,
         List.first(candidates),
         candidates
@@ -306,20 +516,112 @@ defmodule MixWorkspaceOps.Graph do
     next = %{
       current
       | known_unselected: [entry | current.known_unselected],
+        included_applications: MapSet.put(current.included_applications, dependency_app),
         dependency_applications: [application | current.dependency_applications]
     }
 
     {:cont, {:ok, next}}
   end
 
-  defp dependency_application(project, application, classification, provider, candidates) do
+  defp dependency_application(
+         project,
+         application,
+         requirement,
+         options,
+         classification,
+         provider,
+         candidates
+       ) do
     %{
       consumer: project.id,
       application: application,
+      requirement: requirement,
+      options: options,
       classification: classification,
       provider: provider,
       candidates: candidates
     }
+  end
+
+  # Mix includes an optional dependency declared by the root itself. An
+  # optional dependency declared by a transitive project is effective only when
+  # another active path already brings that application into the converged
+  # dependency set. Applying the generated root projection before this pruning
+  # would otherwise turn every transitive optional dependency into a required
+  # top-level dependency.
+  defp include_fulfilled_optional(state) do
+    state.optional
+    |> Enum.reverse()
+    |> Enum.reduce_while({:ok, state}, fn optional, {:ok, current} ->
+      cond do
+        Map.has_key?(optional, :error) and
+            MapSet.member?(current.included_applications, optional.application_name) ->
+          {:halt, {:error, optional.error}}
+
+        Map.has_key?(optional, :error) ->
+          # An ambiguity in an unfulfilled optional dependency cannot affect the
+          # operation. It becomes relevant only if another path selects it.
+          {:cont, {:ok, current}}
+
+        MapSet.member?(current.included_applications, optional.application.application) ->
+          {:cont,
+           {:ok,
+            %{
+              current
+              | edges: put_optional_edge(optional.edge, current.visited, current.edges),
+                dependency_applications: [
+                  optional.application | current.dependency_applications
+                ],
+                external: put_optional(optional.external, current.external),
+                known_unselected:
+                  put_optional(optional.known_unselected, current.known_unselected)
+            }}}
+
+        true ->
+          {:cont, {:ok, current}}
+      end
+    end)
+  end
+
+  defp put_optional(nil, values), do: values
+  defp put_optional(value, values), do: [value | values]
+
+  defp put_optional_edge(nil, _visited, edges), do: edges
+
+  defp put_optional_edge({_consumer, dependency} = edge, visited, edges) do
+    if MapSet.member?(visited, dependency), do: [edge | edges], else: edges
+  end
+
+  defp validate_acyclic(edges) do
+    graph =
+      Enum.reduce(edges, %{}, fn {consumer, dependency}, graph ->
+        graph
+        |> Map.update(consumer, MapSet.new([dependency]), &MapSet.put(&1, dependency))
+        |> Map.put_new(dependency, MapSet.new())
+      end)
+
+    remove_acyclic(graph)
+  end
+
+  defp remove_acyclic(graph) when map_size(graph) == 0, do: :ok
+
+  defp remove_acyclic(graph) do
+    leaves = for {project, dependencies} <- graph, MapSet.size(dependencies) == 0, do: project
+
+    case leaves do
+      [] ->
+        {:error, {:dependency_cycle, graph |> Map.keys() |> Enum.sort() |> hd()}}
+
+      _present ->
+        removed = MapSet.new(leaves)
+
+        graph
+        |> Map.drop(leaves)
+        |> Map.new(fn {project, dependencies} ->
+          {project, MapSet.difference(dependencies, removed)}
+        end)
+        |> remove_acyclic()
+    end
   end
 
   defp digest(projects, edges, dependency_applications, external, known_unselected, inputs) do
@@ -333,6 +635,8 @@ defmodule MixWorkspaceOps.Graph do
           %{
             consumer: dependency.consumer,
             application: dependency.application,
+            requirement: dependency.requirement,
+            options: dependency.options,
             classification: Atom.to_string(dependency.classification),
             provider: dependency.provider,
             candidates: dependency.candidates

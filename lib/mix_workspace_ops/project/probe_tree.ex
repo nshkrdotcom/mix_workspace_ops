@@ -3,7 +3,7 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
   A disposable source tree for evaluating one Mix project.
 
   The whole Git worktree is staged so subprojects may read repository-relative
-  source, including dirty and untracked files. Build output, fetched
+  source, including dirty, untracked, and ignored files. Build output, fetched
   dependencies, Git metadata, operator state, and common credential files are
   excluded. Symlinks are reproduced only when they remain inside the staged
   source surface.
@@ -12,7 +12,7 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
   alias MixWorkspaceOps.Command
 
   @excluded_directories ~w(.git _build deps .mix_workspace_ops .hex .mix .ssh .aws .config .codex)
-  @excluded_files ~w(.env credentials)
+  @excluded_files ~w(.dependency_sources.local.exs .env credentials)
   @excluded_extensions ~w(.key .pem)
   @temporary_attempts 10
 
@@ -28,6 +28,7 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
   @spec stage(String.t()) :: {:ok, t()} | {:error, term()}
   def stage(project_root) do
     project_root = Path.expand(project_root)
+
     source_root = source_root(project_root)
     relative_project = Path.relative_to(project_root, source_root)
 
@@ -68,20 +69,73 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
     :ok
   end
 
-  defp source_root(project_root) do
-    environment = [
-      {"PATH", System.get_env("PATH") || "/usr/bin:/bin"},
-      {"LANG", System.get_env("LANG") || "C"}
-    ]
+  @doc false
+  @spec for_project(t(), String.t()) :: {:ok, t()} | {:error, term()}
+  def for_project(%__MODULE__{} = stage, relative_project) when is_binary(relative_project) do
+    source = Path.join(stage.root, "source")
+    project_root = Path.expand(relative_project, source)
 
+    cond do
+      not inside?(project_root, source) ->
+        {:error, :probe_project_outside_source}
+
+      not File.regular?(Path.join(project_root, "mix.exs")) ->
+        {:error, {:missing_staged_mix_exs, project_root}}
+
+      true ->
+        {:ok, %{stage | project_root: project_root}}
+    end
+  end
+
+  defp source_root(project_root) do
     case Command.run("git", ["rev-parse", "--show-toplevel"],
            cd: project_root,
            replace_env: true,
-           env: environment
+           env: git_environment()
          ) do
       {:ok, result} -> String.trim(result.output)
       {:error, _result} -> project_root
     end
+  end
+
+  @doc false
+  @spec extended_source?(String.t()) :: {:ok, boolean()} | {:error, term()}
+  def extended_source?(root) do
+    case Command.run(
+           "git",
+           [
+             "ls-files",
+             "--others",
+             "--ignored",
+             "--exclude-standard",
+             "--directory",
+             "-z",
+             "--"
+             | ignored_source_pathspecs()
+           ],
+           cd: root,
+           replace_env: true,
+           env: git_environment()
+         ) do
+      {:ok, result} ->
+        extended? =
+          result.output
+          |> :binary.split(<<0>>, [:global, :trim_all])
+          |> Enum.map(&String.trim_trailing(&1, "/"))
+          |> Enum.any?(&source_path?/1)
+
+        {:ok, extended?}
+
+      {:error, result} ->
+        {:error, {:probe_ignored_files, result.exit_code, result.output}}
+    end
+  end
+
+  defp git_environment do
+    [
+      {"PATH", System.get_env("PATH") || "/usr/bin:/bin"},
+      {"LANG", System.get_env("LANG") || "C"}
+    ]
   end
 
   defp temporary_root(attempts \\ @temporary_attempts)
@@ -144,9 +198,7 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
        ) do
     relative = source |> Path.join(name) |> Path.relative_to(source_root)
 
-    if excluded?(relative) do
-      {:cont, {:ok, parts}}
-    else
+    if source_path?(relative) do
       result =
         copy_entry(
           Path.join(source, name),
@@ -158,6 +210,8 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
         )
 
       continue_copy(result)
+    else
+      {:cont, {:ok, parts}}
     end
   end
 
@@ -218,20 +272,39 @@ defmodule MixWorkspaceOps.Project.ProbeTree do
   end
 
   defp included_symlink(target_relative, relative) do
-    if excluded?(target_relative),
-      do: {:error, {:excluded_probe_symlink, relative}},
-      else: :ok
+    if source_path?(target_relative),
+      do: :ok,
+      else: {:error, {:excluded_probe_symlink, relative}}
   end
 
-  defp excluded?(relative) do
+  @doc false
+  @spec source_path?(String.t()) :: boolean()
+  def source_path?(relative) do
     basename = Path.basename(relative)
     segments = Path.split(relative)
 
-    Enum.any?(segments, &(&1 in @excluded_directories)) or
-      basename in @excluded_files or
-      String.starts_with?(basename, ".env.") or
-      String.starts_with?(basename, "credentials.") or
-      Path.extname(basename) in @excluded_extensions
+    not (Enum.any?(segments, &(&1 in @excluded_directories)) or
+           basename in @excluded_files or
+           String.starts_with?(basename, ".env.") or
+           String.starts_with?(basename, "credentials.") or
+           Path.extname(basename) in @excluded_extensions)
+  end
+
+  @doc false
+  @spec ignored_source_pathspecs() :: [String.t()]
+  def ignored_source_pathspecs do
+    directory_exclusions =
+      Enum.map(@excluded_directories, &":(glob,exclude)**/#{&1}/**")
+
+    file_exclusions =
+      Enum.map(@excluded_files, &":(glob,exclude)**/#{&1}") ++
+        [
+          ":(glob,exclude)**/.env.*",
+          ":(glob,exclude)**/credentials.*"
+        ] ++
+        Enum.map(@excluded_extensions, &":(glob,exclude)**/*#{&1}")
+
+    ["." | directory_exclusions ++ file_exclusions]
   end
 
   defp permissions(mode), do: Bitwise.band(mode, 0o7777)

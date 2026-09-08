@@ -70,7 +70,7 @@ defmodule MixWorkspaceOps.OverlayTest do
     root = temporary_directory!(context)
     state_root = Path.join(root, "operator-state")
     initialize_repository!(Path.join(root, "core"))
-    consumer = initialize_repository!(Path.join(root, "consumer"), ~s([{:core, "~> 1.0"}]))
+    consumer = initialize_repository!(Path.join(root, "consumer"), ~s([{:core, "~> 0.1"}]))
 
     checksum = String.duplicate("f", 64)
 
@@ -85,7 +85,7 @@ defmodule MixWorkspaceOps.OverlayTest do
                prepare_objects: true
              )
 
-    assert activation.report.runtime.cache_objects == %{git: []}
+    assert activation.report.runtime.cache_objects == %{hex: [], git: []}
     refute File.exists?(Path.join([state_root, "cache", "hex", "objects"]))
 
     changed_checksum = String.duplicate("e", 64)
@@ -173,7 +173,7 @@ defmodule MixWorkspaceOps.OverlayTest do
     assert dirty.report.context_digest == first.report.context_digest
     assert dirty.report.runtime.deps_path == first.report.runtime.deps_path
     assert dirty.report.runtime.build_path == first.report.runtime.build_path
-    assert dirty.report.runtime.cache_objects == %{git: []}
+    assert dirty.report.runtime.cache_objects == %{hex: [], git: []}
 
     assert {:ok, git} = Overlay.activate(registry, "consumer", mode: :git, state_root: state_root)
     refute git.path == first.path
@@ -403,7 +403,8 @@ defmodule MixWorkspaceOps.OverlayTest do
                stderr_to_stdout: true
              )
 
-    assert bootstrap_output =~ ~s|{:core, [github: "example-org/core", branch: "main"]}|
+    assert bootstrap_output =~
+             ~s|{:core, "~> 1.0", [github: "example-org/core", branch: "main"]}|
 
     assert {:error, {:known_unselected_local, "core", ["core"]}} =
              MixWorkspaceOps.Resolution.resolve(selected, "consumer", mode: "local")

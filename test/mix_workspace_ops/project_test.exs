@@ -130,6 +130,24 @@ defmodule MixWorkspaceOps.ProjectTest do
 
     assert active.dependencies == ["always", "dev_only", "dynamic_dev"]
 
+    assert active.dependency_declarations == [
+             %{
+               application: "always",
+               requirement: %{kind: "string", value: "~> 1.0"},
+               options: %{}
+             },
+             %{
+               application: "dev_only",
+               requirement: %{kind: "string", value: "~> 1.0"},
+               options: %{"only" => ["dev"]}
+             },
+             %{
+               application: "dynamic_dev",
+               requirement: %{kind: "string", value: "~> 1.0"},
+               options: %{}
+             }
+           ]
+
     assert {:ok, all} =
              Project.metadata_at(repository, mix_env: "dev", dependency_scope: :all)
 
@@ -142,6 +160,67 @@ defmodule MixWorkspaceOps.ProjectTest do
              )
 
     assert test_only.dependencies == ["always", "dynamic_dev", "test_only"]
+  end
+
+  test "nil scope options retain ordinary always-active dependency semantics", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "nil_scope"))
+
+    File.write!(Path.join(repository, "mix.exs"), """
+    defmodule NilScope.MixProject do
+      use Mix.Project
+
+      def project do
+        [
+          app: :nil_scope,
+          version: "0.1.0",
+          deps: [{:always, "~> 1.0", only: nil, targets: nil}]
+        ]
+      end
+    end
+    """)
+
+    assert {:ok, metadata} = Project.metadata_at(repository, mix_env: "dev")
+
+    assert metadata.dependency_declarations == [
+             %{
+               application: "always",
+               requirement: %{kind: "string", value: "~> 1.0"},
+               options: %{}
+             }
+           ]
+  end
+
+  test "custom deps.get aliases make dependency contexts source-specific", context do
+    root = temporary_directory!(context)
+
+    fingerprints =
+      for {name, alias_body} <- [{"alpha", "compile"}, {"beta", "loadpaths"}] do
+        repository = initialize_repository!(Path.join(root, name))
+
+        File.write!(Path.join(repository, "mix.exs"), """
+        defmodule #{String.capitalize(name)}.MixProject do
+          use Mix.Project
+
+          def project do
+            [
+              app: :#{name},
+              version: "0.1.0",
+              deps: [{:jason, "~> 1.4"}],
+              aliases: ["deps.get": "#{alias_body}"]
+            ]
+          end
+        end
+        """)
+
+        git_ok!(repository, ["add", "mix.exs"])
+        git_ok!(repository, ["commit", "--quiet", "-m", "custom dependency setup"])
+        assert {:ok, metadata} = Project.metadata_at(repository)
+        metadata.dependency_fingerprint
+      end
+
+    assert [first, second] = fingerprints
+    refute first == second
   end
 
   test "a later invocation owns no answers from the earlier one", context do
@@ -203,6 +282,78 @@ defmodule MixWorkspaceOps.ProjectTest do
              |> Enum.sort()
 
     assert File.read!(counter) == "x"
+  end
+
+  test "projects sharing one staged repository keep private probe state", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "mono"))
+    counter = Path.join(root, "probe-homes")
+
+    for app <- ~w(alpha beta) do
+      project = Path.join([repository, "apps", app])
+      File.mkdir_p!(project)
+
+      File.write!(Path.join(project, "mix.exs"), """
+      File.write!(#{inspect(counter)}, System.fetch_env!("MIX_HOME") <> "\\n", [:append])
+
+      defmodule #{String.capitalize(app)}.MixProject do
+        use Mix.Project
+        def project, do: [app: :#{app}, version: "0.1.0", deps: []]
+      end
+      """)
+    end
+
+    git_ok!(repository, ["add", "apps"])
+    git_ok!(repository, ["commit", "--quiet", "-m", "add projects"])
+
+    catalog =
+      write_catalog!(root, [
+        catalog_repository("mono",
+          projects: [
+            catalog_project("alpha", path: "apps/alpha"),
+            catalog_project("beta", path: "apps/beta")
+          ]
+        )
+      ])
+
+    {:ok, registry} = MixWorkspaceOps.Registry.load(catalog)
+    registry = bind!(registry, root)
+    projects = Enum.map(~w(alpha beta), &registry.projects[&1])
+
+    assert results = Project.prewarm(registry, projects, ProbeMemo.new(), max_concurrency: 2)
+    assert Enum.all?(results, &match?({_id, {:ok, _metadata}}, &1))
+
+    homes = counter |> File.read!() |> String.split("\n", trim: true)
+    assert length(homes) == 2
+    assert length(Enum.uniq(homes)) == 2
+  end
+
+  test "prewarm retains one exact ignored-source snapshot for later invocation reads", context do
+    root = temporary_directory!(context)
+    repository = initialize_repository!(Path.join(root, "alpha"))
+    File.write!(Path.join(repository, ".gitignore"), "version.txt\n")
+
+    File.write!(Path.join(repository, "mix.exs"), """
+    defmodule Alpha.MixProject do
+      use Mix.Project
+      def project, do: [app: :alpha, version: File.read!("version.txt"), deps: []]
+    end
+    """)
+
+    git_ok!(repository, ["add", ".gitignore", "mix.exs"])
+    git_ok!(repository, ["commit", "--quiet", "-m", "read ignored source"])
+    File.write!(Path.join(repository, "version.txt"), "0.1.0")
+
+    registry = load_fixture_registry!(root)
+    project = registry.projects["alpha"]
+    memo = ProbeMemo.new()
+
+    assert [{"alpha", {:ok, %{version: "0.1.0"}}}] =
+             Project.prewarm(registry, [project], memo, max_concurrency: 1)
+
+    File.rm!(Path.join(repository, "version.txt"))
+    assert {:ok, %{version: "0.1.0"}} = Project.metadata(registry, project, probe_memo: memo)
+    assert ProbeMemo.stats(memo).memory_hits == 1
   end
 
   describe "declared_version/1" do

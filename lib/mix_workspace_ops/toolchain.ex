@@ -12,6 +12,17 @@ defmodule MixWorkspaceOps.Toolchain do
     if File.regular?(candidate), do: candidate, else: System.find_executable(name) || name
   end
 
+  @doc false
+  @spec path() :: String.t()
+  def path do
+    elixir_bin = executable("elixir") |> Path.dirname()
+    erlang_bin = :code.root_dir() |> to_string() |> Path.join("bin")
+
+    [elixir_bin, erlang_bin, System.get_env("PATH")]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.join(":")
+  end
+
   defp elixir_executable do
     case :persistent_term.get(@cache_key, nil) do
       nil -> cache_elixir_executable()

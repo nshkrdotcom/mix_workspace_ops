@@ -125,23 +125,28 @@ defmodule MixWorkspaceOps.ResourceBudget do
   end
 
   defp read_memory do
-    with {:ok, bytes} <- File.read("/proc/meminfo") do
-      values =
-        bytes
-        |> String.split("\n", trim: true)
-        |> Enum.reduce(%{}, fn line, acc ->
-          case Regex.run(~r/^(MemTotal|MemAvailable):\s+(\d+)\s+kB$/, line) do
-            [_, key, value] -> Map.put(acc, key, String.to_integer(value) * 1024)
-            _other -> acc
-          end
-        end)
+    case File.read("/proc/meminfo") do
+      {:ok, bytes} -> memory_values(bytes)
+      {:error, _reason} -> %{memory_total: nil, memory_available: nil}
+    end
+  end
 
-      %{
-        memory_total: Map.get(values, "MemTotal"),
-        memory_available: Map.get(values, "MemAvailable")
-      }
-    else
-      _unavailable -> %{memory_total: nil, memory_available: nil}
+  defp memory_values(bytes) do
+    values =
+      bytes
+      |> String.split("\n", trim: true)
+      |> Enum.reduce(%{}, &put_memory_value/2)
+
+    %{
+      memory_total: Map.get(values, "MemTotal"),
+      memory_available: Map.get(values, "MemAvailable")
+    }
+  end
+
+  defp put_memory_value(line, values) do
+    case Regex.run(~r/^(MemTotal|MemAvailable):\s+(\d+)\s+kB$/, line) do
+      [_, key, value] -> Map.put(values, key, String.to_integer(value) * 1024)
+      _other -> values
     end
   end
 end

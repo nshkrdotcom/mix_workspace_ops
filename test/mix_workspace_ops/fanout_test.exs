@@ -59,6 +59,10 @@ defmodule MixWorkspaceOps.FanoutTest do
              {"beta", :passed}
            ]
 
+    assert File.regular?(report.detail_path)
+    assert report.results |> Enum.map(& &1.output_path) |> Enum.uniq() |> length() == 2
+    assert Enum.all?(report.results, &File.regular?(&1.output_path))
+
     assert Enum.map(report.binding.units, & &1.id) == ["alpha", "beta"]
 
     for unit <- report.binding.units do
@@ -121,6 +125,37 @@ defmodule MixWorkspaceOps.FanoutTest do
     refute Enum.any?(state.runs, & &1.leased)
   end
 
+  test "a failed project blocks only its declared dependants", context do
+    fixture = dependency_fixture(context)
+
+    command = [
+      "sh",
+      "-c",
+      "case \"$(basename \"$PWD\")\" in alpha) exit 7;; beta) touch wrongly-ran;; gamma) touch independent;; esac"
+    ]
+
+    assert {:ok, plan} = OperationPlan.build(fixture.registry, fixture.view, command)
+    assert Enum.find(plan.units, &(&1.id == "beta")).dependencies == ["alpha"]
+
+    assert {:error, {:fanout_failed, report}} =
+             Fanout.run(plan, fixture.registry,
+               state_root: fixture.state_root,
+               max_concurrency: 3
+             )
+
+    assert Enum.map(report.results, &{&1.id, &1.status}) == [
+             {"alpha", :failed},
+             {"beta", :blocked},
+             {"gamma", :passed}
+           ]
+
+    refute File.exists?(Path.join(fixture.beta, "wrongly-ran"))
+    assert File.exists?(Path.join(fixture.gamma, "independent"))
+
+    assert [%{kind: :command, affected_units: ["alpha", "beta"]} = cause] = report.causes
+    assert Enum.find(report.results, &(&1.id == "beta")).failure.cause == cause.id
+  end
+
   test "repository units include no-Mix and absent repositories", context do
     root = temporary_directory!(context)
     plain = initialize_repository!(Path.join(root, "plain"))
@@ -174,12 +209,15 @@ defmodule MixWorkspaceOps.FanoutTest do
     assert {:ok, absent_plan} =
              OperationPlan.build(absent_registry, absent_view, ["true"], unit_kind: :repository)
 
+    absent_state = Path.join(root, "absent-state")
+
     assert {:ok, absent_report} =
-             Fanout.run(absent_plan, absent_registry, state_root: Path.join(root, "absent-state"))
+             Fanout.run(absent_plan, absent_registry, state_root: absent_state)
 
     assert absent_report.status == :passed
     assert absent_report.binding.units == []
     assert absent_report.results == [%{id: "missing", status: :absent}]
+    assert {:ok, %{reports: [%{complete: true, active: false}]}} = Runtime.list(absent_state)
   end
 
   test "repository commands reuse one unchanged exact runtime context", context do
@@ -280,6 +318,14 @@ defmodule MixWorkspaceOps.FanoutTest do
   test "an explicit child scheduler budget reaches every command", context do
     fixture = project_fixture(context)
     assert {:ok, plan} = OperationPlan.build(fixture.registry, fixture.view, ["true"])
+    previous = System.get_env("ERL_AFLAGS")
+    System.put_env("ERL_AFLAGS", "+S 99:99")
+
+    on_exit(fn ->
+      if previous,
+        do: System.put_env("ERL_AFLAGS", previous),
+        else: System.delete_env("ERL_AFLAGS")
+    end)
 
     assert {:ok, report} =
              Fanout.run(plan, fixture.registry,
@@ -292,7 +338,7 @@ defmodule MixWorkspaceOps.FanoutTest do
 
     for unit <- report.binding.units do
       assert %{value: value} = Enum.find(unit.command.env, &(&1.name == "ERL_AFLAGS"))
-      assert value =~ "+S 3:3"
+      assert value == "+S 3:3"
     end
   end
 
@@ -319,7 +365,198 @@ defmodule MixWorkspaceOps.FanoutTest do
     refute report.binding.resource_budget.worker_override
   end
 
-  test "a partial binding failure finalizes every lease already allocated", context do
+  test "setup populates one representative per exact dependency context", context do
+    fixture = project_fixture(context)
+
+    assert {:ok, plan} =
+             OperationPlan.build(fixture.registry, fixture.view, ["mix", "deps.get"],
+               lifecycle: :setup
+             )
+
+    assert {:ok, report} =
+             Fanout.run(plan, fixture.registry,
+               state_root: fixture.state_root,
+               resource_snapshot: %{
+                 logical_schedulers: 24,
+                 load_one: 0.0,
+                 memory_total: 160 * 1024 * 1024 * 1024,
+                 memory_available: 155 * 1024 * 1024 * 1024
+               }
+             )
+
+    assert [
+             %{name: :bind, passed: 2, failed: 0},
+             %{name: :populate, contexts: 1, passed: 1, failed: 0, budget: budget}
+           ] =
+             report.binding.phases
+
+    assert budget.workers == 1
+    assert budget.beam_schedulers == 1
+
+    assert Enum.map(report.results, &{&1.id, &1.status}) == [
+             {"alpha", :passed},
+             {"beta", :passed}
+           ]
+
+    assert File.regular?(report.detail_path)
+    assert report.results |> Enum.map(& &1.output_path) |> Enum.uniq() |> length() == 1
+    assert Enum.all?(report.results, &File.regular?(&1.output_path))
+
+    working_locks = Enum.map(report.binding.units, & &1.runtime.lockfile)
+    assert working_locks |> Enum.map(&File.read!/1) |> Enum.uniq() |> length() == 1
+    assert Enum.all?(working_locks, &(File.stat!(&1).mode |> Bitwise.band(0o777) == 0o600))
+  end
+
+  test "compile completes population before starting project work", context do
+    fixture = project_fixture(context)
+
+    assert {:ok, plan} =
+             OperationPlan.build(fixture.registry, fixture.view, ["mix", "compile"],
+               lifecycle: :compile
+             )
+
+    assert {:ok, report} =
+             Fanout.run(plan, fixture.registry,
+               state_root: fixture.state_root,
+               max_concurrency: 2,
+               timeout: 10_000
+             )
+
+    assert [bind, populate, execute] = report.binding.phases
+    assert bind.name == :bind
+    assert populate.name == :populate
+    assert populate.contexts == 1
+    assert populate.failed == 0
+    assert execute.name == :execute
+    assert execute.units == 2
+    assert Enum.all?(report.results, &(&1.status == :passed))
+    assert Enum.all?(report.results, &File.regular?(&1.output_path))
+    assert Enum.all?(report.binding.units, &File.regular?(&1.command.output_path))
+  end
+
+  test "a failed dependency context does not stop an independent compile", context do
+    fixture = project_fixture(context)
+
+    File.write!(Path.join(fixture.alpha, "mix.exs"), """
+    defmodule Alpha.MixProject do
+      use Mix.Project
+      def project,
+        do: [app: :alpha, version: "0.1.0", deps: [{:missing, git: "file:///definitely/missing"}]]
+    end
+    """)
+
+    git!(fixture.alpha, ["add", "mix.exs"])
+    git!(fixture.alpha, ["commit", "--quiet", "-m", "add unavailable dependency"])
+
+    assert {:ok, plan} =
+             OperationPlan.build(fixture.registry, fixture.view, ["mix", "compile"],
+               lifecycle: :compile
+             )
+
+    assert {:error, {:fanout_failed, report}} =
+             Fanout.run(plan, fixture.registry,
+               state_root: fixture.state_root,
+               max_concurrency: 2,
+               timeout: 10_000
+             )
+
+    assert Enum.map(report.results, &{&1.id, &1.status}) == [
+             {"alpha", :failed},
+             {"beta", :passed}
+           ]
+
+    assert [
+             %{name: :bind, failed: 0},
+             %{name: :populate, failed: 1},
+             %{name: :execute, units: 1}
+           ] =
+             report.binding.phases
+
+    assert [%{kind: :dependency_context, affected_units: ["alpha"]} = cause] = report.causes
+    assert cause.log_paths |> Enum.all?(&File.regular?/1)
+    assert Enum.find(report.results, &(&1.id == "alpha")).cause == cause.id
+  end
+
+  test "fail-fast never compiles after any dependency context fails", context do
+    fixture = project_fixture(context)
+
+    File.write!(Path.join(fixture.alpha, "mix.exs"), """
+    defmodule Alpha.MixProject do
+      use Mix.Project
+      def project,
+        do: [app: :alpha, version: "0.1.0", deps: [{:missing, git: "file:///definitely/missing"}]]
+    end
+    """)
+
+    git!(fixture.alpha, ["add", "mix.exs"])
+    git!(fixture.alpha, ["commit", "--quiet", "-m", "add unavailable dependency"])
+
+    assert {:ok, plan} =
+             OperationPlan.build(fixture.registry, fixture.view, ["mix", "compile"],
+               failure_policy: :fail_fast,
+               lifecycle: :compile
+             )
+
+    assert {:error, {:fanout_failed, report}} =
+             Fanout.run(plan, fixture.registry,
+               state_root: fixture.state_root,
+               max_concurrency: 2,
+               timeout: 10_000
+             )
+
+    assert Enum.map(report.results, &{&1.id, &1.status}) == [
+             {"alpha", :failed},
+             {"beta", :not_run}
+           ]
+
+    assert %{name: :execute, units: 0} = List.last(report.binding.phases)
+  end
+
+  test "a failed command cannot promote its permitted lock mutation", context do
+    fixture = project_fixture(context)
+
+    command = [
+      "sh",
+      "-c",
+      ~s|printf '%s failed\n' "$PWD"; printf '%s\n' '%{partial: {:git, "https://example.invalid/partial.git", "deadbeef", []}}' > "$MIX_WORKSPACE_OPS_LOCKFILE"; exit 9|
+    ]
+
+    assert {:ok, plan} = OperationPlan.build(fixture.registry, fixture.view, command)
+
+    assert {:error, {:fanout_failed, failed}} =
+             Fanout.run(plan, fixture.registry,
+               state_root: fixture.state_root,
+               allow_lock_mutation: true,
+               max_concurrency: 2
+             )
+
+    assert Enum.all?(failed.results, &(&1.status == :failed))
+    assert [%{kind: :command, affected_units: ["alpha", "beta"]} = cause] = failed.causes
+    assert cause.diagnostic == ["$PATH failed"]
+    assert Enum.all?(failed.results, &(&1.cause == cause.id))
+    refute Enum.any?(failed.binding.units, &Map.has_key?(&1, :finalize_error))
+
+    context_lockfiles =
+      failed.binding.units
+      |> Enum.map(& &1.runtime.context_lockfile)
+      |> Enum.uniq()
+
+    assert [_shared_context] = context_lockfiles
+    assert Enum.all?(context_lockfiles, &(File.read!(&1) == "%{}\n"))
+
+    assert {:ok, clean_plan} = OperationPlan.build(fixture.registry, fixture.view, ["true"])
+
+    assert {:ok, clean} =
+             Fanout.run(clean_plan, fixture.registry,
+               state_root: fixture.state_root,
+               max_concurrency: 2
+             )
+
+    assert Enum.all?(clean.results, &(&1.status == :passed))
+    assert Enum.all?(clean.binding.units, &(File.read!(&1.runtime.lockfile) == "%{}\n"))
+  end
+
+  test "a partial binding failure does not prevent an independent unit", context do
     fixture = project_fixture(context)
     File.mkdir_p!(Path.join(fixture.beta, "mix.lock"))
 
@@ -332,7 +569,13 @@ defmodule MixWorkspaceOps.FanoutTest do
              Fanout.run(plan, fixture.registry, state_root: fixture.state_root)
 
     assert report.status == :failed
-    assert report.failure.kind == :binding
+
+    assert Enum.map(report.results, &{&1.id, &1.status}) == [
+             {"alpha", :passed},
+             {"beta", :failed}
+           ]
+
+    assert [%{id: "beta"}] = report.binding.failures
     assert {:ok, state} = Runtime.list(fixture.state_root)
     assert length(state.runs) == 1
     refute Enum.any?(state.runs, & &1.leased)
@@ -357,6 +600,52 @@ defmodule MixWorkspaceOps.FanoutTest do
       root: root,
       alpha: alpha,
       beta: beta,
+      view: view,
+      registry: select_and_bind(registry, view, root),
+      state_root: Path.join(root, "state")
+    }
+  end
+
+  defp dependency_fixture(context) do
+    root = temporary_directory!(context)
+    alpha = initialize_repository!(Path.join(root, "alpha"))
+    beta = initialize_repository!(Path.join(root, "beta"))
+    gamma = initialize_repository!(Path.join(root, "gamma"))
+
+    File.write!(Path.join(beta, "mix.exs"), """
+    defmodule Fixture.MixProject do
+      use Mix.Project
+
+      def project do
+        [app: :beta, version: "0.1.0", deps: [{:alpha, "~> 0.1", path: "../alpha"}]]
+      end
+    end
+    """)
+
+    git!(beta, ["add", "mix.exs"])
+    git!(beta, ["commit", "--quiet", "-m", "depend on alpha"])
+
+    catalog =
+      write_catalog!(root, [
+        catalog_repository("alpha", projects: [catalog_project("alpha")]),
+        catalog_repository("beta",
+          projects: [
+            catalog_project("beta",
+              dependency_sources: %{"alpha" => %{"hex" => "~> 0.1"}}
+            )
+          ]
+        ),
+        catalog_repository("gamma", projects: [catalog_project("gamma")])
+      ])
+
+    view_path = write_catalog_view!(root, "dependency_graph", %{})
+    registry = Registry.load!(catalog)
+    {:ok, view} = View.load(view_path)
+
+    %{
+      alpha: alpha,
+      beta: beta,
+      gamma: gamma,
       view: view,
       registry: select_and_bind(registry, view, root),
       state_root: Path.join(root, "state")

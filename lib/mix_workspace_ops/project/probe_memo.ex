@@ -10,7 +10,7 @@ defmodule MixWorkspaceOps.Project.ProbeMemo do
 
   alias Mix.Sync.Lock, as: SyncLock
 
-  @schema "mix_workspace_ops.probe_metadata/v1"
+  @schema "mix_workspace_ops.probe_metadata/v4"
   @enforce_keys [:table]
   defstruct [:table, :root]
 
@@ -42,17 +42,19 @@ defmodule MixWorkspaceOps.Project.ProbeMemo do
     end
   end
 
-  @doc "Coalesces invocation-only facts that must be recomputed before disk keys are formed."
-  @spec fetch_transient(t(), term(), (-> value)) :: value when value: term()
-  def fetch_transient(%__MODULE__{table: table} = memo, key, miss) when is_function(miss, 0) do
-    key = {:transient, key}
+  @doc false
+  @spec put_snapshot(t(), term(), term()) :: :ok
+  def put_snapshot(%__MODULE__{table: table}, key, value) do
+    true = :ets.insert(table, {{:snapshot, key}, value})
+    :ok
+  end
 
-    case :ets.lookup(table, {:value, key}) do
-      [{{:value, ^key}, value}] ->
-        value
-
-      [] ->
-        SyncLock.with_lock(lock_key(memo, key), fn -> transient_fetch(table, key, miss) end)
+  @doc false
+  @spec snapshot(t(), term()) :: {:hit, term()} | :miss
+  def snapshot(%__MODULE__{table: table}, key) do
+    case :ets.lookup(table, {:snapshot, key}) do
+      [{{:snapshot, ^key}, value}] -> {:hit, value}
+      [] -> :miss
     end
   end
 
@@ -69,26 +71,23 @@ defmodule MixWorkspaceOps.Project.ProbeMemo do
         value
 
       [] ->
-        case read(memo, key) do
-          {:ok, value} ->
-            :ets.insert(table, {{:value, key}, value})
-            count(table, :disk_hits)
-            value
-
-          :miss ->
-            value = miss.()
-            if persistable?(value), do: :ok = write(memo, key, value)
-            :ets.insert(table, {{:value, key}, value})
-            count(table, :misses)
-            value
-        end
+        read_or_compute(memo, key, miss)
     end
   end
 
-  defp transient_fetch(table, key, miss) do
-    case :ets.lookup(table, {:value, key}) do
-      [{{:value, ^key}, value}] -> value
-      [] -> miss.() |> tap(&:ets.insert(table, {{:value, key}, &1}))
+  defp read_or_compute(%__MODULE__{table: table} = memo, key, miss) do
+    case read(memo, key) do
+      {:ok, value} ->
+        :ets.insert(table, {{:value, key}, value})
+        count(table, :disk_hits)
+        value
+
+      :miss ->
+        value = miss.()
+        if persistable?(value), do: :ok = write(memo, key, value)
+        :ets.insert(table, {{:value, key}, value})
+        count(table, :misses)
+        value
     end
   end
 

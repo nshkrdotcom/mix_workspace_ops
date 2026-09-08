@@ -41,55 +41,99 @@ defmodule MixWorkspaceOps.HexCache do
         max_concurrency: max(1, concurrency),
         ordered: true,
         timeout: Keyword.get(opts, :timeout, 120_000),
-        on_timeout: :kill_task
+        on_timeout: :kill_task,
+        zip_input_on_exit: true
       )
       |> collect()
     end
   end
 
   @doc "Captures archives fetched by Mix for a previously unlocked context."
-  @spec capture(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
-  def capture(state_root, cache_home, lockfile) do
+  @spec capture(String.t(), String.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def capture(state_root, cache_home, lockfile, opts \\ []) do
     with {:ok, objects} <- objects(lockfile) do
       Enum.reduce_while(objects, :ok, fn object, :ok ->
         source = native_path(cache_home, object)
-
-        case valid?(source, object.checksum) do
-          true ->
-            result =
-              with_object_lock(state_root, object, fn ->
-                install_existing(state_root, object, source)
-              end)
-
-            case result do
-              {:ok, _path, _status} -> {:cont, :ok}
-              {:error, reason} -> {:halt, {:error, reason}}
-            end
-
-          false ->
-            {:cont, :ok}
-        end
+        capture_object(state_root, object, source, opts)
       end)
     end
   end
 
-  defp prepare_object(state_root, cache_home, object, opts) do
-    digest = identity_digest(object)
+  defp capture_object(state_root, object, source, opts) do
+    key = {Path.expand(state_root), identity_digest(object)}
 
-    with_object_lock(state_root, object, fn ->
-      with {:ok, object_path, object_status} <- ensure_object(state_root, object, opts),
-           {:ok, view_status} <- install_view(cache_home, object, object_path) do
-        {:ok,
-         Map.merge(object, %{
-           identity: digest,
-           object: object_path,
-           object_status: object_status,
-           view_status: view_status,
-           network: object_status == :fetched
-         })}
-      end
-    end)
+    result =
+      opts
+      |> Keyword.get(:memo)
+      |> memoized(key, fn -> capture_source(state_root, object, source) end)
+
+    capture_result(result)
   end
+
+  defp capture_result({:ok, _path, _status}), do: {:cont, :ok}
+  defp capture_result(:missing), do: {:cont, :ok}
+  defp capture_result({:error, reason}), do: {:halt, {:error, reason}}
+
+  defp capture_source(state_root, object, source) do
+    if valid?(source, object.checksum) do
+      with_object_lock(state_root, object, fn -> install_existing(state_root, object, source) end)
+    else
+      :missing
+    end
+  end
+
+  defp prepare_object(state_root, cache_home, object, opts) do
+    key = {Path.expand(state_root), identity_digest(object)}
+
+    object_result =
+      memoized(Keyword.get(opts, :memo), key, fn ->
+        with_object_lock(state_root, object, fn -> ensure_object(state_root, object, opts) end)
+      end)
+
+    with {:ok, object_path, object_status} <- object_result,
+         {:ok, view_status} <- install_view(cache_home, object, object_path) do
+      {:ok,
+       Map.merge(object, %{
+         identity: identity_digest(object),
+         object: object_path,
+         object_status: object_status,
+         view_status: view_status,
+         network: object_status == :fetched
+       })}
+    end
+  end
+
+  defp memoized(nil, _key, operation), do: operation.()
+
+  defp memoized(memo, key, operation) do
+    case :ets.lookup(memo, key) do
+      [{^key, result}] -> memoized_result(result)
+      [] -> fill_memo(memo, key, operation)
+    end
+  end
+
+  defp fill_memo(memo, key, operation) do
+    lock = "mix_workspace_ops:hex-memo:" <> term_digest(key)
+    SyncLock.with_lock(lock, fn -> fill_memo_locked(memo, key, operation) end)
+  end
+
+  defp fill_memo_locked(memo, key, operation) do
+    case :ets.lookup(memo, key) do
+      [{^key, result}] ->
+        memoized_result(result)
+
+      [] ->
+        result = operation.()
+        if result != :missing, do: :ets.insert(memo, {key, result})
+        result
+    end
+  end
+
+  defp memoized_result({:ok, path, _status}), do: {:ok, path, :hit}
+
+  defp memoized_result(:missing), do: :missing
+
+  defp memoized_result({:error, _reason} = error), do: error
 
   defp with_object_lock(state_root, object, operation) do
     key =
@@ -106,9 +150,8 @@ defmodule MixWorkspaceOps.HexCache do
       valid?(path, object.checksum) ->
         {:ok, path, :hit}
 
-      File.exists?(path) ->
-        quarantine(path)
-        fetch_object(path, object, opts, 2)
+      present?(path) ->
+        with :ok <- quarantine(path), do: fetch_object(path, object, opts, 2)
 
       true ->
         source_cache = Keyword.get(opts, :source_cache)
@@ -123,14 +166,23 @@ defmodule MixWorkspaceOps.HexCache do
   defp install_existing(state_root, object, source) do
     path = object_path(state_root, object)
 
-    if valid?(path, object.checksum) do
-      {:ok, path, :hit}
-    else
-      with :ok <- atomic_copy(source, path),
-           true <- valid?(path, object.checksum) || {:error, {:hex_object_checksum, object}} do
-        File.chmod(path, 0o400)
-        {:ok, path, :imported}
-      end
+    cond do
+      valid?(path, object.checksum) ->
+        {:ok, path, :hit}
+
+      present?(path) ->
+        with :ok <- quarantine(path), do: install_verified_copy(path, object, source)
+
+      true ->
+        install_verified_copy(path, object, source)
+    end
+  end
+
+  defp install_verified_copy(path, object, source) do
+    with :ok <- atomic_copy(source, path),
+         true <- valid?(path, object.checksum) || {:error, {:hex_object_checksum, object}},
+         :ok <- File.chmod(path, 0o400) do
+      {:ok, path, :imported}
     end
   end
 
@@ -138,11 +190,13 @@ defmodule MixWorkspaceOps.HexCache do
     do: {:error, {:hex_object_checksum, object}}
 
   defp fetch_object(path, object, opts, attempts) do
-    temporary = temporary(path)
+    temporary_root = temporary(path)
+    temporary = Path.join(temporary_root, "#{object.package}-#{object.version}.tar")
     File.mkdir_p!(Path.dirname(path))
 
     result =
-      with :ok <- fetch(object, temporary, opts),
+      with :ok <- File.mkdir(temporary_root),
+           :ok <- fetch(object, temporary, opts),
            true <- valid?(temporary, object.checksum) || :invalid_checksum,
            :ok <- File.rename(temporary, path),
            :ok <- File.chmod(path, 0o400) do
@@ -151,14 +205,20 @@ defmodule MixWorkspaceOps.HexCache do
 
     case result do
       {:ok, _path, _status} = ok ->
+        File.rm_rf(temporary_root)
         ok
 
       :invalid_checksum ->
-        quarantine(temporary)
-        fetch_object(path, object, opts, attempts - 1)
+        quarantine_result = quarantine_as(temporary, path)
+        File.rm_rf(temporary_root)
+
+        case quarantine_result do
+          :ok -> fetch_object(path, object, opts, attempts - 1)
+          {:error, reason} -> {:error, {:hex_object_quarantine, path, reason}}
+        end
 
       {:error, reason} ->
-        File.rm(temporary)
+        File.rm_rf(temporary_root)
         {:error, {:hex_object_fetch, object, reason}}
     end
   end
@@ -169,6 +229,8 @@ defmodule MixWorkspaceOps.HexCache do
         function.(object, path)
 
       nil ->
+        output = Path.dirname(path)
+
         args = [
           "hex.package",
           "fetch",
@@ -177,10 +239,12 @@ defmodule MixWorkspaceOps.HexCache do
           "--repo",
           object.repo,
           "--output",
-          path
+          output
         ]
 
-        case Command.run(Toolchain.executable("mix"), args,
+        runner = Keyword.get(opts, :command_runner, &Command.run/3)
+
+        case runner.(Toolchain.executable("mix"), args,
                cd: Keyword.get(opts, :cd, System.tmp_dir!()),
                replace_env: true,
                env: Keyword.fetch!(opts, :env)
@@ -194,33 +258,32 @@ defmodule MixWorkspaceOps.HexCache do
   defp install_view(cache_home, object, source) do
     destination = native_path(cache_home, object)
 
+    SyncLock.with_lock("mix_workspace_ops:hex-view:" <> Path.expand(destination), fn ->
+      install_view_locked(destination, object, source)
+    end)
+  end
+
+  defp install_view_locked(destination, object, source) do
     cond do
       valid?(destination, object.checksum) ->
         {:ok, :hit}
 
-      File.exists?(destination) ->
-        quarantine(destination)
-        link_or_copy(source, destination)
+      present?(destination) ->
+        with :ok <- quarantine(destination),
+             do: copy_view(source, destination, object.checksum)
 
       true ->
-        link_or_copy(source, destination)
+        copy_view(source, destination, object.checksum)
     end
   end
 
-  defp link_or_copy(source, destination) do
-    File.mkdir_p!(Path.dirname(destination))
-
-    case File.ln(source, destination) do
-      :ok ->
-        {:ok, :linked}
-
-      {:error, :eexist} ->
-        {:ok, :hit}
-
-      {:error, _cross_device_or_unsupported} ->
-        with :ok <- atomic_copy(source, destination) do
-          {:ok, :copied}
-        end
+  # A hard link would let a child running as the same user chmod and mutate the
+  # checksum-addressed retained object through its context view. A private copy
+  # preserves the network/cache win without sharing a writable inode.
+  defp copy_view(source, destination, checksum) do
+    with :ok <- atomic_copy(source, destination),
+         true <- valid?(destination, checksum) || {:error, {:hex_view_checksum, destination}} do
+      {:ok, :copied}
     end
   end
 
@@ -299,6 +362,13 @@ defmodule MixWorkspaceOps.HexCache do
     |> Base.encode16(case: :lower)
   end
 
+  defp term_digest(term) do
+    term
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
   defp valid?(path, checksum) do
     case File.stat(path) do
       {:ok, %{type: :regular, size: size}} when size > 0 -> file_sha256(path) == checksum
@@ -317,22 +387,34 @@ defmodule MixWorkspaceOps.HexCache do
   end
 
   defp quarantine(path) do
-    if File.exists?(path) do
-      suffix = "#{System.system_time(:millisecond)}.#{System.unique_integer([:positive])}"
-      _ = File.rename(path, path <> ".corrupt." <> suffix)
-    end
-
-    :ok
+    quarantine_as(path, path)
   end
+
+  defp quarantine_as(source, destination) do
+    if present?(source) do
+      suffix = "#{System.system_time(:millisecond)}.#{System.unique_integer([:positive])}"
+      File.rename(source, destination <> ".corrupt." <> suffix)
+    else
+      :ok
+    end
+  end
+
+  defp present?(path), do: match?({:ok, _stat}, File.lstat(path))
 
   defp temporary(path),
     do: path <> ".tmp.#{System.unique_integer([:positive, :monotonic])}"
 
   defp collect(stream) do
     Enum.reduce_while(stream, {:ok, []}, fn
-      {:ok, {:ok, report}}, {:ok, reports} -> {:cont, {:ok, [report | reports]}}
-      {:ok, {:error, reason}}, _acc -> {:halt, {:error, reason}}
-      {:exit, reason}, _acc -> {:halt, {:error, {:hex_object_task_exit, reason}}}
+      {:ok, {:ok, report}}, {:ok, reports} ->
+        {:cont, {:ok, [report | reports]}}
+
+      {:ok, {:error, reason}}, _acc ->
+        {:halt, {:error, reason}}
+
+      {:exit, {object, reason}}, _acc ->
+        identity = Map.take(object, [:package, :version, :repo, :checksum])
+        {:halt, {:error, {:hex_object_task_exit, identity, reason}}}
     end)
     |> case do
       {:ok, reports} -> {:ok, Enum.reverse(reports)}

@@ -30,7 +30,9 @@ defmodule MixWorkspaceOps.LockfileTest do
     refute Map.has_key?(lock, :alpha)
     assert Map.has_key?(lock, :beta)
 
-    assert {:ok, ^bytes} = Lockfile.project_path_apps(bytes, [])
+    assert {:ok, canonical} = Lockfile.project_path_apps(bytes, [])
+    assert {:ok, canonical_lock} = Lockfile.parse_map(canonical)
+    assert Map.keys(canonical_lock) |> Enum.sort() == [:alpha, :beta]
   end
 
   test "projected string keys use map arrows rather than quoted keyword syntax" do

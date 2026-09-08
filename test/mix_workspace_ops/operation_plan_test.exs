@@ -17,7 +17,7 @@ defmodule MixWorkspaceOps.OperationPlanTest do
              )
 
     refute File.exists?(marker)
-    assert plan.schema == "mix_workspace_ops.plan/v2"
+    assert plan.schema == "mix_workspace_ops.plan/v3"
     assert plan.digest == digest(Map.delete(plan, :digest))
     assert Enum.map(plan.units, & &1.id) == ["alpha", "beta"]
     assert Enum.all?(plan.units, &(&1.status == :planned))
@@ -54,6 +54,26 @@ defmodule MixWorkspaceOps.OperationPlanTest do
     assert {:error, {:operation_plan, ^path, :duplicate_operation_units}} =
              OperationPlan.load(path)
 
+    unknown_dependency =
+      plan
+      |> put_in([:units, Access.at(0), :dependencies], ["missing"])
+      |> redigest()
+
+    assert :ok = Report.write(path, unknown_dependency)
+
+    assert {:error, {:operation_plan, ^path, :invalid_operation_plan_dependency}} =
+             OperationPlan.load(path)
+
+    cycle =
+      plan
+      |> put_in([:units, Access.at(1), :dependencies], ["alpha"])
+      |> redigest()
+
+    assert :ok = Report.write(path, cycle)
+
+    assert {:error, {:operation_plan, ^path, :operation_plan_dependency_cycle}} =
+             OperationPlan.load(path)
+
     absolute = plan |> put_in([:command, :executable], "/bin/true") |> redigest()
     assert :ok = Report.write(path, absolute)
 
@@ -69,6 +89,27 @@ defmodule MixWorkspaceOps.OperationPlanTest do
 
     assert OperationPlan.build(fixture.registry, fixture.view, ["env", "OUT=/tmp/result"]) ==
              {:error, {:nonportable_command_segment, "OUT=/tmp/result"}}
+  end
+
+  test "lifecycle semantics are frozen and preserved by replay", context do
+    fixture = fixture(context)
+
+    assert {:ok, plan} =
+             OperationPlan.build(fixture.registry, fixture.view, ["mix", "compile"],
+               lifecycle: :compile
+             )
+
+    assert plan.policy.lifecycle == :compile
+    path = Path.join(fixture.root, "compile-plan.json")
+    assert :ok = OperationPlan.write(path, plan)
+    assert {:ok, loaded} = OperationPlan.load(path)
+    assert loaded["policy"]["lifecycle"] == "compile"
+
+    assert {:ok, replayed} = OperationPlan.replay(loaded, fixture.registry, fixture.view, [])
+    assert replayed.policy.lifecycle == :compile
+
+    assert OperationPlan.build(fixture.registry, fixture.view, ["true"], lifecycle: :compile) ==
+             {:error, {:invalid_lifecycle_command, :compile, ["true"]}}
   end
 
   test "loads a plan whose local candidate names a known unselected provider", context do

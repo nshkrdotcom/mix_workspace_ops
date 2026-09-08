@@ -1,11 +1,41 @@
 defmodule MixWorkspaceOps.Git do
   @moduledoc "Fail-closed Git repository inspection and mutation primitives."
 
+  alias Mix.Sync.Lock, as: SyncLock
   alias MixWorkspaceOps.Command
+  alias MixWorkspaceOps.Project.ProbeTree
 
-  @spec root(String.t()) :: {:ok, String.t()} | {:error, term()}
-  def root(path) do
-    case Command.run("git", ["rev-parse", "--show-toplevel"], cd: path) do
+  @doc "Returns one repository-state snapshot, coalesced by root when an invocation memo is given."
+  @spec state(String.t(), :ets.tid() | nil) :: map()
+  def state(repo, memo \\ nil)
+
+  def state(repo, nil), do: repo |> root!([]) |> read_state()
+
+  def state(repo, memo) do
+    root = root!(repo, [])
+    key = {:repository_state, root}
+
+    case :ets.lookup(memo, key) do
+      [{^key, state}] ->
+        state
+
+      [] ->
+        locked_state(root, memo, key)
+    end
+  end
+
+  defp locked_state(root, memo, key) do
+    SyncLock.with_lock("mix_workspace_ops:repository-state:" <> root, fn ->
+      case :ets.lookup(memo, key) do
+        [{^key, state}] -> state
+        [] -> read_state(root) |> tap(&:ets.insert(memo, {key, &1}))
+      end
+    end)
+  end
+
+  @spec root(String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def root(path, opts \\ []) do
+    case Command.run("git", ["rev-parse", "--show-toplevel"], Keyword.put(opts, :cd, path)) do
       {:ok, result} -> {:ok, String.trim(result.output)}
       {:error, result} -> {:error, {:git_root, result.output}}
     end
@@ -19,8 +49,8 @@ defmodule MixWorkspaceOps.Git do
     end
   end
 
-  @spec head!(String.t()) :: String.t()
-  def head!(repo), do: output!(repo, ["rev-parse", "HEAD"])
+  @spec head!(String.t(), keyword()) :: String.t()
+  def head!(repo, opts \\ []), do: output!(repo, ["rev-parse", "HEAD"], opts)
 
   @doc """
   The revision `repo` is at, or why it could not be read.
@@ -28,9 +58,9 @@ defmodule MixWorkspaceOps.Git do
   A caller pinning a coordinate to a checkout has something else to do when the
   checkout cannot answer, so it asks rather than being raised at.
   """
-  @spec head(String.t()) :: {:ok, String.t()} | {:error, term()}
-  def head(repo) do
-    case Command.run("git", ["rev-parse", "HEAD"], cd: repo) do
+  @spec head(String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def head(repo, opts \\ []) do
+    case Command.run("git", ["rev-parse", "HEAD"], Keyword.put(opts, :cd, repo)) do
       {:ok, result} -> {:ok, String.trim(result.output)}
       {:error, result} -> {:error, {:git_head, result.output}}
     end
@@ -73,30 +103,81 @@ defmodule MixWorkspaceOps.Git do
     end
   end
 
-  @spec clean?(String.t()) :: boolean()
-  def clean?(repo), do: output!(repo, ["status", "--porcelain"]) == ""
+  @spec clean?(String.t(), keyword()) :: boolean()
+  def clean?(repo, opts \\ []), do: output!(repo, ["status", "--porcelain"], opts) == ""
 
-  @spec source_digest(String.t()) :: String.t()
-  def source_digest(repo) do
-    root = root!(repo)
-    status = output_binary!(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-    diff = output_binary!(root, ["diff", "--binary", "--no-ext-diff", "HEAD", "--"])
-    untracked = output_binary!(root, ["ls-files", "--others", "--exclude-standard", "-z"])
+  @spec source_digest(String.t(), keyword()) :: String.t()
+  def source_digest(repo, opts \\ []) do
+    root = root!(repo, opts)
+    {digest, _clean?} = source_state(root, opts)
+    digest
+  end
+
+  defp source_state(root, opts) do
+    status =
+      output_binary!(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], opts)
+
+    diff = output_binary!(root, ["diff", "--binary", "--no-ext-diff", "HEAD", "--"], opts)
+    untracked = output_binary!(root, ["ls-files", "--others", "--exclude-standard", "-z"], opts)
+
+    ignored =
+      output_binary!(
+        root,
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--"] ++
+          ProbeTree.ignored_source_pathspecs(),
+        opts
+      )
 
     untracked_digests =
-      untracked
-      |> :binary.split(<<0>>, [:global, :trim_all])
-      |> Enum.sort()
-      |> Enum.map(fn relative ->
-        path = Path.join(root, relative)
-        [relative, <<0>>, file_kind(path), <<0>>, content_digest(path), <<0>>]
-      end)
+      source_digests(root, untracked |> null_paths() |> Enum.filter(&ProbeTree.source_path?/1))
 
-    :crypto.hash(
-      :sha256,
-      ["status\0", status, "diff\0", diff, "untracked\0", untracked_digests]
-    )
-    |> Base.encode16(case: :lower)
+    ignored_digests =
+      source_digests(root, ignored |> null_paths() |> Enum.filter(&ProbeTree.source_path?/1))
+
+    digest =
+      :crypto.hash(
+        :sha256,
+        [
+          "status\0",
+          status,
+          "diff\0",
+          diff,
+          "untracked\0",
+          untracked_digests,
+          "ignored\0",
+          ignored_digests
+        ]
+      )
+      |> Base.encode16(case: :lower)
+
+    {digest, status == ""}
+  end
+
+  defp null_paths(bytes), do: :binary.split(bytes, <<0>>, [:global, :trim_all])
+
+  defp source_digests(root, relative_paths) do
+    relative_paths
+    |> Enum.sort()
+    |> Enum.map(fn relative ->
+      path = Path.join(root, relative)
+
+      [
+        relative,
+        <<0>>,
+        file_kind(path),
+        <<0>>,
+        file_mode(path),
+        <<0>>,
+        content_digest(path),
+        <<0>>
+      ]
+    end)
+  end
+
+  defp read_state(repo) do
+    head = output!(repo, ["rev-parse", "HEAD"])
+    {source_digest, clean?} = source_state(repo, [])
+    %{head: head, source_digest: source_digest, clean: clean?}
   end
 
   @spec tag_exists?(String.t(), String.t()) :: boolean()
@@ -108,10 +189,10 @@ defmodule MixWorkspaceOps.Git do
     end
   end
 
-  @spec output!(String.t(), [String.t()]) :: String.t()
-  def output!(repo, args) do
+  @spec output!(String.t(), [String.t()], keyword()) :: String.t()
+  def output!(repo, args, opts \\ []) do
     "git"
-    |> Command.run!(args, cd: repo)
+    |> Command.run!(args, Keyword.put(opts, :cd, repo))
     |> Map.fetch!(:output)
     |> String.trim()
   end
@@ -130,15 +211,15 @@ defmodule MixWorkspaceOps.Git do
     end
   end
 
-  defp root!(repo) do
-    case root(repo) do
+  defp root!(repo, opts) do
+    case root(repo, opts) do
       {:ok, root} -> root
       {:error, reason} -> raise "cannot resolve Git root: #{inspect(reason)}"
     end
   end
 
-  defp output_binary!(repo, args) do
-    "git" |> Command.run!(args, cd: repo) |> Map.fetch!(:output)
+  defp output_binary!(repo, args, opts) do
+    "git" |> Command.run!(args, Keyword.put(opts, :cd, repo)) |> Map.fetch!(:output)
   end
 
   defp file_kind(path) do
@@ -146,6 +227,13 @@ defmodule MixWorkspaceOps.Git do
       {:ok, %{type: :symlink}} -> "symlink"
       {:ok, %{type: :regular}} -> "file"
       {:ok, %{type: type}} -> to_string(type)
+      {:error, reason} -> "error:#{reason}"
+    end
+  end
+
+  defp file_mode(path) do
+    case File.lstat(path) do
+      {:ok, stat} -> stat.mode |> Bitwise.band(0o777) |> Integer.to_string(8)
       {:error, reason} -> "error:#{reason}"
     end
   end

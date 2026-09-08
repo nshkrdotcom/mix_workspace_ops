@@ -2,7 +2,7 @@ defmodule MixWorkspaceOps.RuntimeTest do
   use MixWorkspaceOps.WorkspaceCase, async: false
 
   alias Mix.Sync.Lock, as: SyncLock
-  alias MixWorkspaceOps.{Runtime, Toolchain}
+  alias MixWorkspaceOps.{Lockfile, Runtime, Toolchain}
 
   @cache_identity String.duplicate("a", 64)
   @checksum String.duplicate("b", 64)
@@ -158,9 +158,12 @@ defmodule MixWorkspaceOps.RuntimeTest do
              )
 
     assert allowed.report.context_lock_status == :hit
-    assert File.read!(allowed.report.lockfile) == @lock
+    assert_same_lock(allowed.report.lockfile, @lock)
     File.write!(allowed.report.lockfile, @changed_lock)
-    assert {:ok, final_report} = Runtime.finish(allowed.handle)
+
+    assert {:ok, final_report} =
+             Runtime.finish(allowed.handle, accept_lock_mutation: true)
+
     assert final_report.lock_mutated
     assert final_report.status == "complete"
     refute final_report.source_lock_digest == final_report.final_lock_digest
@@ -168,12 +171,79 @@ defmodule MixWorkspaceOps.RuntimeTest do
 
     assert File.read!(refused.report.source_lock) == @lock
     assert File.read!(allowed.report.source_lock) == @lock
-    assert File.read!(allowed.report.context_lockfile) == @changed_lock
+    assert_same_lock(allowed.report.context_lockfile, @changed_lock)
 
     assert {:ok, reused} = Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts())
     assert reused.report.dependency_identity == allowed.report.dependency_identity
     assert reused.report.context_lock_status == :hit
-    assert File.read!(reused.report.lockfile) == @changed_lock
+    assert_same_lock(reused.report.lockfile, @changed_lock)
+    finish_and_release(reused.handle)
+  end
+
+  test "a permitted lock mutation is not promoted without operation success", context do
+    state_root = temporary_directory!(context)
+
+    assert {:ok, failed} =
+             Runtime.prepare(
+               state_root,
+               @cache_identity,
+               @lock,
+               runtime_opts(allow_lock_mutation: true)
+             )
+
+    File.write!(failed.report.lockfile, @changed_lock)
+
+    assert {:ok, discarded} =
+             Runtime.finish(failed.handle, accept_lock_mutation: false)
+
+    assert discarded.invocation_id == failed.report.invocation_id
+    assert discarded.status == "discarded"
+    assert discarded.lock_mutated
+    assert_same_lock(failed.report.context_lockfile, @lock)
+    assert :ok = Runtime.release(failed.handle)
+
+    assert {:ok, reused} =
+             Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts())
+
+    assert_same_lock(reused.report.lockfile, @lock)
+    finish_and_release(reused.handle)
+  end
+
+  test "transport preparation uses the learned operational lock", context do
+    root = temporary_directory!(context)
+    state_root = Path.join(root, "state")
+    remote = initialize_repository!(Path.join(root, "remote"))
+    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: remote)
+    commit = String.trim(commit)
+    source_lock = "%{}\n"
+    learned_lock = inspect(%{sample: {:git, remote, commit, []}}) <> "\n"
+
+    assert {:ok, initial} =
+             Runtime.prepare(
+               state_root,
+               @cache_identity,
+               source_lock,
+               runtime_opts(allow_lock_mutation: true)
+             )
+
+    File.write!(initial.report.lockfile, learned_lock)
+    assert {:ok, _report} = Runtime.finish(initial.handle, accept_lock_mutation: true)
+    assert :ok = Runtime.release(initial.handle)
+
+    assert {:ok, reused} =
+             Runtime.prepare(
+               state_root,
+               @cache_identity,
+               source_lock,
+               runtime_opts(
+                 prepare_objects: true,
+                 managed_sources: %{"sample" => "github"}
+               )
+             )
+
+    assert [%{remote: ^remote, commit: ^commit, network: true}] =
+             reused.report.cache_objects.git
+
     finish_and_release(reused.handle)
   end
 
@@ -187,8 +257,8 @@ defmodule MixWorkspaceOps.RuntimeTest do
 
     assert {:ok, recovered} = Runtime.prepare(state_root, @cache_identity, @lock, runtime_opts())
     assert recovered.report.context_lock_status == :recovered
-    assert File.read!(recovered.report.lockfile) == @lock
-    assert File.read!(context_lockfile) == @lock
+    assert_same_lock(recovered.report.lockfile, @lock)
+    assert_same_lock(context_lockfile, @lock)
 
     quarantined =
       context_lockfile
@@ -218,17 +288,17 @@ defmodule MixWorkspaceOps.RuntimeTest do
     File.write!(first.report.lockfile, first_lock)
     File.write!(second.report.lockfile, second_lock)
 
-    assert {:ok, _report} = Runtime.finish(first.handle)
+    assert {:ok, _report} = Runtime.finish(first.handle, accept_lock_mutation: true)
 
     assert {:error,
             {:context_lock_conflict, context_lockfile, initial_digest, current_digest,
-             final_digest}} = Runtime.finish(second.handle)
+             final_digest}} = Runtime.finish(second.handle, accept_lock_mutation: true)
 
     assert context_lockfile == first.report.context_lockfile
     assert initial_digest == second.report.operational_lock_digest
     refute current_digest == initial_digest
     refute final_digest in [initial_digest, current_digest]
-    assert File.read!(context_lockfile) == first_lock
+    assert_same_lock(context_lockfile, first_lock)
     assert :ok = Runtime.release(first.handle)
     assert :ok = Runtime.release(second.handle)
   end
@@ -411,7 +481,8 @@ defmodule MixWorkspaceOps.RuntimeTest do
     commit = git!(source, ["rev-parse", "HEAD"]) |> String.trim()
     git!(root, ["clone", "--quiet", "--bare", source, origin])
 
-    private_remote = "https://private.example.invalid/source.git"
+    private_remote = "https://credential@private.example.invalid/source.git"
+    reported_remote = "https://private.example.invalid/source.git"
 
     File.write!(
       Path.join(operator_home, ".gitconfig"),
@@ -442,7 +513,8 @@ defmodule MixWorkspaceOps.RuntimeTest do
              )
 
     on_exit(fn -> finish_and_release(runtime.handle) end)
-    assert [%{remote: ^private_remote, commit: ^commit}] = runtime.report.cache_objects.git
+    assert [%{remote: ^reported_remote, commit: ^commit}] = runtime.report.cache_objects.git
+    refute inspect(runtime.report) =~ "credential@"
     child_env = Map.new(runtime.env)
     assert child_env["HOME"] == runtime.report.home
     assert child_env["GH_TOKEN"] == nil
@@ -549,6 +621,7 @@ defmodule MixWorkspaceOps.RuntimeTest do
     assert Enum.sort(Enum.map(contexts.contexts, & &1.kind)) == [:build, :deps]
     refute File.exists?(completed.report.deps_path)
     refute File.exists?(completed.report.build_path)
+    refute completed.report.hex_cache |> Path.dirname() |> Path.dirname() |> File.exists?()
   end
 
   test "a reused PID with the wrong process start is a stale lease", context do
@@ -582,8 +655,8 @@ defmodule MixWorkspaceOps.RuntimeTest do
     root = temporary_directory!(context)
     absent = Path.join(root, "absent")
 
-    assert {:ok, %{runs: [], legacy_runtimes: []}} = Runtime.list(absent)
-    assert {:ok, %{runs: []}} = Runtime.gc(absent, 0)
+    assert {:ok, %{runs: [], reports: []}} = Runtime.list(absent)
+    assert {:ok, %{runs: [], reports: []}} = Runtime.gc(absent, 0)
     refute File.exists?(absent)
 
     unmarked = Path.join(root, "unmarked")
@@ -651,6 +724,11 @@ defmodule MixWorkspaceOps.RuntimeTest do
   defp finish_and_release(handle) do
     Runtime.finish(handle)
     Runtime.release(handle)
+  end
+
+  defp assert_same_lock(path, expected_bytes) do
+    assert {:ok, expected} = Lockfile.parse_map(expected_bytes)
+    assert {:ok, ^expected} = path |> File.read!() |> Lockfile.parse_map()
   end
 
   defp restore_env(name, nil), do: System.delete_env(name)

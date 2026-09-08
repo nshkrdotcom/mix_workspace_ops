@@ -95,7 +95,7 @@ defmodule MixWorkspaceOps.GitCache do
 
   defp ensure_object(state_root, object, opts, started_at) do
     state_root = Path.expand(state_root)
-    key = {:object, state_root, remote_identity(object.remote), object.commit}
+    key = {:object, state_root, remote_identity(object.remote), object.remote, object.commit}
     memoized(opts, key, fn -> prepare_object(state_root, object, opts, started_at) end)
   end
 
@@ -107,7 +107,11 @@ defmodule MixWorkspaceOps.GitCache do
 
   defp ensure_source_object(state_root, source, opts, started_at) do
     state_root = Path.expand(state_root)
-    key = {:source, state_root, remote_identity(source.remote), Map.get(source, :revision)}
+
+    key =
+      {:source, state_root, remote_identity(source.remote), source.remote,
+       Map.get(source, :revision)}
+
     memoized(opts, key, fn -> prepare_source(state_root, source, opts, started_at) end)
   end
 
@@ -122,7 +126,7 @@ defmodule MixWorkspaceOps.GitCache do
   def environment(reports) when is_list(reports) do
     rewrites =
       reports
-      |> Enum.map(&{&1.remote, &1.mirror})
+      |> Enum.map(&{Map.get(&1, :transport_remote, &1.remote), &1.mirror})
       |> Enum.uniq()
       |> Enum.sort()
 
@@ -150,13 +154,16 @@ defmodule MixWorkspaceOps.GitCache do
         end
 
       {:ok, _present} ->
-        with :ok <- fetch_mirror(mirror, opts),
+        with :ok <- fetch_mirror(mirror, object.remote, opts),
              {:ok, true} <- inspect_mirror(mirror, object),
              :ok <- pin_commit(mirror, object.commit) do
           {:ok, report(object, remote_identity, mirror, :refreshed, nil)}
         else
-          {:ok, false} -> {:error, {:git_commit_unavailable, object.remote, object.commit}}
-          {:error, _reason} = error -> error
+          {:ok, false} ->
+            {:error, {:git_commit_unavailable, display_remote(object.remote), object.commit}}
+
+          {:error, _reason} = error ->
+            error
         end
 
       :absent ->
@@ -180,6 +187,7 @@ defmodule MixWorkspaceOps.GitCache do
     result =
       with :ok <- mkdir_private(root),
            {:ok, _output} <- git(["clone", "--mirror", "--quiet", object.remote, temporary], opts),
+           :ok <- sanitize_origin(temporary, object.remote),
            {:ok, true} <- inspect_mirror(temporary, object, false),
            :ok <- pin_commit(temporary, object.commit),
            :ok <- write_manifest(temporary, object.remote, remote_identity),
@@ -187,8 +195,11 @@ defmodule MixWorkspaceOps.GitCache do
         status = if quarantine, do: :repaired, else: :miss
         {:ok, report(object, remote_identity, mirror, status, quarantine)}
       else
-        {:ok, false} -> {:error, {:git_commit_unavailable, object.remote, object.commit}}
-        {:error, _reason} = error -> error
+        {:ok, false} ->
+          {:error, {:git_commit_unavailable, display_remote(object.remote), object.commit}}
+
+        {:error, _reason} = error ->
+          error
       end
 
     File.rm_rf(temporary)
@@ -201,16 +212,7 @@ defmodule MixWorkspaceOps.GitCache do
         :absent
 
       {:ok, %{type: :directory}} ->
-        with {:ok, "true\n"} <- git(["--git-dir", path, "rev-parse", "--is-bare-repository"], []),
-             :ok <- maybe_verify_manifest(path, object, verify_manifest?),
-             {:ok, _output} <-
-               git(["--git-dir", path, "cat-file", "-e", object.commit <> "^{commit}"], []) do
-          {:ok, true}
-        else
-          {:error, {:git_exit, _args, _status, _output}} -> {:ok, false}
-          {:ok, output} -> {:error, {:git_mirror_bare, path, output}}
-          {:error, _reason} = error -> error
-        end
+        inspect_bare_mirror(path, object, verify_manifest?)
 
       {:ok, %{type: type}} ->
         {:error, {:git_mirror_type, path, type}}
@@ -220,10 +222,33 @@ defmodule MixWorkspaceOps.GitCache do
     end
   end
 
+  defp inspect_bare_mirror(path, object, verify_manifest?) do
+    case git(["--git-dir", path, "rev-parse", "--is-bare-repository"], []) do
+      {:ok, "true\n"} ->
+        with :ok <- maybe_verify_manifest(path, object, verify_manifest?) do
+          commit_present?(path, object.commit)
+        end
+
+      {:ok, output} ->
+        {:error, {:git_mirror_bare, path, output}}
+
+      {:error, reason} ->
+        {:error, {:git_mirror_inspection, path, reason}}
+    end
+  end
+
+  defp commit_present?(path, commit) do
+    case git(["--git-dir", path, "cat-file", "-e", commit <> "^{commit}"], []) do
+      {:ok, _output} -> {:ok, true}
+      {:error, {:git_exit, _args, _status, _output}} -> {:ok, false}
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp maybe_verify_manifest(path, object, true), do: verify_manifest(path, object)
   defp maybe_verify_manifest(_path, _object, false), do: :ok
 
-  defp fetch_mirror(mirror, opts) do
+  defp fetch_mirror(mirror, remote, opts) do
     case git(
            [
              "--git-dir",
@@ -231,10 +256,20 @@ defmodule MixWorkspaceOps.GitCache do
              "fetch",
              "--quiet",
              "--prune",
-             "origin",
+             remote,
              "+refs/*:refs/mix-workspace-ops/upstream/*"
            ],
            opts
+         ) do
+      {:ok, _output} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp sanitize_origin(mirror, remote) do
+    case git(
+           ["--git-dir", mirror, "remote", "set-url", "origin", display_remote(remote)],
+           []
          ) do
       {:ok, _output} -> :ok
       {:error, _reason} = error -> error
@@ -280,7 +315,7 @@ defmodule MixWorkspaceOps.GitCache do
   defp install_directory(temporary, destination) do
     case File.rename(temporary, destination) do
       :ok -> :ok
-      {:error, :eexist} -> :ok
+      {:error, :eexist} -> {:error, {:git_mirror_install_conflict, destination}}
       {:error, reason} -> {:error, {:git_mirror_install, destination, reason}}
     end
   end
@@ -305,11 +340,17 @@ defmodule MixWorkspaceOps.GitCache do
     env = Keyword.get(opts, :env, [])
 
     case System.cmd(command, args, env: env, stderr_to_stdout: true) do
-      {output, 0} -> {:ok, output}
-      {output, status} -> {:error, {:git_exit, args, status, output}}
+      {output, 0} ->
+        {:ok, output}
+
+      {output, status} ->
+        {:error, {:git_exit, Enum.map(args, &display_remote/1), status, redact_urls(output)}}
     end
   rescue
-    error -> {:error, {:git_command, args, error.__struct__, Exception.message(error)}}
+    error ->
+      {:error,
+       {:git_command, Enum.map(args, &display_remote/1), error.__struct__,
+        redact_urls(Exception.message(error))}}
   end
 
   defp ensure_resolved_source(state_root, remote_identity, source, opts) do
@@ -345,9 +386,12 @@ defmodule MixWorkspaceOps.GitCache do
 
   defp resolve_source(%{remote: remote, revision: {kind, value}}, _opts)
        when is_binary(remote),
-       do: {:error, {:git_source_revision, remote, kind, value}}
+       do: {:error, {:git_source_revision, display_remote(remote), kind, value}}
 
-  defp resolve_source(source, _opts), do: {:error, {:git_source, source}}
+  defp resolve_source(source, _opts) do
+    safe = Map.update(source, :remote, nil, &display_remote/1)
+    {:error, {:git_source, safe}}
+  end
 
   defp resolve_remote_ref(remote, refs, opts) do
     with {:ok, output} <- git(["ls-remote", remote | refs], opts),
@@ -372,10 +416,10 @@ defmodule MixWorkspaceOps.GitCache do
 
         if Regex.match?(@commit, commit),
           do: {:ok, commit},
-          else: {:error, {:git_source_revision, remote, refs}}
+          else: {:error, {:git_source_revision, display_remote(remote), refs}}
 
       _missing ->
-        {:error, {:git_source_revision, remote, refs}}
+        {:error, {:git_source_revision, display_remote(remote), refs}}
     end
   end
 
@@ -406,9 +450,7 @@ defmodule MixWorkspaceOps.GitCache do
         "file:" <> Path.expand(remote)
 
       captures = Regex.named_captures(@scp_remote, remote) ->
-        captures["user"] <>
-          "@" <>
-          String.downcase(captures["host"]) <>
+        String.downcase(captures["host"]) <>
           ":" <> String.replace_suffix(captures["path"], ".git", "")
 
       true ->
@@ -427,7 +469,10 @@ defmodule MixWorkspaceOps.GitCache do
           uri
           | scheme: String.downcase(scheme),
             host: String.downcase(host),
-            path: String.replace_suffix(path, ".git", "")
+            path: String.replace_suffix(path, ".git", ""),
+            userinfo: nil,
+            query: nil,
+            fragment: nil
         }
         |> URI.to_string()
 
@@ -440,7 +485,8 @@ defmodule MixWorkspaceOps.GitCache do
     %{
       schema: @schema,
       status: status,
-      remote: object.remote,
+      remote: display_remote(object.remote),
+      transport_remote: object.remote,
       commit: object.commit,
       remote_identity: identity,
       mirror: mirror,
@@ -467,7 +513,7 @@ defmodule MixWorkspaceOps.GitCache do
 
   defp fetch_memoized(memo, key, operation) do
     case :ets.lookup(memo, key) do
-      [{^key, report}] -> {:ok, memoized_report(report)}
+      [{^key, result}] -> memoized_result(result)
       [] -> fill_memo(memo, key, operation)
     end
   end
@@ -479,27 +525,21 @@ defmodule MixWorkspaceOps.GitCache do
 
   defp fill_memo_locked(memo, key, operation) do
     case :ets.lookup(memo, key) do
-      [{^key, report}] -> {:ok, memoized_report(report)}
-      [] -> store_memo_result(memo, key, operation.())
+      [{^key, result}] -> memoized_result(result)
+      [] -> operation.() |> tap(&:ets.insert(memo, {key, &1}))
     end
   end
 
-  defp store_memo_result(memo, key, {:ok, report} = result) do
-    :ets.insert(memo, {key, report})
-    result
-  end
+  defp memoized_result({:ok, report}),
+    do: {:ok, Map.merge(report, %{status: :hit, network: false, quarantine: nil, duration_ms: 0})}
 
-  defp store_memo_result(_memo, _key, error), do: error
-
-  defp memoized_report(report) do
-    Map.merge(report, %{status: :hit, network: false, quarantine: nil, duration_ms: 0})
-  end
+  defp memoized_result({:error, _reason} = error), do: error
 
   defp with_remote_lock(state_root, remote, started_at, operation) do
     state_root = Path.expand(state_root)
     remote_identity = remote_identity(remote)
 
-    ("mix_workspace_ops:git:" <> remote_identity)
+    ("mix_workspace_ops:git:" <> state_root <> ":" <> remote_identity)
     |> SyncLock.with_lock(fn -> operation.(state_root, remote_identity) end)
     |> with_duration(started_at)
   end
@@ -517,6 +557,28 @@ defmodule MixWorkspaceOps.GitCache do
 
   defp random_suffix,
     do: :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+
+  defp display_remote(value) when is_binary(value) do
+    case URI.parse(value) do
+      %URI{scheme: scheme, host: host} = uri when is_binary(scheme) and is_binary(host) ->
+        %{uri | userinfo: nil, query: nil, fragment: nil} |> URI.to_string()
+
+      _other ->
+        case Regex.named_captures(@scp_remote, value) do
+          %{"host" => host, "path" => path} -> host <> ":" <> path
+          _not_scp -> value
+        end
+    end
+  end
+
+  defp display_remote(value), do: value
+
+  defp redact_urls(value) when is_binary(value) do
+    value
+    |> then(&Regex.replace(~r{([a-z][a-z0-9+.-]*://)[^/@\s]+@}i, &1, "\\1[redacted]@"))
+    |> then(&Regex.replace(~r{([a-z][a-z0-9+.-]*://[^\s?#]+)\?[^\s#]+}i, &1, "\\1?[redacted]"))
+    |> then(&Regex.replace(~r{(^|\s)[^/@:\s]+@([^:\s]+:)}m, &1, "\\1[redacted]@\\2"))
+  end
 
   defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 end

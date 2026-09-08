@@ -14,7 +14,7 @@ defmodule MixWorkspaceOps.Runtime do
   """
 
   alias Mix.Sync.Lock, as: SyncLock
-  alias MixWorkspaceOps.{GitCache, HexCache, Lockfile, Report, Toolchain}
+  alias MixWorkspaceOps.{GitCache, HexCache, Lockfile, Report, RunReport, Toolchain}
 
   @state_marker "mix_workspace_ops.state/v1\n"
   @runtime_schema "mix_workspace_ops.runtime/v5"
@@ -128,6 +128,7 @@ defmodule MixWorkspaceOps.Runtime do
     :context_lockfile,
     :context_lock_status,
     :lockfile,
+    :hex_cache_memo,
     :allow_lock_mutation,
     :created_at
   ]
@@ -148,6 +149,7 @@ defmodule MixWorkspaceOps.Runtime do
           context_lockfile: String.t(),
           context_lock_status: :hit | :initialized | :recovered,
           lockfile: String.t() | nil,
+          hex_cache_memo: :ets.tid() | nil,
           allow_lock_mutation: boolean(),
           created_at: non_neg_integer()
         }
@@ -168,7 +170,7 @@ defmodule MixWorkspaceOps.Runtime do
          dependency_identity <-
            dependency_identity(cache_identity, projected_lock, execution_inputs),
          execution_identity <- execution_identity(dependency_identity, execution_inputs),
-         :ok <- ensure_state_root(state_root),
+         :ok <- initialize(state_root),
          {:ok, preparation_timeout} <- preparation_timeout(opts),
          {:ok, root, run_id} <- create_run_root(state_root, execution_identity) do
       identities = %{
@@ -200,6 +202,7 @@ defmodule MixWorkspaceOps.Runtime do
                    run_id: run_id,
                    binding_root: execution_inputs.binding_root,
                    ownership: ownership,
+                   hex_cache_memo: Keyword.get(opts, :hex_cache_memo),
                    allow_lock_mutation: Keyword.get(opts, :allow_lock_mutation, false),
                    created_at: created_at
                  }
@@ -212,11 +215,20 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   @doc "Finalizes the lock audit and durable run record. Safe to call before releasing the lease."
-  @spec finish(t()) :: {:ok, map()} | {:error, term()}
-  def finish(%__MODULE__{} = handle) do
+  @spec finish(t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def finish(%__MODULE__{} = handle, opts \\ []) do
+    accept_lock_mutation? = Keyword.get(opts, :accept_lock_mutation, false)
+
     with {:ok, final_lock, final_lock_digest} <- final_lock(handle),
          lock_mutated = final_lock_digest != handle.operational_lock_digest,
-         decision <- finish_decision(handle, final_lock, final_lock_digest, lock_mutated),
+         decision <-
+           finish_decision(
+             handle,
+             final_lock,
+             final_lock_digest,
+             lock_mutated,
+             accept_lock_mutation?
+           ),
          finished_at = System.system_time(:second),
          status = finish_status(decision),
          {:ok, metadata} <- read_metadata(handle.metadata_path),
@@ -231,7 +243,7 @@ defmodule MixWorkspaceOps.Runtime do
       report = runtime_report(handle, final)
 
       case decision do
-        :complete -> {:ok, report}
+        decision when decision in [:complete, :discard] -> {:ok, report}
         {:rejected, reason} -> {:error, reason}
       end
     end
@@ -266,7 +278,7 @@ defmodule MixWorkspaceOps.Runtime do
              state_root,
              runs,
              read_contexts(state_root, runs),
-             legacy_runtimes(state_root)
+             RunReport.list(state_root)
            )}
         end
 
@@ -296,7 +308,9 @@ defmodule MixWorkspaceOps.Runtime do
          context_candidates <- context_candidates(state.contexts, now, older_than_seconds),
          {:ok, removed} <- maybe_remove_runs(candidates, state.state_root, dry_run?),
          {:ok, removed_contexts} <-
-           maybe_remove_contexts(context_candidates, state.state_root, dry_run?) do
+           maybe_remove_contexts(context_candidates, state.state_root, dry_run?),
+         {:ok, removed_reports} <-
+           RunReport.gc(state.state_root, older_than_seconds, now: now, dry_run: dry_run?) do
       {:ok,
        %{
          schema: @gc_schema,
@@ -304,7 +318,8 @@ defmodule MixWorkspaceOps.Runtime do
          older_than_seconds: older_than_seconds,
          dry_run: dry_run?,
          runs: Enum.map(removed, &Map.take(&1, [:run_id, :execution_identity, :root])),
-         contexts: removed_contexts
+         contexts: removed_contexts,
+         reports: removed_reports
        }}
     end
   end
@@ -344,7 +359,11 @@ defmodule MixWorkspaceOps.Runtime do
          :ok <-
            record_preparation(diagnostic, "copy_archives", "running", %{path: paths.archives}),
          :ok <-
-           copy_archives(paths.archives, Keyword.get(opts, :archives_source, archives_source())),
+           prepare_archives(
+             paths.archives,
+             Keyword.get(opts, :archives_source, archives_source()),
+             Keyword.get(opts, :archive_cache_memo)
+           ),
          :ok <-
            record_preparation(diagnostic, "write_runtime_files", "running", %{path: handle.root}),
          :ok <- write_mix_wrapper(paths.mix_exs),
@@ -355,11 +374,8 @@ defmodule MixWorkspaceOps.Runtime do
            | lockfile: lockfile,
              operational_lock_digest: lock_digest(operational_lock)
          },
-         :ok <- record_preparation(diagnostic, "prepare_hex_transport", "running"),
-         {:ok, hex} <- prepare_hex_transport(handle, paths, opts),
-         :ok <- record_preparation(diagnostic, "prepare_git_transport", "running"),
-         {:ok, git_cache} <- prepare_git_transport(handle, lock_bytes, paths, opts),
-         cache_objects <- Map.put(git_cache, :hex, hex),
+         :ok <- record_preparation(diagnostic, "prepare_transport", "running"),
+         {:ok, cache_objects} <- prepare_transport(handle, operational_lock, paths, opts),
          metadata <- initial_metadata(handle, execution_inputs, paths, cache_objects),
          :ok <- write_report_private(handle.metadata_path, metadata),
          :ok <- record_preparation(diagnostic, "complete", "complete") do
@@ -388,6 +404,7 @@ defmodule MixWorkspaceOps.Runtime do
       operational_lock_digest: lock_digest(context_lock.bytes),
       context_lockfile: context_lock.path,
       context_lock_status: context_lock.status,
+      hex_cache_memo: invocation.hex_cache_memo,
       allow_lock_mutation: invocation.allow_lock_mutation,
       created_at: invocation.created_at
     }
@@ -470,7 +487,10 @@ defmodule MixWorkspaceOps.Runtime do
 
   defp valid_identity(field, value), do: {:error, {:invalid_runtime_identity, field, value}}
 
-  defp ensure_state_root(state_root) do
+  @doc "Creates or verifies the private state root and its ownership marker."
+  @spec initialize(String.t()) :: :ok | {:error, term()}
+  def initialize(state_root) when is_binary(state_root) do
+    state_root = Path.expand(state_root)
     marker = Path.join(state_root, ".mix_workspace_ops_state")
 
     if state_root == "/" do
@@ -846,6 +866,12 @@ defmodule MixWorkspaceOps.Runtime do
     end
   end
 
+  defp prepare_archives(destination, source, memo) do
+    key = {destination, source}
+
+    memoized(memo, key, "archive", fn -> copy_archives(destination, source) end)
+  end
+
   defp copy_archives_locked(destination, source) do
     SyncLock.with_lock("mix_workspace_ops:archives:" <> destination, fn ->
       with {:ok, names} <- list_archives(source),
@@ -950,11 +976,62 @@ defmodule MixWorkspaceOps.Runtime do
     end
   end
 
+  defp prepare_transport(handle, lock_bytes, paths, opts) do
+    key = {handle.state_root, handle.dependency_identity}
+
+    memoized(Keyword.get(opts, :transport_cache_memo), key, "transport", fn ->
+      prepare_transport_uncached(handle, lock_bytes, paths, opts)
+    end)
+  end
+
+  defp memoized(nil, _key, _kind, operation), do: operation.()
+
+  defp memoized(memo, key, kind, operation) do
+    case :ets.lookup(memo, key) do
+      [{^key, result}] -> result
+      [] -> memoized_locked(memo, key, kind, operation)
+    end
+  end
+
+  defp memoized_locked(memo, key, kind, operation) do
+    lock =
+      "mix_workspace_ops:#{kind}-memo:" <>
+        sha256(:erlang.term_to_binary(key, [:deterministic]))
+
+    SyncLock.with_lock(lock, fn ->
+      case :ets.lookup(memo, key) do
+        [{^key, result}] -> result
+        [] -> operation.() |> cache_memo_result(memo, key)
+      end
+    end)
+  end
+
+  defp cache_memo_result(:ok = result, memo, key) do
+    true = :ets.insert(memo, {key, result})
+    result
+  end
+
+  defp cache_memo_result({:ok, _value} = result, memo, key) do
+    true = :ets.insert(memo, {key, result})
+    result
+  end
+
+  defp cache_memo_result(result, _memo, _key), do: result
+
+  defp prepare_transport_uncached(handle, lock_bytes, paths, opts) do
+    with {:ok, hex} <- prepare_hex_transport(handle, paths, opts),
+         {:ok, git_cache} <- prepare_git_transport(handle, lock_bytes, paths, opts) do
+      {:ok, Map.put(git_cache, :hex, hex)}
+    end
+  end
+
   defp prepare_hex_transport(handle, paths, opts) do
     if Keyword.get(opts, :prepare_objects, false) do
       HexCache.prepare(handle.state_root, paths.hex_cache, handle.lockfile,
         env: hex_transport_environment(paths),
         cd: handle.root,
+        memo: Keyword.get(opts, :hex_cache_memo),
+        source_cache: Keyword.get(opts, :hex_source_cache, native_hex_cache_home()),
         max_concurrency: Keyword.get(opts, :cache_concurrency, System.schedulers_online()),
         timeout: Keyword.get(opts, :cache_timeout, 120_000)
       )
@@ -1042,7 +1119,7 @@ defmodule MixWorkspaceOps.Runtime do
       {"MIX_EXS", paths.mix_exs},
       {"MIX_WORKSPACE_OPS_PROJECT_ROOT", handle.binding_root},
       {"MIX_WORKSPACE_OPS_LOCKFILE", handle.lockfile},
-      {"PATH", toolchain_path()}
+      {"PATH", Toolchain.path()}
     ]
 
     removed = Enum.map(publication_credential_keys(), &{&1, nil})
@@ -1091,7 +1168,7 @@ defmodule MixWorkspaceOps.Runtime do
       {"TMPDIR", paths.tmp},
       {"HEX_NO_UPDATE_CHECK", "1"},
       {"ERL_AFLAGS", "+S 1:1"},
-      {"PATH", toolchain_path()},
+      {"PATH", Toolchain.path()},
       {"GCM_INTERACTIVE", "never"},
       {"GIT_TERMINAL_PROMPT", "0"}
     ]
@@ -1101,18 +1178,24 @@ defmodule MixWorkspaceOps.Runtime do
     |> Enum.sort_by(&elem(&1, 0))
   end
 
+  defp native_hex_cache_home do
+    case System.get_env("HEX_HOME") do
+      value when is_binary(value) and value != "" ->
+        Path.expand(value)
+
+      _unset ->
+        if System.get_env("MIX_XDG") in ["1", "true"] do
+          cache = System.get_env("XDG_CACHE_HOME") || Path.join(System.user_home!(), ".cache")
+          cache |> Path.expand() |> Path.join("hex")
+        else
+          System.user_home!() |> Path.join(".hex") |> Path.expand()
+        end
+    end
+  end
+
   defp git_transport_credential?(name) do
     name in @git_transport_credentials or
       Regex.match?(~r/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/, name)
-  end
-
-  defp toolchain_path do
-    elixir_bin = Toolchain.executable("elixir") |> Path.dirname()
-    erlang_bin = :code.root_dir() |> to_string() |> Path.join("bin")
-
-    [elixir_bin, erlang_bin, System.get_env("PATH")]
-    |> Enum.reject(&(&1 in [nil, ""]))
-    |> Enum.join(":")
   end
 
   defp publication_credential_keys do
@@ -1155,7 +1238,7 @@ defmodule MixWorkspaceOps.Runtime do
       toolchain: toolchain(),
       deps_present: paths.deps_present,
       build_present: paths.build_present,
-      cache_objects: Map.drop(cache_objects, [:git_env]),
+      cache_objects: cache_object_report(cache_objects),
       context_lock_status: handle.context_lock_status,
       source_lock_digest: handle.source_lock_digest,
       operational_lock_digest: handle.operational_lock_digest,
@@ -1164,6 +1247,14 @@ defmodule MixWorkspaceOps.Runtime do
       allow_lock_mutation: handle.allow_lock_mutation,
       paths: report_paths(handle, paths)
     }
+  end
+
+  defp cache_object_report(cache_objects) do
+    cache_objects
+    |> Map.drop([:git_env])
+    |> Map.update(:git, [], fn reports ->
+      Enum.map(reports, &Map.delete(&1, :transport_remote))
+    end)
   end
 
   defp report_paths(handle, paths) do
@@ -1231,8 +1322,10 @@ defmodule MixWorkspaceOps.Runtime do
     do: {:ok, nil, digest}
 
   defp final_lock(%{lockfile: path}) do
-    case File.read(path) do
-      {:ok, bytes} -> {:ok, bytes, lock_digest(bytes)}
+    with {:ok, bytes} <- File.read(path),
+         {:ok, canonical} <- Lockfile.canonicalize(bytes) do
+      {:ok, canonical, lock_digest(canonical)}
+    else
       {:error, reason} -> {:error, {:runtime_final_lock, path, reason}}
     end
   end
@@ -1242,21 +1335,26 @@ defmodule MixWorkspaceOps.Runtime do
     cache_home = Map.get(paths, "hex_cache", Map.get(paths, :hex_cache))
 
     if is_binary(cache_home),
-      do: HexCache.capture(handle.state_root, cache_home, handle.lockfile),
+      do:
+        HexCache.capture(handle.state_root, cache_home, handle.lockfile,
+          memo: handle.hex_cache_memo
+        ),
       else: {:error, {:runtime_hex_cache_path, cache_home}}
   end
 
   defp capture_hex_objects(_decision, _handle, _metadata), do: :ok
 
-  defp finish_decision(_handle, _final_lock, _final_digest, false), do: :complete
+  defp finish_decision(_handle, _final_lock, _final_digest, false, _accept?), do: :complete
 
-  defp finish_decision(handle, _final_lock, final_digest, true)
+  defp finish_decision(handle, _final_lock, final_digest, true, _accept?)
        when not handle.allow_lock_mutation do
     {:rejected,
      {:lock_mutation_not_allowed, handle.run_id, handle.operational_lock_digest, final_digest}}
   end
 
-  defp finish_decision(handle, final_lock, final_digest, true) do
+  defp finish_decision(_handle, _final_lock, _final_digest, true, false), do: :discard
+
+  defp finish_decision(handle, final_lock, final_digest, true, true) do
     case Lockfile.digest(final_lock) do
       {:ok, ^final_digest} ->
         case persist_context_lock(handle, final_lock, final_digest) do
@@ -1301,6 +1399,7 @@ defmodule MixWorkspaceOps.Runtime do
   end
 
   defp finish_status(:complete), do: "complete"
+  defp finish_status(:discard), do: "discarded"
   defp finish_status({:rejected, _reason}), do: "rejected"
 
   defp readable_state_root(state_root) do
@@ -1323,13 +1422,13 @@ defmodule MixWorkspaceOps.Runtime do
     end
   end
 
-  defp state_report(state_root, runs, contexts, legacy_runtimes) do
+  defp state_report(state_root, runs, contexts, reports) do
     %{
       schema: @list_schema,
       state_root: state_root,
       runs: runs,
       contexts: contexts,
-      legacy_runtimes: legacy_runtimes
+      reports: reports
     }
   end
 
@@ -1428,12 +1527,7 @@ defmodule MixWorkspaceOps.Runtime do
 
     with {:ok, metadata} <- read_metadata(metadata_path),
          true <-
-           metadata["schema"] in [
-             @runtime_schema,
-             "mix_workspace_ops.runtime/v3",
-             "mix_workspace_ops.runtime/v2"
-           ] ||
-             {:error, {:runtime_schema, metadata_path}},
+           metadata["schema"] == @runtime_schema || {:error, {:runtime_schema, metadata_path}},
          {:ok, lease} <- lease_status(Path.join(root, "lease.json")) do
       {:ok,
        %{
@@ -1612,13 +1706,38 @@ defmodule MixWorkspaceOps.Runtime do
         :leased
 
       {:ok, false} ->
-        case File.rm_rf(path) do
-          {:ok, _removed} -> :ok
-          {:error, reason, failed_path} -> {:error, {:runtime_context_gc, failed_path, reason}}
+        with :ok <- remove_transport_context(context, state_root) do
+          remove_dependency_or_build_context(path)
         end
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp remove_dependency_or_build_context(path) do
+    case File.rm_rf(path) do
+      {:ok, _removed} -> :ok
+      {:error, reason, failed_path} -> {:error, {:runtime_context_gc, failed_path, reason}}
+    end
+  end
+
+  defp remove_transport_context(%{kind: :build}, _state_root), do: :ok
+
+  defp remove_transport_context(%{kind: :deps, identity: identity}, state_root) do
+    parent = Path.join([state_root, "contexts", "transport"])
+    path = Path.join(parent, identity)
+
+    if Path.dirname(path) == parent and Regex.match?(~r/^[0-9a-f]{64}$/, identity) do
+      case File.rm_rf(path) do
+        {:ok, _removed} ->
+          :ok
+
+        {:error, reason, failed_path} ->
+          {:error, {:runtime_transport_context_gc, failed_path, reason}}
+      end
+    else
+      {:error, {:unsafe_runtime_transport_gc_target, path}}
     end
   end
 
@@ -1633,14 +1752,6 @@ defmodule MixWorkspaceOps.Runtime do
            end
        end)}
     end
-  end
-
-  defp legacy_runtimes(state_root) do
-    state_root
-    |> Path.join("runtimes/*")
-    |> Path.wildcard()
-    |> Enum.filter(&File.dir?/1)
-    |> Enum.sort()
   end
 
   defp age_multiplier(""), do: 1
